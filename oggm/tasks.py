@@ -28,6 +28,8 @@ from oggm.core.centerlines import fixed_dx_elevation_band_flowline
 from oggm.core.climate import process_climate_data
 from oggm.core.climate import process_custom_climate_data
 from oggm.core.climate import historical_delta_method
+from oggm.core.regional_scaling import process_regional_scaling_data
+from oggm.core.regional_scaling import process_regional_scaling_climate_data
 from oggm.core.massbalance import mb_calibration_from_scalar_mb
 from oggm.core.massbalance import mb_calibration_from_geodetic_mb
 from oggm.core.massbalance import mb_calibration_from_wgms_mb

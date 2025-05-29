@@ -151,6 +151,8 @@ the majority of OGGM's tasks). They are parallelizable.
     tasks.process_climate_data
     tasks.process_custom_climate_data
     tasks.historical_delta_method
+    tasks.process_regional_scaling_data
+    tasks.process_regional_scaling_climate_data
     tasks.mb_calibration_from_scalar_mb
     tasks.mb_calibration_from_geodetic_mb
     tasks.mb_calibration_from_wgms_mb

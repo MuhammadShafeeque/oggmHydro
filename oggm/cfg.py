@@ -301,6 +301,16 @@ BASENAMES['elevation_band_flowline'] = ('elevation_band_flowline.csv', _doc)
 _doc = "The outlines of this glacier complex sub-entities (for RGI7C only!)."
 BASENAMES['complex_sub_entities'] = ('complex_sub_entities.shp', _doc)
 
+# Regional scaling file types
+_doc = 'Physical parameters for climate downscaling (temperature gradients, orographic effects, etc.).'
+BASENAMES['physical_parameters'] = ('physical_parameters.nc', _doc)
+
+_doc = 'Quality control metrics for climate data validation and bias correction.'
+BASENAMES['qc_metrics'] = ('qc_metrics.nc', _doc)
+
+_doc = 'Climate data validation results and statistical summaries.'
+BASENAMES['validation_results'] = ('validation_results.nc', _doc)
+
 
 def set_logging_config(logging_level='INFO'):
     """Set the global logger parameters.
