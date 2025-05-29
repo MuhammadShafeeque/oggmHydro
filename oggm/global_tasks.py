@@ -6,6 +6,7 @@ This module is simply a shortcut to the core functions
 
 from oggm.workflow import gis_prepro_tasks
 from oggm.workflow import climate_tasks
+from oggm.workflow import regional_scaling_tasks
 from oggm.workflow import inversion_tasks
 from oggm.workflow import calibrate_inversion_from_consensus
 from oggm.workflow import merge_glacier_tasks

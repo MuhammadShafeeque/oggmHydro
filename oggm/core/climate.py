@@ -218,6 +218,11 @@ def process_climate_data(gdir, y0=None, y1=None, output_filesuffix=None,
         process_custom_climate_data(gdir, y0=y0, y1=y1,
                                     output_filesuffix=output_filesuffix,
                                     **kwargs)
+    elif baseline == 'REGIONAL_SCALING':
+        from oggm.core.regional_scaling import process_regional_scaling_climate_data
+        process_regional_scaling_climate_data(gdir, y0=y0, y1=y1,
+                                              output_filesuffix=output_filesuffix,
+                                              **kwargs)
     else:
         raise ValueError("cfg.PARAMS['baseline_climate'] not understood")
 

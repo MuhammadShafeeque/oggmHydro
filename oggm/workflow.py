@@ -1150,3 +1150,66 @@ def merge_gridded_data(gdirs, output_folder=None,
 
     if return_dataset:
         return ds_adapted
+
+
+@global_task(log)
+def regional_scaling_tasks(gdirs, station_data_path=None, era5_data_path=None,
+                          y0=None, y1=None, output_filesuffix='',
+                          overwrite_gdir=False, override_missing=None,
+                          compute_physical_params=True, save_qc=True, **kwargs):
+    """Run all regional scaling climate tasks on a list of glaciers.
+    
+    This workflow combines ERA5/reanalysis data with station observations to
+    produce high-resolution, bias-corrected climate data for glacier modeling.
+    
+    Parameters
+    ----------
+    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+        the glacier directories to process
+    station_data_path : str
+        Path to station observation data file
+    era5_data_path : str
+        Path to ERA5 reanalysis data file (optional)
+    y0 : int
+        Starting year for climate data
+    y1 : int
+        Ending year for climate data
+    output_filesuffix : str
+        Suffix for output files
+    overwrite_gdir : bool
+        Whether to overwrite existing glacier directory data
+    override_missing : bool or None
+        Override missing data handling
+    compute_physical_params : bool
+        Whether to compute physical parameters (elevation lapse rates, etc.)
+    save_qc : bool
+        Whether to save quality control metrics
+    **kwargs
+        Additional parameters for regional scaling processing
+    """
+    
+    # Store paths in configuration if provided
+    if station_data_path:
+        cfg.PATHS['station_data_path'] = station_data_path
+    if era5_data_path:
+        cfg.PATHS['era5_data_path'] = era5_data_path
+    
+    # Compute physical parameters first if requested
+    if compute_physical_params:
+        execute_entity_task(tasks.compute_physical_parameters, gdirs,
+                           station_data_path=station_data_path,
+                           output_filesuffix=output_filesuffix, **kwargs)
+    
+    # Process regional scaling climate data
+    execute_entity_task(tasks.process_regional_scaling_data, gdirs,
+                       station_data_path=station_data_path,
+                       era5_data_path=era5_data_path,
+                       y0=y0, y1=y1,
+                       output_filesuffix=output_filesuffix,
+                       save_qc=save_qc, **kwargs)
+    
+    # Mass balance calibration and apparent mass balance
+    execute_entity_task(tasks.mb_calibration_from_geodetic_mb, gdirs,
+                        override_missing=override_missing,
+                        overwrite_gdir=overwrite_gdir)
+    execute_entity_task(tasks.apparent_mb_from_any_mb, gdirs)
