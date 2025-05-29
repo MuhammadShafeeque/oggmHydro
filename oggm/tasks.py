@@ -71,3 +71,14 @@ from oggm.core.dynamic_spinup import run_dynamic_melt_f_calibration
 from oggm.utils import copy_to_basedir
 from oggm.utils import gdir_to_tar
 from oggm.utils import merge_consecutive_run_outputs
+from oggm.graphics import (
+    plot_climate_stations,
+    plot_climate_maps, 
+    plot_physical_parameters,
+    plot_climate_comparison,
+    plot_station_vs_downscaled,
+    plot_flexible_validation,
+    plot_lapse_rate_analysis,
+    plot_station_analysis,
+    plot_comprehensive_analysis
+)

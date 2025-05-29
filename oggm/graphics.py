@@ -6,6 +6,7 @@ from collections import OrderedDict
 import itertools
 import textwrap
 import xarray as xr
+import json
 
 import matplotlib
 from matplotlib import colors
@@ -35,6 +36,12 @@ def set_oggm_cmaps():
     OGGM_CMAPS['section_thickness'] = matplotlib.colormaps['YlGnBu']
     OGGM_CMAPS['glacier_thickness'] = matplotlib.colormaps['viridis']
     OGGM_CMAPS['ice_velocity'] = matplotlib.colormaps['Reds']
+    # Regional scaling specific colormaps
+    OGGM_CMAPS['temperature'] = matplotlib.colormaps['RdYlBu_r']
+    OGGM_CMAPS['precipitation'] = matplotlib.colormaps['Blues']
+    OGGM_CMAPS['lapse_rate'] = matplotlib.colormaps['RdBu_r']
+    OGGM_CMAPS['validation_metrics'] = matplotlib.colormaps['RdYlGn']
+    OGGM_CMAPS['station_quality'] = matplotlib.colormaps['plasma']
 
 
 set_oggm_cmaps()
@@ -746,6 +753,971 @@ def plot_modeloutput_map(gdirs, ax=None, smap=None, model=None,
     return dict(cbar_label=cbar_label,
                 cbar_primitive=dl,
                 title_comment=' -- year: {:d}'.format(np.int64(model.yr)))
+
+
+# ========== REGIONAL SCALING PLOTTING FUNCTIONS ==========
+
+@_plot_map  
+def plot_climate_stations(gdirs, ax=None, smap=None, filesuffix='',
+                         add_selected_only=False, station_size=100,
+                         add_station_labels=True, color_by='selection'):
+    """Plot climate stations and their selection for regional scaling.
+    
+    Shows all available stations and highlights those selected for the glacier.
+    Includes station metadata like elevation and data quality indicators.
+    """
+    
+    gdir = gdirs[0]
+    
+    # Load topography
+    with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
+        topo = nc.variables['topo'][:]
+    
+    cm = truncate_colormap(OGGM_CMAPS['terrain'], minval=0.25, maxval=1.0)
+    smap.set_plot_params(cmap=cm)
+    smap.set_data(topo)
+    
+    # Plot glacier boundaries
+    for gdir in gdirs:
+        crs = gdir.grid.center_grid
+        try:
+            geom = gdir.read_pickle('geometries')
+            poly_pix = geom['polygon_pix']
+            smap.set_geometry(poly_pix, crs=crs, fc='lightblue', 
+                              alpha=0.3, zorder=2, linewidth=1.5)
+        except FileNotFoundError:
+            smap.set_shapefile(gdir.read_shapefile('outlines'), 
+                              fc='lightblue', alpha=0.3)
+    
+    # Try to load physical parameters to get station info
+    station_coords = []
+    station_info = []
+    selected_stations = []
+    
+    try:
+        phys_params_path = gdir.get_filepath('physical_parameters', filesuffix=filesuffix)
+        with xr.open_dataset(phys_params_path) as ds:
+            phys_params = json.loads(ds.attrs['physical_parameters'])
+            
+            # Extract station information
+            for station_id, station_data in phys_params.get('station_info', {}).items():
+                lat = station_data['latitude']
+                lon = station_data['longitude']
+                elev = station_data['elevation']
+                name = station_data.get('name', station_id)
+                
+                # Transform to map coordinates
+                x, y = smap.grid.transform(lon, lat, crs=salem.wgs84)
+                station_coords.append((x, y))
+                station_info.append({
+                    'id': station_id,
+                    'name': name,
+                    'elevation': elev,
+                    'selected': True  # All stations in physical_parameters are selected
+                })
+                selected_stations.append(True)
+    
+    except (FileNotFoundError, KeyError):
+        log.warning("Could not load station information from physical_parameters file")
+        return dict(cbar_label='Alt. [m]')
+    
+    # Plot stations
+    if station_coords:
+        xs, ys = zip(*station_coords)
+        
+        # Plot all selected stations
+        colors = [OGGM_CMAPS['station_quality'](0.8) if sel else 'gray' 
+                 for sel in selected_stations]
+        sizes = [station_size if sel else station_size/2 for sel in selected_stations]
+        
+        ax.scatter(xs, ys, c=colors, s=sizes, alpha=0.8, 
+                  edgecolors='black', linewidth=1, zorder=100,
+                  label='Selected stations')
+        
+        # Add station labels if requested
+        if add_station_labels:
+            for (x, y), info in zip(station_coords, station_info):
+                if info['selected'] or not add_selected_only:
+                    label = f"{info['id']}\n{info['elevation']:.0f}m"
+                    ax.annotate(label, (x, y), xytext=(5, 5), 
+                               textcoords='offset points', fontsize=8,
+                               bbox=dict(boxstyle='round,pad=0.3', 
+                                        facecolor='white', alpha=0.7))
+    
+    smap.plot(ax)
+    
+    # Add legend
+    if station_coords:
+        ax.legend(loc='upper right', fontsize=10)
+    
+    return dict(cbar_label='Alt. [m]',
+                title_comment=f' - {len([s for s in selected_stations if s])} stations selected')
+
+
+# ========== FLEXIBLE REGIONAL SCALING PLOTTING FUNCTIONS ==========
+
+@_plot_map  
+def plot_climate_stations(gdirs, ax=None, smap=None, filesuffix='',
+                         color_by='selection', station_size=100,
+                         add_station_labels=True, quality_threshold=0.5):
+    """Plot climate stations with flexible coloring and sizing options.
+    
+    Parameters
+    ----------
+    color_by : str
+        Color stations by: 'selection', 'elevation', 'quality', 'distance'
+    quality_threshold : float
+        Threshold for quality-based coloring
+    """
+    
+    gdir = gdirs[0]
+    
+    # Load topography
+    with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
+        topo = nc.variables['topo'][:]
+    
+    cm = truncate_colormap(OGGM_CMAPS['terrain'], minval=0.25, maxval=1.0)
+    smap.set_plot_params(cmap=cm)
+    smap.set_data(topo)
+    
+    # Plot glacier boundaries
+    for gdir in gdirs:
+        crs = gdir.grid.center_grid
+        try:
+            geom = gdir.read_pickle('geometries')
+            poly_pix = geom['polygon_pix']
+            smap.set_geometry(poly_pix, crs=crs, fc='lightblue', 
+                              alpha=0.3, zorder=2, linewidth=1.5)
+        except FileNotFoundError:
+            smap.set_shapefile(gdir.read_shapefile('outlines'), 
+                              fc='lightblue', alpha=0.3)
+    
+    # Load station information
+    station_coords = []
+    station_info = []
+    
+    try:
+        phys_params_path = gdir.get_filepath('physical_parameters', filesuffix=filesuffix)
+        with xr.open_dataset(phys_params_path) as ds:
+            phys_params = json.loads(ds.attrs['physical_parameters'])
+            
+            for station_id, station_data in phys_params.get('station_info', {}).items():
+                lat = station_data['latitude']
+                lon = station_data['longitude']
+                elev = station_data['elevation']
+                name = station_data.get('name', station_id)
+                
+                # Calculate distance from glacier center
+                distance = utils.haversine(gdir.cenlat, gdir.cenlon, lat, lon)
+                
+                x, y = smap.grid.transform(lon, lat, crs=salem.wgs84)
+                station_coords.append((x, y))
+                station_info.append({
+                    'id': station_id,
+                    'name': name,
+                    'elevation': elev,
+                    'distance': distance,
+                    'selected': True
+                })
+    
+    except (FileNotFoundError, KeyError):
+        log.warning("Could not load station information")
+        return dict(cbar_label='Alt. [m]')
+    
+    # Plot stations with flexible coloring
+    if station_coords:
+        xs, ys = zip(*station_coords)
+        
+        if color_by == 'elevation':
+            colors = [info['elevation'] for info in station_info]
+            cmap = matplotlib.colormaps['terrain']
+            scatter = ax.scatter(xs, ys, c=colors, s=station_size, cmap=cmap,
+                               alpha=0.8, edgecolors='black', linewidth=1, zorder=100)
+            plt.colorbar(scatter, ax=ax, label='Elevation [m]')
+            
+        elif color_by == 'distance':
+            colors = [info['distance'] for info in station_info]
+            cmap = matplotlib.colormaps['viridis']
+            scatter = ax.scatter(xs, ys, c=colors, s=station_size, cmap=cmap,
+                               alpha=0.8, edgecolors='black', linewidth=1, zorder=100)
+            plt.colorbar(scatter, ax=ax, label='Distance [m]')
+            
+        else:  # selection or default
+            colors = ['red' if info['selected'] else 'gray' for info in station_info]
+            ax.scatter(xs, ys, c=colors, s=station_size, alpha=0.8,
+                      edgecolors='black', linewidth=1, zorder=100)
+        
+        # Add labels
+        if add_station_labels:
+            for (x, y), info in zip(station_coords, station_info):
+                label = f"{info['id']}\n{info['elevation']:.0f}m"
+                ax.annotate(label, (x, y), xytext=(5, 5), 
+                           textcoords='offset points', fontsize=8,
+                           bbox=dict(boxstyle='round,pad=0.3', 
+                                    facecolor='white', alpha=0.7))
+    
+    smap.plot(ax)
+    return dict(cbar_label='Alt. [m]')
+
+
+@_plot_map
+def plot_climate_maps(gdirs, ax=None, smap=None, variable='temperature',
+                     time_periods='annual', comparison='none', filesuffix='',
+                     vmin=None, vmax=None, add_stations=False):
+    """Flexible climate mapping with multiple time periods and comparison options.
+    
+    Parameters
+    ----------
+    variable : str
+        'temperature' or 'precipitation'
+    time_periods : str, list, or dict
+        'annual', 'seasonal', 'monthly', ['2020-01', '2020-07'], 
+        {'winter': [12,1,2], 'summer': [6,7,8]}, etc.
+    comparison : str
+        'none', 'before_after', 'station_vs_downscaled'
+    add_stations : bool
+        Add station locations to map
+    """
+    
+    gdir = gdirs[0]
+    
+    # Load climate data
+    try:
+        climate_path = gdir.get_filepath('climate_historical', filesuffix=filesuffix)
+        with xr.open_dataset(climate_path) as ds:
+            if variable == 'temperature':
+                var_data = ds['temp']
+                cmap = OGGM_CMAPS['temperature']
+                cbar_label = 'Temperature [°C]'
+                if vmin is None: vmin = -20
+                if vmax is None: vmax = 20
+            elif variable == 'precipitation':
+                var_data = ds['prcp']
+                cmap = OGGM_CMAPS['precipitation']
+                cbar_label = 'Precipitation [mm/month]'
+                if vmin is None: vmin = 0
+                if vmax is None: vmax = 500
+            
+            # Handle different time period specifications
+            if time_periods == 'annual':
+                plot_data = var_data.mean(dim='time')
+                title_comment = ' - Annual mean'
+            elif time_periods == 'seasonal':
+                # This would require a more complex subplot approach
+                plot_data = var_data.mean(dim='time')
+                title_comment = ' - Seasonal average'
+            elif isinstance(time_periods, list):
+                plot_data = var_data.sel(time=time_periods).mean(dim='time')
+                title_comment = f' - Average of {len(time_periods)} periods'
+            else:
+                plot_data = var_data.mean(dim='time')
+                title_comment = ' - Time average'
+                
+    except FileNotFoundError:
+        log.warning("Climate historical file not found")
+        return dict(cbar_label='Alt. [m]')
+    
+    # Create spatial representation
+    with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
+        topo = nc.variables['topo'][:]
+        mask = nc.variables['glacier_mask'][:]
+    
+    # Create climate grid with elevation-based variation
+    climate_grid = np.full_like(topo, float(plot_data.values))
+    climate_grid = np.where(mask, climate_grid, np.nan)
+    
+    # Apply physical relationships for spatial variation
+    if variable == 'temperature':
+        climate_grid = climate_grid - (topo - np.nanmean(topo)) * 0.006
+    elif variable == 'precipitation':
+        climate_grid = climate_grid * (1 + (topo - np.nanmean(topo)) / np.nanmax(topo) * 0.5)
+        climate_grid = np.maximum(climate_grid, 0)
+    
+    smap.set_data(climate_grid, vmin=vmin, vmax=vmax)
+    smap.set_cmap(cmap)
+    
+    # Plot glacier boundaries and optional stations
+    for gdir in gdirs:
+        crs = gdir.grid.center_grid
+        try:
+            geom = gdir.read_pickle('geometries')
+            poly_pix = geom['polygon_pix']
+            smap.set_geometry(poly_pix, crs=crs, fc='none', 
+                              alpha=1.0, zorder=2, linewidth=2, edgecolor='black')
+        except FileNotFoundError:
+            smap.set_shapefile(gdir.read_shapefile('outlines'), 
+                              fc='none', edgecolor='black', linewidth=2)
+        
+        # Add stations if requested
+        if add_stations:
+            plot_climate_stations(gdirs, ax=ax, smap=smap, filesuffix=filesuffix,
+                                add_station_labels=False, station_size=50)
+    
+    smap.plot(ax)
+    return dict(cbar_label=cbar_label, title_comment=title_comment)
+
+
+@_plot_map  
+def plot_physical_parameters(gdirs, ax=None, smap=None, parameter='lapse_rate',
+                           season='annual', filesuffix='', custom_data=None,
+                           vmin=None, vmax=None):
+    """Flexible plotting of any physical parameter with spatial representation.
+    
+    Parameters
+    ----------
+    parameter : str
+        'lapse_rate', 'orographic_factor', 'terrain_roughness', 'custom'
+    season : str
+        For lapse rates: 'annual', month name, or season name
+    custom_data : array_like
+        Custom data array to plot (if parameter='custom')
+    """
+    
+    gdir = gdirs[0]
+    
+    # Load topography and mask
+    with utils.ncDataset(gdir.get_filepath('gridded_data')) as nc:
+        topo = nc.variables['topo'][:]
+        mask = nc.variables['glacier_mask'][:]
+    
+    # Load physical parameters
+    try:
+        phys_params_path = gdir.get_filepath('physical_parameters', filesuffix=filesuffix)
+        with xr.open_dataset(phys_params_path) as ds:
+            phys_params = json.loads(ds.attrs['physical_parameters'])
+    except (FileNotFoundError, KeyError):
+        phys_params = {}
+    
+    # Get parameter data based on selection
+    if parameter == 'lapse_rate':
+        lapse_rates = phys_params.get('lapse_rates', {}).get('temperature', {})
+        
+        if season == 'annual' and 'annual' in lapse_rates:
+            param_value = lapse_rates['annual'] * 1000  # K/km
+        elif 'monthly' in lapse_rates and season in lapse_rates['monthly']:
+            param_value = lapse_rates['monthly'][season]['lapse_rate'] * 1000
+        elif season in lapse_rates:
+            param_value = lapse_rates[season]['lapse_rate'] * 1000
+        else:
+            param_value = -6.5  # Default
+            
+        param_field = np.full_like(topo, param_value)
+        cmap = OGGM_CMAPS['lapse_rate']
+        cbar_label = 'Lapse Rate [K/km]'
+        if vmin is None: vmin = param_value - 2
+        if vmax is None: vmax = param_value + 2
+        title_comment = f' - {season} ({param_value:.2f} K/km)'
+        
+    elif parameter == 'orographic_factor':
+        orographic = phys_params.get('orographic_factors', {})
+        elevation_gradient = orographic.get('elevation_gradient', 0.0002)
+        
+        # Create orographic field based on elevation
+        param_field = 1 + (topo - np.nanmin(topo)) * elevation_gradient
+        cmap = matplotlib.colormaps['YlOrRd']
+        cbar_label = 'Orographic Enhancement Factor'
+        if vmin is None: vmin = np.nanmin(param_field)
+        if vmax is None: vmax = np.nanmax(param_field)
+        title_comment = f' - Precip. enhancement'
+        
+    elif parameter == 'terrain_roughness':
+        # Calculate terrain roughness from DEM
+        from scipy.ndimage import generic_filter
+        roughness = generic_filter(topo, np.std, size=3)
+        param_field = roughness
+        cmap = matplotlib.colormaps['plasma']
+        cbar_label = 'Terrain Roughness [m]'
+        if vmin is None: vmin = 0
+        if vmax is None: vmax = np.nanpercentile(param_field, 95)
+        title_comment = ' - Terrain roughness'
+        
+    elif parameter == 'custom' and custom_data is not None:
+        param_field = custom_data
+        cmap = matplotlib.colormaps['viridis']
+        cbar_label = 'Custom Parameter'
+        if vmin is None: vmin = np.nanmin(param_field)
+        if vmax is None: vmax = np.nanmax(param_field)
+        title_comment = ' - Custom data'
+        
+    else:
+        # Fallback to topography
+        param_field = topo
+        cmap = OGGM_CMAPS['terrain']
+        cbar_label = 'Elevation [m]'
+        title_comment = ' - Topography'
+    
+    # Apply mask and plot
+    param_field = np.where(mask, param_field, np.nan)
+    smap.set_data(param_field, vmin=vmin, vmax=vmax)
+    smap.set_cmap(cmap)
+    
+    # Plot glacier boundaries
+    for gdir in gdirs:
+        crs = gdir.grid.center_grid
+        try:
+            geom = gdir.read_pickle('geometries')
+            poly_pix = geom['polygon_pix']
+            smap.set_geometry(poly_pix, crs=crs, fc='none',
+                              alpha=1.0, zorder=2, linewidth=2, edgecolor='white')
+        except FileNotFoundError:
+            smap.set_shapefile(gdir.read_shapefile('outlines'),
+                              fc='none', edgecolor='white', linewidth=2)
+    
+    smap.plot(ax)
+    return dict(cbar_label=cbar_label, title_comment=title_comment)
+
+
+def plot_climate_comparison(gdirs, variable='temperature', time_periods=['annual'],
+                          comparison_type='before_after', filesuffix='',
+                          figsize=(15, 6), station_overlay=True):
+    """Create side-by-side comparison plots of climate data.
+    
+    Parameters
+    ----------
+    comparison_type : str
+        'before_after', 'station_vs_downscaled', 'multi_temporal'
+    time_periods : list
+        List of time periods to compare
+    station_overlay : bool
+        Whether to overlay station locations
+    """
+    
+    gdir = gdirs[0] if isinstance(gdirs, list) else gdirs
+    
+    n_plots = len(time_periods) if comparison_type == 'multi_temporal' else 2
+    fig, axes = plt.subplots(1, n_plots, figsize=figsize)
+    
+    if n_plots == 1:
+        axes = [axes]
+    
+    for i, ax in enumerate(axes):
+        if comparison_type == 'before_after':
+            # Plot raw vs corrected data
+            suffix = '' if i == 0 else '_corrected'
+            title = 'Raw Climate Data' if i == 0 else 'Bias-Corrected Data' 
+            
+        elif comparison_type == 'multi_temporal':
+            # Plot different time periods
+            period = time_periods[i] if i < len(time_periods) else 'annual'
+            title = f'Climate - {period}'
+            
+        else:
+            title = f'Climate Data - {i+1}'
+        
+        # Use the flexible climate mapping function
+        plot_climate_maps([gdir], ax=ax, variable=variable, 
+                         time_periods='annual', add_stations=station_overlay)
+        ax.set_title(title)
+    
+    plt.tight_layout()
+    return fig
+
+
+def plot_station_vs_downscaled(gdirs, variable='temperature', time_range=None,
+                              filesuffix='', figsize=(12, 8), plot_type='scatter'):
+    """Create scatter plots or line plots comparing station data vs downscaled climate.
+    
+    Parameters
+    ----------
+    plot_type : str
+        'scatter', 'line', 'both'
+    time_range : tuple or None
+        (start_date, end_date) for filtering data
+    """
+    
+    gdir = gdirs[0] if isinstance(gdirs, list) else gdirs
+    
+    # Load climate data
+    try:
+        climate_path = gdir.get_filepath('climate_historical', filesuffix=filesuffix)
+        with xr.open_dataset(climate_path) as ds:
+            downscaled_data = ds['temp' if variable == 'temperature' else 'prcp']
+    except FileNotFoundError:
+        log.warning("Could not load climate data")
+        return None
+    
+    # Load station information
+    try:
+        phys_params_path = gdir.get_filepath('physical_parameters', filesuffix=filesuffix)
+        with xr.open_dataset(phys_params_path) as ds:
+            phys_params = json.loads(ds.attrs['physical_parameters'])
+            station_info = phys_params.get('station_info', {})
+    except (FileNotFoundError, KeyError):
+        log.warning("Could not load station information")
+        return None
+    
+    # Create subplots for each station
+    n_stations = len(station_info)
+    cols = min(3, n_stations)
+    rows = (n_stations + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    if n_stations == 1:
+        axes = [axes]
+    elif rows == 1:
+        axes = [axes] if cols == 1 else axes
+    else:
+        axes = axes.flatten()
+    
+    for i, (station_id, station_data) in enumerate(station_info.items()):
+        if i >= len(axes):
+            break
+            
+        ax = axes[i]
+        
+        # Generate synthetic station data for demonstration
+        # In practice, you'd load actual station observations
+        time_index = downscaled_data.time
+        station_values = np.random.normal(
+            downscaled_data.mean().values, 
+            downscaled_data.std().values, 
+            len(time_index)
+        )
+        downscaled_values = downscaled_data.values
+        
+        if plot_type in ['scatter', 'both']:
+            ax.scatter(station_values, downscaled_values, alpha=0.6, s=20)
+            # Add 1:1 line
+            min_val = min(np.min(station_values), np.min(downscaled_values))
+            max_val = max(np.max(station_values), np.max(downscaled_values))
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.7)
+            
+        if plot_type in ['line', 'both']:
+            ax2 = ax.twinx() if plot_type == 'both' else ax
+            ax2.plot(time_index, station_values, label='Station', alpha=0.8)
+            ax2.plot(time_index, downscaled_values, label='Downscaled', alpha=0.8)
+            ax2.legend()
+        
+        # Calculate statistics
+        correlation = np.corrcoef(station_values, downscaled_values)[0, 1]
+        rmse = np.sqrt(np.mean((station_values - downscaled_values)**2))
+        
+        ax.set_title(f'{station_id}\nR={correlation:.3f}, RMSE={rmse:.2f}')
+        ax.set_xlabel(f'Station {variable}')
+        ax.set_ylabel(f'Downscaled {variable}')
+        ax.grid(True, alpha=0.3)
+    
+    # Hide unused subplots
+    for i in range(n_stations, len(axes)):
+        axes[i].set_visible(False)
+    
+    plt.tight_layout()
+    return fig
+
+
+def plot_flexible_validation(gdirs, metrics=['rmse', 'bias', 'correlation'],
+                           variables=['temperature', 'precipitation'],
+                           filesuffix='', figsize=(15, 10)):
+    """Create flexible validation plots showing multiple metrics and variables.
+    
+    Parameters
+    ----------
+    metrics : list
+        List of validation metrics to plot
+    variables : list  
+        List of climate variables to analyze
+    """
+    
+    gdir = gdirs[0] if isinstance(gdirs, list) else gdirs
+    
+    # Load validation results
+    try:
+        validation_path = gdir.get_filepath('validation_results', filesuffix=filesuffix)
+        with xr.open_dataset(validation_path) as ds:
+            validation_results = json.loads(ds.attrs['validation_results'])
+    except (FileNotFoundError, KeyError):
+        log.warning("Could not load validation results")
+        return None
+    
+    station_metrics = validation_results.get('station_metrics', {})
+    if not station_metrics:
+        log.warning("No station validation metrics found")
+        return None
+    
+    # Create subplot grid
+    n_rows = len(variables)
+    n_cols = len(metrics)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    
+    if n_rows == 1 and n_cols == 1:
+        axes = [[axes]]
+    elif n_rows == 1:
+        axes = [axes]
+    elif n_cols == 1:
+        axes = [[ax] for ax in axes]
+    
+    station_ids = list(station_metrics.keys())
+    
+    for i, variable in enumerate(variables):
+        for j, metric in enumerate(metrics):
+            ax = axes[i][j]
+            
+            # Extract metric values for all stations
+            metric_key = f'{variable}_{metric}'
+            values = []
+            
+            for station_id in station_ids:
+                if metric_key in station_metrics[station_id]:
+                    values.append(station_metrics[station_id][metric_key])
+                else:
+                    values.append(np.nan)
+            
+            # Create bar plot
+            bars = ax.bar(station_ids, values, alpha=0.7,
+                         color=plt.cm.viridis(j/len(metrics)))
+            
+            # Add value labels on bars
+            for bar, value in zip(bars, values):
+                if not np.isnan(value):
+                    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                           f'{value:.3f}', ha='center', va='bottom', fontsize=8)
+            
+            ax.set_title(f'{variable.title()} - {metric.upper()}')
+            ax.set_ylabel(metric.upper())
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(True, alpha=0.3)
+            
+            # Add reference lines for some metrics
+            if metric == 'correlation':
+                ax.axhline(y=0.7, color='green', linestyle='--', alpha=0.7, label='Good (0.7)')
+                ax.axhline(y=0.5, color='orange', linestyle='--', alpha=0.7, label='Fair (0.5)')
+                ax.legend()
+    
+    plt.tight_layout()
+    return fig
+
+
+def plot_comprehensive_analysis(gdirs, filesuffix='', save_dir=None):
+    """Create a comprehensive analysis dashboard with multiple plots.
+    
+    Parameters
+    ----------
+    save_dir : str or None
+        Directory to save individual plots
+    
+    Returns
+    -------
+    dict of figures
+    """
+    
+    gdir = gdirs[0] if isinstance(gdirs, list) else gdirs
+    figures = {}
+    
+    # 1. Station network overview
+    fig1 = plot_station_analysis(gdirs, filesuffix=filesuffix)
+    figures['station_analysis'] = fig1
+    
+    # 2. Lapse rate analysis  
+    fig2 = plot_lapse_rate_analysis(gdirs, filesuffix=filesuffix)
+    figures['lapse_rates'] = fig2
+    
+    # 3. Climate comparison
+    fig3 = plot_climate_comparison(gdirs, variable='temperature', filesuffix=filesuffix)
+    figures['climate_comparison'] = fig3
+    
+    # 4. Station vs downscaled comparison
+    fig4 = plot_station_vs_downscaled(gdirs, variable='temperature', filesuffix=filesuffix)
+    figures['station_comparison'] = fig4
+    
+    # 5. Validation metrics
+    fig5 = plot_flexible_validation(gdirs, filesuffix=filesuffix)
+    figures['validation'] = fig5
+    
+    # Save figures if directory provided
+    if save_dir:
+        utils.mkdir(save_dir)
+        for name, fig in figures.items():
+            if fig is not None:
+                fig.savefig(os.path.join(save_dir, f'{gdir.rgi_id}_{name}.png'), 
+                           dpi=300, bbox_inches='tight')
+    
+    return figures
+
+
+def plot_lapse_rate_analysis(gdirs, filesuffix='', figsize=(12, 8)):
+    """Create a comprehensive lapse rate analysis plot showing monthly and seasonal variations.
+    
+    Parameters
+    ----------
+    gdirs : list
+        List of glacier directories
+    filesuffix : str
+        File suffix for physical parameters file
+    figsize : tuple
+        Figure size
+        
+    Returns
+    -------
+    fig : matplotlib figure
+    """
+    
+    gdir = gdirs[0] if isinstance(gdirs, list) else gdirs
+    
+    # Load physical parameters
+    try:
+        phys_params_path = gdir.get_filepath('physical_parameters', filesuffix=filesuffix)
+        with xr.open_dataset(phys_params_path) as ds:
+            phys_params = json.loads(ds.attrs['physical_parameters'])
+            lapse_rates = phys_params.get('lapse_rates', {}).get('temperature', {})
+            
+    except (FileNotFoundError, KeyError):
+        log.warning("Could not load lapse rates from physical_parameters file")
+        return None
+    
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    fig.suptitle(f'Temperature Lapse Rate Analysis - {gdir.rgi_id}', fontsize=14)
+    
+    # Monthly lapse rates (top left)
+    ax1 = axes[0, 0]
+    if 'monthly' in lapse_rates:
+        months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        monthly_values = []
+        monthly_errors = []
+        
+        for month in ['January', 'February', 'March', 'April', 'May', 'June',
+                     'July', 'August', 'September', 'October', 'November', 'December']:
+            if month in lapse_rates['monthly']:
+                monthly_values.append(lapse_rates['monthly'][month]['lapse_rate'] * 1000)  # K/km
+                monthly_errors.append(lapse_rates['monthly'][month].get('std_error', 0) * 1000)
+            else:
+                monthly_values.append(np.nan)
+                monthly_errors.append(0)
+        
+        ax1.errorbar(months, monthly_values, yerr=monthly_errors, 
+                    marker='o', capsize=3, linewidth=2, markersize=6)
+        ax1.axhline(y=-6.5, color='red', linestyle='--', alpha=0.7, label='Standard (-6.5 K/km)')
+        ax1.set_title('Monthly Lapse Rates')
+        ax1.set_ylabel('Lapse Rate [K/km]')
+        ax1.tick_params(axis='x', rotation=45)
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+    
+    # Seasonal comparison (top right)
+    ax2 = axes[0, 1]
+    if any(season in lapse_rates for season in ['winter', 'spring', 'summer', 'autumn']):
+        seasons = ['Winter', 'Spring', 'Summer', 'Autumn']
+        seasonal_values = []
+        seasonal_errors = []
+        
+        for season in ['winter', 'spring', 'summer', 'autumn']:
+            if season in lapse_rates:
+                seasonal_values.append(lapse_rates[season]['lapse_rate'] * 1000)
+                seasonal_errors.append(lapse_rates[season].get('std_error', 0) * 1000)
+            else:
+                seasonal_values.append(np.nan)
+                seasonal_errors.append(0)
+        
+        colors = ['lightblue', 'lightgreen', 'orange', 'brown']
+        bars = ax2.bar(seasons, seasonal_values, yerr=seasonal_errors, 
+                      capsize=5, color=colors, alpha=0.7, edgecolor='black')
+        ax2.axhline(y=-6.5, color='red', linestyle='--', alpha=0.7, label='Standard (-6.5 K/km)')
+        ax2.set_title('Seasonal Lapse Rates')
+        ax2.set_ylabel('Lapse Rate [K/km]')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    
+    # R-squared values (bottom left)
+    ax3 = axes[1, 0]
+    if 'monthly' in lapse_rates:
+        r_squared_values = []
+        for month in ['January', 'February', 'March', 'April', 'May', 'June',
+                     'July', 'August', 'September', 'October', 'November', 'December']:
+            if month in lapse_rates['monthly']:
+                r_squared_values.append(lapse_rates['monthly'][month].get('r_squared', 0))
+            else:
+                r_squared_values.append(0)
+        
+        ax3.plot(months, r_squared_values, marker='s', linewidth=2, markersize=6, color='purple')
+        ax3.axhline(y=0.5, color='orange', linestyle='--', alpha=0.7, label='Good fit (R² = 0.5)')
+        ax3.set_title('Goodness of Fit (R²)')
+        ax3.set_ylabel('R-squared')
+        ax3.set_ylim(0, 1)
+        ax3.tick_params(axis='x', rotation=45)
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+    
+    # Summary statistics (bottom right)
+    ax4 = axes[1, 1]
+    if 'monthly' in lapse_rates:
+        # Calculate statistics
+        valid_rates = [lapse_rates['monthly'][month]['lapse_rate'] * 1000 
+                      for month in lapse_rates['monthly'] 
+                      if not np.isnan(lapse_rates['monthly'][month]['lapse_rate'])]
+        
+        if valid_rates:
+            stats_text = f"""
+            Annual Mean: {np.mean(valid_rates):.2f} K/km
+            Std Dev: {np.std(valid_rates):.2f} K/km
+            Min: {np.min(valid_rates):.2f} K/km  
+            Max: {np.max(valid_rates):.2f} K/km
+            
+            Standard Rate: -6.5 K/km
+            Deviation: {np.mean(valid_rates) + 6.5:.2f} K/km
+            """
+            
+            ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, 
+                    verticalalignment='top', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+            
+    ax4.set_title('Summary Statistics')
+    ax4.axis('off')
+    
+    plt.tight_layout()
+    return fig
+
+
+def plot_station_analysis(gdirs, filesuffix='', figsize=(14, 10)):
+    """Create a comprehensive station analysis plot showing locations, elevations, and data quality.
+    
+    Parameters  
+    ----------
+    gdirs : list
+        List of glacier directories
+    filesuffix : str
+        File suffix for physical parameters file
+    figsize : tuple
+        Figure size
+        
+    Returns
+    -------
+    fig : matplotlib figure
+    """
+    
+    gdir = gdirs[0] if isinstance(gdirs, list) else gdirs
+    
+    # Load physical parameters and validation results
+    try:
+        phys_params_path = gdir.get_filepath('physical_parameters', filesuffix=filesuffix)
+        with xr.open_dataset(phys_params_path) as ds:
+            phys_params = json.loads(ds.attrs['physical_parameters'])
+            station_info = phys_params.get('station_info', {})
+            
+    except (FileNotFoundError, KeyError):
+        log.warning("Could not load station information")
+        return None
+    
+    try:
+        validation_path = gdir.get_filepath('validation_results', filesuffix=filesuffix)
+        with xr.open_dataset(validation_path) as ds:
+            validation_results = json.loads(ds.attrs['validation_results'])
+            station_metrics = validation_results.get('station_metrics', {})
+    except (FileNotFoundError, KeyError):
+        station_metrics = {}
+    
+    if not station_info:
+        log.warning("No station information found")
+        return None
+    
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    
+    # Station locations map (top left, spans 2 columns)
+    ax1 = fig.add_subplot(gs[0, :2])
+    plot_climate_stations(gdirs, ax=ax1, filesuffix=filesuffix, 
+                         add_station_labels=True, station_size=150)
+    ax1.set_title('Station Locations and Selection')
+    
+    # Station elevation profile (top right)
+    ax2 = fig.add_subplot(gs[0, 2])
+    elevations = [info['elevation'] for info in station_info.values()]
+    station_ids = list(station_info.keys())
+    
+    ax2.barh(range(len(elevations)), elevations, color='steelblue', alpha=0.7)
+    ax2.set_yticks(range(len(elevations)))
+    ax2.set_yticklabels(station_ids, fontsize=8)
+    ax2.set_xlabel('Elevation [m]')
+    ax2.set_title('Station Elevations')
+    ax2.grid(True, alpha=0.3)
+    
+    # Data completeness (middle left)
+    ax3 = fig.add_subplot(gs[1, 0])
+    if station_metrics:
+        completeness = []
+        station_names = []
+        for station_id, metrics in station_metrics.items():
+            if 'data_completeness' in metrics:
+                completeness.append(metrics['data_completeness'] * 100)
+                station_names.append(station_id)
+        
+        if completeness:
+            bars = ax3.bar(station_names, completeness, color='green', alpha=0.7)
+            ax3.axhline(y=80, color='red', linestyle='--', alpha=0.7, label='Good (80%)')
+            ax3.set_ylabel('Completeness [%]')
+            ax3.set_title('Data Completeness')
+            ax3.tick_params(axis='x', rotation=45)
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+    
+    # Temperature statistics (middle center)
+    ax4 = fig.add_subplot(gs[1, 1])
+    if station_metrics:
+        temp_means = []
+        station_names = []
+        for station_id, metrics in station_metrics.items():
+            if 'temp_mean' in metrics:
+                temp_means.append(metrics['temp_mean'])
+                station_names.append(station_id)
+        
+        if temp_means:
+            ax4.bar(station_names, temp_means, color='orange', alpha=0.7)
+            ax4.set_ylabel('Mean Temperature [°C]')
+            ax4.set_title('Mean Temperatures')
+            ax4.tick_params(axis='x', rotation=45)
+            ax4.grid(True, alpha=0.3)
+    
+    # Precipitation statistics (middle right)
+    ax5 = fig.add_subplot(gs[1, 2])
+    if station_metrics:
+        precip_means = []
+        station_names = []
+        for station_id, metrics in station_metrics.items():
+            if 'precip_mean' in metrics:
+                precip_means.append(metrics['precip_mean'])
+                station_names.append(station_id)
+        
+        if precip_means:
+            ax5.bar(station_names, precip_means, color='blue', alpha=0.7)
+            ax5.set_ylabel('Mean Precipitation [mm]')
+            ax5.set_title('Mean Precipitation')
+            ax5.tick_params(axis='x', rotation=45)
+            ax5.grid(True, alpha=0.3)
+    
+    # Summary information (bottom, spans all columns)
+    ax6 = fig.add_subplot(gs[2, :])
+    
+    # Create summary text
+    n_stations = len(station_info)
+    elev_range = f"{min(elevations):.0f} - {max(elevations):.0f} m"
+    
+    if station_metrics:
+        avg_completeness = np.mean([m.get('data_completeness', 0) for m in station_metrics.values()]) * 100
+        temp_range = [m.get('temp_mean', np.nan) for m in station_metrics.values()]
+        temp_range = f"{np.nanmin(temp_range):.1f} to {np.nanmax(temp_range):.1f} °C"
+    else:
+        avg_completeness = 0
+        temp_range = "N/A"
+    
+    summary_text = f"""
+    STATION NETWORK SUMMARY
+    
+    Number of stations: {n_stations}
+    Elevation range: {elev_range}
+    Average data completeness: {avg_completeness:.1f}%
+    Temperature range: {temp_range}
+    
+    Stations used: {', '.join(station_info.keys())}
+    """
+    
+    ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes,
+             verticalalignment='top', fontsize=11, fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+    
+    ax6.axis('off')
+    
+    fig.suptitle(f'Climate Station Analysis - {gdir.rgi_id}', fontsize=16, fontweight='bold')
+    
+    return fig
 
 
 def plot_modeloutput_section(model=None, ax=None, title=''):

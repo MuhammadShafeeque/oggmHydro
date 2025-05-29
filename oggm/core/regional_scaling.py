@@ -8,6 +8,12 @@ This module provides comprehensive climate data processing by combining:
 The module produces high-resolution, bias-corrected climate data compatible
 with OGGM's glacier modeling workflow, along with comprehensive validation
 and quality control metrics.
+
+Main functions:
+- compute_physical_parameters: Compute terrain-based physical relationships
+- process_regional_scaling_data: Main climate processing with bias correction
+- select_climate_stations: Station selection algorithms
+- Plotting functions available in oggm.graphics module
 """
 
 # Built ins
@@ -46,7 +52,7 @@ log = logging.getLogger(__name__)
 
 # Default parameters for regional scaling
 DEFAULT_PARAMS = {
-    'station_selection_method': 'distance',  # 'distance', 'boundary', 'hybrid'
+    'station_selection_method': 'hybrid',  # 'distance', 'boundary', 'hybrid'
     'station_selection_distance': 25000,     # meters
     'bias_correction_method': 'quantile_mapping',  # 'linear', 'quantile_mapping', 'variance_scaling'
     'downscaling_resolution': 100,           # meters or 'elevation_bands'
@@ -54,7 +60,7 @@ DEFAULT_PARAMS = {
     'temp_lapse_rate': -0.0065,             # K/m - fallback constant
     'precip_gradient': 0.0002,              # 1/m - fallback constant
     'validation_method': 'leave_one_out',    # 'leave_one_out', 'temporal_split', 'k_fold'
-    'min_overlap_years': 5,                 # minimum overlap period for bias correction
+    'min_overlap_years': 4,                 # minimum overlap period for bias correction
     'quality_threshold': 0.5,               # minimum correlation for station acceptance
 }
 
