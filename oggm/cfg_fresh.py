@@ -14,7 +14,8 @@ import numpy as np
 import pandas as pd
 try:
     from scipy.signal.windows import gaussian
-except ImportError:
+except AttributeError:
+    # Old scipy
     from scipy.signal import gaussian
 from configobj import ConfigObj, ConfigObjError
 try:
@@ -121,8 +122,8 @@ class ParamsLoggingDict(ResettingOrderedDict):
         prev = self.get(key)
         if prev is None:
             if key not in ['prcp_fac']:
-                log.info('WARNING: adding an unknown parameter '
-                          '`{}`:`{}` to PARAMS.'.format(key, value))
+                log.workflow('WARNING: adding an unknown parameter '
+                             '`{}`:`{}` to PARAMS.'.format(key, value))
             return
 
         if prev == value:
@@ -130,8 +131,8 @@ class ParamsLoggingDict(ResettingOrderedDict):
 
         if key == 'use_multiprocessing':
             msg = 'ON' if value else 'OFF'
-            log.info('Multiprocessing switched {} '.format(msg) +
-                     'after user settings.')
+            log.workflow('Multiprocessing switched {} '.format(msg) +
+                         'after user settings.')
             return
 
         if key == 'mp_processes':
@@ -139,17 +140,17 @@ class ParamsLoggingDict(ResettingOrderedDict):
                 import multiprocessing
                 value = multiprocessing.cpu_count()
                 if PARAMS.get('use_multiprocessing', False):
-                    log.info('Multiprocessing: using all available '
-                             'processors (N={})'.format(value))
+                    log.workflow('Multiprocessing: using all available '
+                                 'processors (N={})'.format(value))
             else:
                 if PARAMS.get('use_multiprocessing', False):
-                    log.info('Multiprocessing: using the requested number '
-                             'of processors (N={})'.format(value))
+                    log.workflow('Multiprocessing: using the requested number '
+                                 'of processors (N={})'.format(value))
             return
 
-        log.info("PARAMS['{}'] changed from `{}` to `{}`.".format(key,
-                                                                  prev,
-                                                                  value))
+        log.workflow("PARAMS['{}'] changed from `{}` to `{}`.".format(key,
+                                                                      prev,
+                                                                      value))
 
 
 # Globals
@@ -300,16 +301,6 @@ BASENAMES['elevation_band_flowline'] = ('elevation_band_flowline.csv', _doc)
 _doc = "The outlines of this glacier complex sub-entities (for RGI7C only!)."
 BASENAMES['complex_sub_entities'] = ('complex_sub_entities.shp', _doc)
 
-# Regional scaling file types
-_doc = 'Physical parameters for climate downscaling (temperature gradients, orographic effects, etc.).'
-BASENAMES['physical_parameters'] = ('physical_parameters.nc', _doc)
-
-_doc = 'Quality control metrics for climate data validation and bias correction.'
-BASENAMES['qc_metrics'] = ('qc_metrics.nc', _doc)
-
-_doc = 'Climate data validation results and statistical summaries.'
-BASENAMES['validation_results'] = ('validation_results.nc', _doc)
-
 
 def set_logging_config(logging_level='INFO'):
     """Set the global logger parameters.
@@ -411,10 +402,10 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
         sys.exit()
 
     if is_default:
-        log.info('Reading default parameters from the OGGM `params.cfg` '
+        log.workflow('Reading default parameters from the OGGM `params.cfg` '
                      'configuration file.')
     else:
-        log.info('Reading parameters from the user provided '
+        log.workflow('Reading parameters from the user provided '
                      'configuration file: %s', file)
 
     # Static Paths
@@ -434,7 +425,7 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
     env_wd = os.environ.get('OGGM_WORKDIR')
     if env_wd and not PATHS['working_dir']:
         PATHS['working_dir'] = env_wd
-        log.info("PATHS['working_dir'] set to env variable $OGGM_WORKDIR: "
+        log.workflow("PATHS['working_dir'] set to env variable $OGGM_WORKDIR: "
                      + env_wd)
 
     # Do not spam
@@ -444,12 +435,12 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
     try:
         use_mp = bool(int(os.environ['OGGM_USE_MULTIPROCESSING']))
         msg = 'ON' if use_mp else 'OFF'
-        log.info('Multiprocessing switched {} '.format(msg) +
+        log.workflow('Multiprocessing switched {} '.format(msg) +
                      'according to the ENV variable OGGM_USE_MULTIPROCESSING')
     except KeyError:
         use_mp = cp.as_bool('use_multiprocessing')
         msg = 'ON' if use_mp else 'OFF'
-        log.info('Multiprocessing switched {} '.format(msg) +
+        log.workflow('Multiprocessing switched {} '.format(msg) +
                      'according to the parameter file.')
     PARAMS['use_multiprocessing'] = use_mp
 
@@ -457,7 +448,7 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
     try:
         use_mp_spawn = bool(int(os.environ['OGGM_USE_MP_SPAWN']))
         msg = 'ON' if use_mp_spawn else 'OFF'
-        log.info('MP spawn context switched {} '.format(msg) +
+        log.workflow('MP spawn context switched {} '.format(msg) +
                      'according to the ENV variable OGGM_USE_MP_SPAWN')
     except KeyError:
         use_mp_spawn = cp.as_bool('use_mp_spawn')
@@ -468,22 +459,22 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
     if mpp == -1:
         try:
             mpp = int(os.environ['SLURM_JOB_CPUS_PER_NODE'])
-            log.info('Multiprocessing: using slurm allocated '
+            log.workflow('Multiprocessing: using slurm allocated '
                          'processors (N={})'.format(mpp))
         except (KeyError, ValueError):
             import multiprocessing
             mpp = multiprocessing.cpu_count()
-            log.info('Multiprocessing: using all available '
+            log.workflow('Multiprocessing: using all available '
                          'processors (N={})'.format(mpp))
     else:
-        log.info('Multiprocessing: using the requested number of '
+        log.workflow('Multiprocessing: using the requested number of '
                      'processors (N={})'.format(mpp))
     PARAMS['mp_processes'] = mpp
 
     # Size of LRU cache
     try:
         lru_maxsize = int(os.environ['LRU_MAXSIZE'])
-        log.info('Size of LRU cache set to {} '.format(lru_maxsize) +
+        log.workflow('Size of LRU cache set to {} '.format(lru_maxsize) +
                      'according to the ENV variable LRU_MAXSIZE')
     except KeyError:
         lru_maxsize = cp.as_int('lru_maxsize')
@@ -546,12 +537,10 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
     k = 'glacier_length_method'
     PARAMS[k] = cp[k]
     k = 'evolution_model'
-    PARAMS[k] = cp[k]    # Others
-    PARAMS['tidewater_type'] = cp.as_int('tidewater_type')
+    PARAMS[k] = cp[k]
 
-    # Regional scaling parameters (can be empty)
-    PARAMS['station_data_path'] = cp.get('station_data_path', '').strip()
-    PARAMS['era5_data_path'] = cp.get('era5_data_path', '').strip()
+    # Others
+    PARAMS['tidewater_type'] = cp.as_int('tidewater_type')
 
     # Precip factor can be none
     try:
@@ -584,26 +573,13 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
            'tidewater_type', 'store_model_geometry', 'use_winter_prcp_fac',
            'store_diagnostic_variables', 'store_fl_diagnostic_variables',
            'geodetic_mb_period', 'store_fl_diagnostics', 'winter_prcp_fac_ab',
-           'prcp_fac', 'downstream_line_shape', 'keep_multipolygon_outlines',
-           'station_data_path', 'era5_data_path', 'station_selection_method',
-           'bias_correction_method', 'lapse_rate_method', 'validation_method',
-           'save_regional_scaling_qc']
+           'prcp_fac', 'downstream_line_shape', 'keep_multipolygon_outlines']
     for k in ltr:
         cp.pop(k, None)
 
     # Other params are floats
     for k in cp:
-        try:
-            PARAMS[k] = cp.as_float(k)
-        except ValueError:
-            # Handle empty strings or invalid float values
-            value = cp[k]
-            if isinstance(value, (list, tuple)):
-                value = value[0] if value else ''
-            if str(value).strip() == '':
-                PARAMS[k] = None
-            else:
-                raise ValueError(f"Could not convert parameter '{k}' with value '{cp[k]}' to float")
+        PARAMS[k] = cp.as_float(k)
     PARAMS.do_log = True
 
     # Empty defaults
@@ -703,25 +679,24 @@ def oggm_static_paths():
 
     # Override defaults with env variables if available
     if os.environ.get('OGGM_DOWNLOAD_CACHE_RO') is not None:
-        ro = bool(strtobool(os.environ.get('OGGM_DOWNLOAD_CACHE_RO', '0')))
+        ro = bool(strtobool(os.environ.get('OGGM_DOWNLOAD_CACHE_RO')))
         config['dl_cache_readonly'] = ro
     if os.environ.get('OGGM_DOWNLOAD_CACHE') is not None:
         config['dl_cache_dir'] = os.environ.get('OGGM_DOWNLOAD_CACHE')
     if os.environ.get('OGGM_EXTRACT_DIR') is not None:
         # This is for the directories where OGGM needs to extract things
         # On the cluster it might be useful to do it on a fast disc
-        edir = os.path.abspath(os.environ.get('OGGM_EXTRACT_DIR', ''))
+        edir = os.path.abspath(os.environ.get('OGGM_EXTRACT_DIR'))
         config['tmp_dir'] = os.path.join(edir, 'tmp')
         config['rgi_dir'] = os.path.join(edir, 'rgi')
     if os.environ.get('OGGM_RGI_DIR') is not None:
-        config['rgi_dir'] = os.path.abspath(os.environ.get('OGGM_RGI_DIR', ''))
+        config['rgi_dir'] = os.path.abspath(os.environ.get('OGGM_RGI_DIR'))
 
     # Fill the PATH dict
     for k, v in config.iteritems():
         if not k.endswith('_dir'):
             continue
-        if isinstance(v, str):
-            PATHS[k] = os.path.abspath(os.path.expanduser(v))
+        PATHS[k] = os.path.abspath(os.path.expanduser(v))
 
     # Other
     PARAMS.do_log = False
@@ -802,9 +777,10 @@ def set_intersects_db(path_or_gdf=None):
     PARAMS.do_log = False
 
     if PARAMS['use_intersects'] and path_or_gdf is not None:
-        gpd = globals().get('gpd', None)
-        if gpd:
+        if isinstance(path_or_gdf, str):
             PARAMS['intersects_gdf'] = gpd.read_file(path_or_gdf)
+        else:
+            PARAMS['intersects_gdf'] = path_or_gdf
     else:
         PARAMS['intersects_gdf'] = pd.DataFrame()
     PARAMS.do_log = True
