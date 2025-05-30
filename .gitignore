@@ -45,8 +45,11 @@ docs/_images
 docs/.doctrees
 oggm/version.py
 oggm/ignore
+.netrc
+
 
 # Ignore Jupyter Notebook for testing
 tutorials/*.ipynb
 # Ignore Jupyter Notebook checkpoints
 tutorials/*checkpoints
+tutorials/*

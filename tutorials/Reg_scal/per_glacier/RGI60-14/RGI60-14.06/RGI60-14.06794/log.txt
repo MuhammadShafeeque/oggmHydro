@@ -53,8 +53,8 @@
 2023-05-24T17:15:31;glacier_statistics;time:0.668546199798584;SUCCESS
 2023-05-24T17:23:16;climate_statistics;time:0.6861047744750977;SUCCESS
 2023-05-24T17:29:29;fixed_geometry_mass_balance;time:0.02976822853088379;SUCCESS
-2023-08-15T20:03:04;flowline_model_run_historical;time:0.24277138710021973;SUCCESS
-2023-08-15T20:03:04;run_from_climate_data_historical;time:0.25588440895080566;SUCCESS
-2023-08-15T20:44:43;run_dynamic_melt_f_calibration_spinup_historical;time:3.1192989349365234;SUCCESS
-2023-08-15T22:57:59;glacier_statistics;time:0.7275722026824951;SUCCESS
-2025-05-29T22:38:01;define_glacier_region;HttpDownloadError: (401, 'https://e4ftl01.cr.usgs.gov/MEASURES/NASADEM_HGT.001/2000.02.11/NASADEM_HGT_n35e075.zip')
+2025-05-29T23:49:57;compute_physical_parameters;KeyError: 'coordinates'
+2025-05-29T23:50:02;compute_physical_parameters;KeyError: 'coordinates'
+2025-05-29T23:58:02;compute_physical_parameters;time:8.302564859390259;SUCCESS
+2025-05-29T23:58:11;process_regional_scaling_data;time:8.2467041015625;SUCCESS
+2025-05-29T23:58:11;mb_calibration_from_geodetic_mb;InvalidWorkflowError: use_temp_bias_from_file currently only available for W5E5 data.
