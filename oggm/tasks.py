@@ -39,6 +39,12 @@ from oggm.core.massbalance import apparent_mb_from_any_mb
 from oggm.core.massbalance import perturbate_mb_params
 from oggm.core.massbalance import fixed_geometry_mass_balance
 from oggm.core.massbalance import compute_ela
+# HydroMassBalance module
+from oggm.core.hydro_massbalance import hydro_mb_calibration
+from oggm.core.hydro_climate import setup_hydro_climate_integration
+from oggm.core.hydro_climate import compute_glacier_runoff
+from oggm.core.hydro_climate import calibrate_glacier_runoff
+from oggm.core.hydro_validation import validate_hydro_mass_balance
 from oggm.shop.w5e5 import process_w5e5_data
 from oggm.shop.cru import process_cru_data
 from oggm.shop.cru import process_dummy_cru_file
