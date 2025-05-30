@@ -26,3 +26,4 @@
 2025-05-29T23:49:57; compute_physical_parameters; KeyError; 'coordinates'
 2025-05-29T23:50:02; compute_physical_parameters; KeyError; 'coordinates'
 2025-05-29T23:58:11; mb_calibration_from_geodetic_mb; InvalidWorkflowError; use_temp_bias_from_file currently only available for W5E5 data.
+2025-05-30T14:32:45; mb_calibration_from_geodetic_mb; InvalidWorkflowError; use_temp_bias_from_file currently only available for W5E5 data.

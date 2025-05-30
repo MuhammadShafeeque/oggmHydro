@@ -1,1 +1,1 @@
-{"proj": "+proj=tmerc +lat_0=0 +lon_0=76.4047 +k=0.9996 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs", "x0y0": [-63638.0530451182, 4007927.104803629], "nxny": [639, 506], "dxdy": [200.0, -200.0], "pixel_ref": "center"}
+{"proj": "+proj=tmerc +lat_0=0 +lon_0=76.4047 +k=0.9996 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs", "x0y0": [-33638.0530451182, 3977927.104803629], "nxny": [339, 206], "dxdy": [200.0, -200.0], "pixel_ref": "center"}
