@@ -10,6 +10,8 @@ from oggm.workflow import regional_scaling_tasks
 from oggm.workflow import inversion_tasks
 from oggm.workflow import calibrate_inversion_from_consensus
 from oggm.workflow import merge_glacier_tasks
+from oggm.hydro_workflow import hydro_mass_balance_workflow
+from oggm.hydro_workflow import hydro_mass_balance_quickstart
 from oggm.utils import get_ref_mb_glaciers
 from oggm.utils import write_centerlines_to_shape
 from oggm.utils import compile_run_output

@@ -310,6 +310,16 @@ BASENAMES['qc_metrics'] = ('qc_metrics.nc', _doc)
 _doc = 'Climate data validation results and statistical summaries.'
 BASENAMES['validation_results'] = ('validation_results.nc', _doc)
 
+# Hydro workflow file types
+_doc = 'Detailed runoff components from HydroMassBalance calculations (glacier runoff, rain runoff, ice/snow contributions, etc.).'
+BASENAMES['runoff_components'] = ('runoff_components.pkl', _doc)
+
+_doc = 'Runoff calibration results and optimized parameters for HydroMassBalance model.'
+BASENAMES['runoff_calibration'] = ('runoff_calibration.pkl', _doc)
+
+_doc = 'HydroMassBalance calibration parameters and results for the glacier mass balance model.'
+BASENAMES['hydro_mb_calib'] = ('hydro_mb_calib.json', _doc)
+
 
 def set_logging_config(logging_level='INFO'):
     """Set the global logger parameters.

@@ -45,3 +45,8 @@ from oggm.core.flowline import Flowline
 from oggm.core.flowline import FlowlineModel
 from oggm.core.flowline import FileModel
 from oggm.core.massbalance import MassBalanceModel
+
+# Hydro-glaciological classes (parallel module approach)
+from oggm.core.hydro_massbalance import HydroMassBalance
+from oggm.core.hydro_climate import HydroClimateIntegration
+from oggm.core.hydro_validation import HydroValidationFramework
