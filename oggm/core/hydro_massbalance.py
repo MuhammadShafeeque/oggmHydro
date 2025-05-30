@@ -728,8 +728,7 @@ class HydroMassBalance(MassBalanceModel):
         target_priorities : dict
             Priority weights for multi-target calibration
         """
-        
-        # Initialize base OGGM mass balance model
+          # Initialize base OGGM mass balance model
         super(HydroMassBalance, self).__init__()
         
         # Store configuration
@@ -748,11 +747,17 @@ class HydroMassBalance(MassBalanceModel):
             'volume': volume_temporal_scale,
             'velocity': velocity_temporal_scale
         }
+          # CRITICAL FIX: Initialize model parameters BEFORE climate data initialization
+        # These parameters are needed by _initialize_climate_data
+        self.melt_f = melt_f if melt_f is not None else cfg.PARAMS.get('melt_f', 5.0)
+        self.temp_bias = temp_bias if temp_bias is not None else 0.0
+        self.prcp_fac = prcp_fac if prcp_fac is not None else cfg.PARAMS.get('prcp_fac', 2.5)
+        self.bias = bias if bias is not None else 0.0
         
         # Initialize physics modules
         self._initialize_physics_modules(**kwargs)
         
-        # Initialize climate data
+        # Initialize climate data (now that parameters are set)
         self._initialize_climate_data(filename, input_filesuffix, ys, ye, **kwargs)
         
         # Configure calibration targets
@@ -779,12 +784,6 @@ class HydroMassBalance(MassBalanceModel):
             )
         else:
             self.calibrator = None
-        
-        # Model parameters
-        self.melt_f = melt_f or cfg.PARAMS.get('melt_f', 5.0)
-        self.temp_bias = temp_bias or 0.0
-        self.prcp_fac = prcp_fac or cfg.PARAMS.get('prcp_fac', 2.5)
-        self.bias = bias
         
         # OGGM compatibility
         self.valid_bounds = [-1e4, 2e4]

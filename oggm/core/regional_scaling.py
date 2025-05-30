@@ -379,7 +379,7 @@ class BiasCorrector:
 class PhysicalDownscaler:
     """Implements physically-based downscaling methods."""
     
-    def __init__(self, gdir):
+    def __init__(self, gdir, use_gridded_data=True):
         """
         Initialize physical downscaler for a glacier.
         
@@ -387,20 +387,103 @@ class PhysicalDownscaler:
         ----------
         gdir : GlacierDirectory
             OGGM glacier directory
+        use_gridded_data : bool
+            If True, prefer gridded.nc data over direct DEM access.
+            This uses OGGM's processed topography data which is already
+            aligned to the glacier grid and includes quality-controlled variables.
         """
         self.gdir = gdir
-        self._load_terrain_data()
+        self.use_gridded_data = use_gridded_data
+        self._load_terrain_data(use_gridded_data=use_gridded_data)
         
-    def _load_terrain_data(self):
-        """Load terrain data from glacier directory."""
-        # Get DEM and glacier geometry
-        dem_path = self.gdir.get_filepath('dem')
-        with rasterio.open(dem_path) as src:
-            self.dem = src.read(1)
-            self.dem_transform = src.transform
-            self.dem_crs = src.crs
+    def _load_terrain_data(self, use_gridded_data=True):
+        """Load terrain data from glacier directory.
         
-        # Calculate terrain metrics
+        Parameters
+        ----------
+        use_gridded_data : bool
+            If True, prefer gridded.nc data over direct DEM access.
+            This uses OGGM's processed topography data which is already
+            aligned to the glacier grid and includes smoothed versions.
+        """
+        self.loaded_from_gridded = False
+        
+        try:
+            # Try to use gridded.nc data first (preferred for OGGM integration)
+            if use_gridded_data and self.gdir.has_file('gridded_data'):
+                log.info(f"Loading terrain data from gridded.nc for {self.gdir.rgi_id}")
+                with utils.ncDataset(self.gdir.get_filepath('gridded_data')) as nc:
+                    # Use OGGM's processed topography (prefer smoothed version)
+                    if 'topo_smoothed' in nc.variables:
+                        self.dem = nc.variables['topo_smoothed'][:]
+                        log.debug("Using smoothed topography from gridded.nc")
+                    else:
+                        self.dem = nc.variables['topo'][:]
+                        log.debug("Using raw topography from gridded.nc")
+                    
+                    # Ensure DEM is not a masked array
+                    if hasattr(self.dem, 'filled'):
+                        self.dem = self.dem.filled(np.nan)
+                    
+                    # Load glacier boundary information
+                    if 'glacier_mask' in nc.variables:
+                        self.glacier_mask = nc.variables['glacier_mask'][:].astype(bool)
+                        log.debug("Loaded glacier mask from gridded.nc")
+                    
+                    if 'glacier_ext' in nc.variables:
+                        self.glacier_ext = nc.variables['glacier_ext'][:]
+                        log.debug("Loaded glacier extent from gridded.nc")
+                    
+                    # Load pre-computed terrain metrics if available
+                    terrain_vars = ['slope', 'aspect', 'slope_factor']
+                    for var in terrain_vars:
+                        if var in nc.variables:
+                            setattr(self, f'{var}_precomputed', nc.variables[var][:])
+                            log.debug(f"Loaded pre-computed {var} from gridded.nc")
+                    
+                    # Load other useful variables for climate downscaling
+                    useful_vars = ['dis_from_border', 'catchment_area', 'flowline_mask', 'topo_valid_mask']
+                    self.gridded_variables = {}
+                    for var in useful_vars:
+                        if var in nc.variables:
+                            self.gridded_variables[var] = nc.variables[var][:]
+                            log.debug(f"Loaded {var} from gridded.nc")
+                    
+                    # Get grid information from gdir (no need for transform)
+                    self.dem_transform = None  # Use gdir.grid for spatial operations
+                    self.dem_crs = self.gdir.grid.proj.srs
+                    self.grid = self.gdir.grid
+                    
+                    # Mark successful loading
+                    self.loaded_from_gridded = True
+                    
+                log.info(f"Successfully loaded terrain from gridded.nc: {self.dem.shape}")
+                
+        except Exception as e:
+            log.warning(f"Failed to load from gridded.nc: {e}, falling back to DEM file")
+            use_gridded_data = False
+            self.loaded_from_gridded = False
+            
+        if not use_gridded_data:
+            # Fallback: use local dem.tif file (already supports cfg.PARAMS['dem_source'] = 'USER')
+            dem_path = self.gdir.get_filepath('dem')
+            log.info(f"Loading terrain data from local DEM: {dem_path}")
+            
+            # Check if dem.tif exists in glacier directory
+            if not os.path.exists(dem_path):
+                raise FileNotFoundError(f"Local DEM file not found: {dem_path}")
+                
+            with rasterio.open(dem_path) as src:
+                self.dem = src.read(1)
+                self.dem_transform = src.transform
+                self.dem_crs = src.crs
+                self.grid = None  # Use rasterio transform
+                self.glacier_mask = None
+                self.gridded_variables = {}
+            
+            log.info(f"Successfully loaded terrain from DEM: {self.dem.shape}")
+        
+        # Calculate terrain metrics (use pre-computed if available)
         self._calculate_terrain_metrics()
         
         # Get elevation bands
@@ -408,43 +491,98 @@ class PhysicalDownscaler:
         
     def _calculate_terrain_metrics(self):
         """Calculate slope, aspect, and other terrain metrics."""
-        # Calculate gradients
+        # Use pre-computed values if available from gridded.nc
+        if hasattr(self, 'slope_precomputed'):
+            self.slope = self.slope_precomputed
+            log.debug("Using pre-computed slope from gridded.nc")
+        else:
+            # Calculate gradients from DEM
+            dy, dx = np.gradient(self.dem)
+            # Slope (in radians)
+            self.slope = np.arctan(np.sqrt(dx**2 + dy**2))
+            log.debug("Computed slope from DEM gradients")
+        
+        if hasattr(self, 'aspect_precomputed'):
+            self.aspect = self.aspect_precomputed
+            log.debug("Using pre-computed aspect from gridded.nc")
+        else:
+            # Calculate aspect from DEM
+            dy, dx = np.gradient(self.dem)
+            self.aspect = np.arctan2(-dx, dy)
+            self.aspect = np.where(self.aspect < 0, self.aspect + 2*np.pi, self.aspect)
+            log.debug("Computed aspect from DEM gradients")
+        
+        # Always compute curvature from DEM (not typically pre-computed)
         dy, dx = np.gradient(self.dem)
-        
-        # Slope (in radians, then degrees)
-        self.slope = np.arctan(np.sqrt(dx**2 + dy**2))
-        
-        # Aspect (in radians, then degrees)
-        self.aspect = np.arctan2(-dx, dy)
-        self.aspect = np.where(self.aspect < 0, self.aspect + 2*np.pi, self.aspect)
-        
-        # Curvature
         dxx = np.gradient(dx, axis=1)
         dyy = np.gradient(dy, axis=0)
         self.curvature = dxx + dyy
         
         # Terrain roughness (standard deviation of elevation in 3x3 window)
-        from scipy.ndimage import generic_filter
-        self.roughness = generic_filter(self.dem, np.std, size=3)
+        try:
+            from scipy.ndimage import generic_filter
+            self.roughness = generic_filter(self.dem, np.std, size=3)
+        except ImportError:
+            log.warning("scipy.ndimage not available, skipping roughness calculation")
+            self.roughness = np.zeros_like(self.dem)
         
     def _get_elevation_bands(self):
-        """Get elevation bands for the glacier."""
+        """Get elevation bands for the glacier, prioritizing OGGM's elevation band data."""
         try:
-            # Try to get existing elevation bands from OGGM
-            cls = self.gdir.read_pickle('inversion_flowlines')
-            elevations = []
-            for cl in cls:
-                elevations.extend(cl.surface_h)
+            # First try to use OGGM's elevation band flowlines if available (preferred)
+            if self.gdir.has_file('elevation_band_flowline'):
+                log.debug("Using OGGM elevation band flowlines")
+                try:
+                    # Try reading as CSV first (new format)
+                    import pandas as pd
+                    df = pd.read_csv(self.gdir.get_filepath('elevation_band_flowline'), index_col=0)
+                    if not df.empty:
+                        # Check for elevation column variants
+                        elev_col = None
+                        for col in ['mean_elevation', 'elevation', 'elev', 'z']:
+                            if col in df.columns:
+                                elev_col = col
+                                break
+                        
+                        if elev_col:
+                            elevations = df[elev_col].dropna().values
+                            if len(elevations) > 0:
+                                elevation_bands = np.sort(elevations)
+                                log.debug(f"Got {len(elevation_bands)} elevation bands from CSV flowlines")
+                                return elevation_bands
+                except:
+                    # Fallback to pickle format
+                    df = self.gdir.read_pickle('elevation_band_flowline') 
+                    if hasattr(df, 'columns') and 'mean_elevation' in df.columns:
+                        elevations = df['mean_elevation'].dropna().values
+                        if len(elevations) > 0:
+                            elevation_bands = np.sort(elevations)
+                            log.debug(f"Got {len(elevation_bands)} elevation bands from pickle flowlines")
+                            return elevation_bands
             
-            # Create elevation bands
-            min_elev = np.min(elevations)
-            max_elev = np.max(elevations)
-            n_bands = max(5, min(20, int((max_elev - min_elev) / 50)))  # 50m bands
+            # Try to get existing elevation bands from OGGM inversion flowlines
+            if self.gdir.has_file('inversion_flowlines'):
+                log.debug("Using OGGM inversion flowlines")
+                cls = self.gdir.read_pickle('inversion_flowlines')
+                elevations = []
+                for cl in cls:
+                    elevations.extend(cl.surface_h)
+                
+                if len(elevations) > 0:
+                    # Create elevation bands
+                    min_elev = np.min(elevations)
+                    max_elev = np.max(elevations)
+                    n_bands = max(5, min(20, int((max_elev - min_elev) / 50)))  # 50m bands
+                    
+                    elevation_bands = np.linspace(min_elev, max_elev, n_bands)
+                    log.debug(f"Created {len(elevation_bands)} elevation bands from flowlines: {min_elev:.0f}-{max_elev:.0f}m")
+                    return elevation_bands
+                    
+        except Exception as e:
+            log.debug(f"Could not use OGGM flowlines for elevation bands: {e}")
             
-            elevation_bands = np.linspace(min_elev, max_elev, n_bands)
-            
-        except:
-            # Fallback: use DEM within glacier boundary
+        # Fallback: use DEM within glacier boundary
+        try:
             glacier_mask = self._get_glacier_mask()
             glacier_elevations = self.dem[glacier_mask]
             glacier_elevations = glacier_elevations[~np.isnan(glacier_elevations)]
@@ -454,28 +592,65 @@ class PhysicalDownscaler:
                 max_elev = np.max(glacier_elevations)
                 n_bands = max(5, min(20, int((max_elev - min_elev) / 50)))
                 elevation_bands = np.linspace(min_elev, max_elev, n_bands)
+                log.debug(f"Created {len(elevation_bands)} elevation bands from DEM: {min_elev:.0f}-{max_elev:.0f}m")
+                return elevation_bands
             else:
-                # Ultimate fallback
-                elevation_bands = np.linspace(2000, 4000, 10)
+                log.warning("No valid glacier elevations found")
                 
+        except Exception as e:
+            log.warning(f"Failed to extract elevations from glacier DEM: {e}")
+            
+        # Ultimate fallback
+        elevation_bands = np.linspace(2000, 4000, 10)
+        log.warning(f"Using fallback elevation bands: {elevation_bands[0]:.0f}-{elevation_bands[-1]:.0f}m")
         return elevation_bands
     
     def _get_glacier_mask(self):
-        """Get glacier boundary mask."""
+        """Get glacier boundary mask, preferring gridded.nc data."""
         try:
-            # Get glacier outline
-            gdf = self.gdir.read_shapefile('outlines')
-            glacier_geom = gdf.geometry.iloc[0]
+            # First try to use mask loaded from gridded.nc (preferred)
+            if hasattr(self, 'glacier_mask') and self.glacier_mask is not None:
+                log.debug(f"Using glacier mask from gridded.nc: {np.sum(self.glacier_mask)} glacier pixels")
+                return self.glacier_mask
             
-            # Create mask
-            mask = geometry_mask([glacier_geom], 
-                               transform=self.dem_transform,
-                               invert=True,
-                               out_shape=self.dem.shape)
-            return mask
-        except:
-            # Fallback: use all valid DEM pixels
-            return ~np.isnan(self.dem)
+            # Try to load from gridded.nc if not already loaded
+            if self.loaded_from_gridded or (hasattr(self, 'grid') and self.grid is not None):
+                try:
+                    with utils.ncDataset(self.gdir.get_filepath('gridded_data')) as nc:
+                        if 'glacier_mask' in nc.variables:
+                            mask = nc.variables['glacier_mask'][:].astype(bool)
+                            log.debug(f"Loaded glacier mask from gridded.nc: {np.sum(mask)} glacier pixels")
+                            self.glacier_mask = mask  # Cache for future use
+                            return mask
+                except Exception as e:
+                    log.debug(f"Could not load glacier mask from gridded.nc: {e}")
+            
+            # Fallback: create mask from glacier outline and DEM transform
+            if hasattr(self, 'dem_transform') and self.dem_transform is not None:
+                # Get glacier outline
+                gdf = self.gdir.read_shapefile('outlines')
+                glacier_geom = gdf.geometry.iloc[0]
+                
+                # Create mask using rasterio
+                from rasterio.features import geometry_mask
+                mask = geometry_mask([glacier_geom], 
+                                   transform=self.dem_transform,
+                                   invert=True,
+                                   out_shape=self.dem.shape)
+                log.debug(f"Created glacier mask from outline: {np.sum(mask)} glacier pixels")
+                return mask
+            
+        except Exception as e:
+            log.warning(f"Failed to get glacier mask: {e}")
+            
+        # Ultimate fallback: use valid DEM pixels (conservative approach)
+        if hasattr(self, 'gridded_variables') and 'topo_valid_mask' in self.gridded_variables:
+            mask = self.gridded_variables['topo_valid_mask'].astype(bool)
+            log.debug(f"Using topo_valid_mask from gridded.nc: {np.sum(mask)} pixels")
+        else:
+            mask = ~np.isnan(self.dem)
+            log.debug(f"Using fallback mask (valid DEM pixels): {np.sum(mask)} pixels")
+        return mask
     
     def compute_lapse_rates(self, station_data, method='spatiotemporal'):
         """
@@ -1003,8 +1178,9 @@ def compute_physical_parameters(gdir, station_data_path, method='hybrid',
     
     log.info(f"Found {len(station_data)} station(s)")
     
-    # Initialize physical downscaler
-    downscaler = PhysicalDownscaler(gdir)
+    # Initialize physical downscaler with gridded data preference
+    use_gridded = kwargs.get('use_gridded_data', True)
+    downscaler = PhysicalDownscaler(gdir, use_gridded_data=use_gridded)
     
     # Compute lapse rates
     lapse_rate_method = kwargs.get('lapse_rate_method', DEFAULT_PARAMS['lapse_rate_method'])
@@ -1335,7 +1511,7 @@ def apply_transfer_functions(gdir, station_data, physical_params=None, y0=None, 
         
         # Get glacier elevation
         try:
-            downscaler = PhysicalDownscaler(gdir)
+            downscaler = PhysicalDownscaler(gdir, use_gridded_data=True)
             target_elevation = np.mean(downscaler.elevation_bands)
             
             # Apply lapse rate correction (simplified)
