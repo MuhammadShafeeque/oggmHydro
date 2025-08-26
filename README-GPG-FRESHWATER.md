@@ -66,7 +66,7 @@ Where:
 - $m_i(z)$ is monthly surface mass balance for grid point $i$ [mm w.e.]
 - $f_P$ is precipitation factor (default: 1.6)
 - $P_i^{solid}(z)$ is solid precipitation [mm w.e.]
-- $\mu$ is air temperature sensitivity [mm w.e. K$^{-1}$]
+- $\mu$ is air temperature sensitivity [mm w.e. K⁻¹]
 - $T_i^m(z)$ is air temperature above the threshold for ice melt [K]
 
 ### Frontal Ablation for Marine-Terminating Glaciers
@@ -77,7 +77,7 @@ $$Q_f = k \times d \times h \times w$$
 
 Where:
 - $Q_f$ is the frontal ablation flux
-- $k$ is the water-depth sensitivity parameter [yr$^{-1}$]
+- $k$ is the water-depth sensitivity parameter [yr⁻¹]
 - $d$ is water depth at the terminus [m]
 - $h$ is ice thickness at the terminus [m]
 - $w$ is glacier width at the terminus [m]
@@ -93,7 +93,7 @@ Where:
 - $C$ is observed annual frontal ablation rate [Gt/yr]
 - $\Delta M_f$ is observed annual volume retreat due to area changes in terminus region [Gt/yr]
 - $f_{bwl}$ is fraction of $\Delta M_f$ occurring below waterline
-- $A_{RGI}$ is glacier surface area [km$^2$]
+- $A_{RGI}$ is glacier surface area [km²]
 - $T_m$ is annually accumulated air temperature above melt threshold [K]
 
 ### Total Freshwater Runoff

@@ -107,6 +107,7 @@ output*/
 *.jpg
 *.jpeg
 *.png
+!gpg_freshwater_workflow.png
 *.zip
 *.tar
 *.gz
