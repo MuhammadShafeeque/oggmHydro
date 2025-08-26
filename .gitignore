@@ -19,6 +19,15 @@ wheels/
 .installed.cfg
 *.egg
 
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+oggm_mt_env/
+.venv-oggm/
+
 # asv stuff
 .asv/
 
@@ -30,6 +39,9 @@ wheels/
 .spyderproject
 .spyproject
 .ropeproject
+*.iml
+.project
+.pydevproject
 
 # coverage stuffs
 .coverage
@@ -57,6 +69,8 @@ examples/*checkpoints
 *.nbgrader.log
 .jupyter/
 jupyter_execute/
+.virtual_documents/
+notebooks/.virtual_documents/
 
 # Tests stuffs
 oggm/tests/result_images/
@@ -92,6 +106,12 @@ oggm/ignore
 *.grib
 *.pkl
 *.pickle
+*.csv
+*.xlsx
+*.xls
+*.mat
+*.json
+!asv.conf.json
 
 # temporary and output files
 tmp*/
@@ -100,6 +120,12 @@ output*/
 *.bak
 *.swp
 *~
+.~*
+*.log
+*.out
+slurm-*.out
+*.err
+.history/
 
 # Large binary files
 *.tif
@@ -129,8 +155,13 @@ env/
 ENV/
 .env/
 .venv/
+.venv-oggm/
 .conda/
 .python-version
+oggm_mt_env/
+Pipfile
+Pipfile.lock
+poetry.lock
 
 # specific to GPG-freshwater research
 GPG_freshwater_results/
@@ -138,3 +169,13 @@ freshwater_plots/
 glacier_data/
 climate_data/
 intermediate_results/
+calibration_results/
+sensitivity_tests/
+validation_data/
+raw_data/
+processed_data/
+model_outputs/
+figures/
+manuscripts/
+logs/
+slurm_outputs/
