@@ -1,5 +1,22 @@
 *.py[cod]
-__pycache__
+__pycache__/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # asv stuff
 .asv/
@@ -7,40 +24,115 @@ __pycache__
 # IDE stuffs
 .idea/
 .vscode/
+*.sublime-project
+*.sublime-workspace
+.spyderproject
+.spyproject
+.ropeproject
 
 # coverage stuffs
 .coverage
+htmlcov/
+.tox/
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
 
 # OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
 # Notebook stuffs
 examples/*checkpoints
-.ipynb_checkpoints
+.ipynb_checkpoints/
 *.nbgrader.log
+.jupyter/
+jupyter_execute/
 
 # Tests stuffs
-oggm/tests/result_images
-result_images
-.pytest_cache
+oggm/tests/result_images/
+result_images/
+.pytest_cache/
 
-# Packages
-*.egg
-*.egg-info
-eggs
-*.eggs
+# Documentation
+docs/_build/
+docs/_build_html/
+docs/generated/
+docs/_generated/
+docs/_sources/
+docs/_images/
+docs/.doctrees/
+docs/_templates/
+docs/_static/css/*.map
 
 # specific
 *.cache
 baseline/
 *.lock
 oggm/tests/tmp_*
-docs/_build
-docs/_build_html
-docs/generated
-docs/_generated
-docs/_sources
-docs/_images
-docs/.doctrees
 oggm/version.py
 oggm/ignore
+
+# data files
+*.npy
+*.npz
+*.nc
+*.zarr
+*.h5
+*.hdf5
+*.grib
+*.pkl
+*.pickle
+
+# temporary and output files
+tmp*/
+output*/
+*.tmp
+*.bak
+*.swp
+*~
+
+# Large binary files
+*.tif
+*.tiff
+*.jp2
+*.jpg
+*.jpeg
+*.png
+*.zip
+*.tar
+*.gz
+*.bz2
+*.rar
+*.shp
+*.shx
+*.dbf
+*.prj
+*.sbn
+*.sbx
+*.flt
+*.hdr
+
+# environment
+venv/
+env/
+ENV/
+.env/
+.venv/
+.conda/
+.python-version
+
+# specific to GPG-freshwater research
+GPG_freshwater_results/
+freshwater_plots/
+glacier_data/
+climate_data/
+intermediate_results/

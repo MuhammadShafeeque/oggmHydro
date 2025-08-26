@@ -45,3 +45,7 @@ from oggm.core.flowline import Flowline
 from oggm.core.flowline import FlowlineModel
 from oggm.core.flowline import FileModel
 from oggm.core.massbalance import MassBalanceModel
+# GPG-Freshwater specific imports
+from oggm.core.freshwater import compute_glacier_runoff, analyze_peak_water
+from oggm.core.greenland import add_greenland_attributes, identify_greenland_region
+from oggm.core.gpg_calibration import calibrate_inversion_from_geodetic_mb
