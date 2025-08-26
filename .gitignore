@@ -6,6 +6,7 @@ build/
 develop-eggs/
 dist/
 downloads/
+MyRuns/
 eggs/
 .eggs/
 lib/
