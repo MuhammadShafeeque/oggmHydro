@@ -48,6 +48,66 @@ This branch implements methodologies and enhancements for accurate modeling of G
 - Geodetic mass balance observations (Hugonnet et al., 2021)
 - Frontal ablation estimates (Kochtitzky et al., 2022)
 
+## Workflow Overview
+
+![GPG-Freshwater Workflow](https://raw.githubusercontent.com/MuhammadShafeeque/oggmHydro/oggm-GPG-freshwater/docs/_static/gpg_freshwater_workflow.png)
+
+*Figure: Workflow diagram showing the integration of model setup, climate data preprocessing, calibration, and future projections analysis. The workflow highlights the key components of the GPG-Freshwater methodology.*
+
+## Key Equations
+
+### Mass Balance Calculation
+
+The monthly surface mass balance at a grid point $i$ with elevation $z$ is calculated as:
+
+$$m_i(z) = f_P P_i^{solid}(z) - \mu \max(T_i^m(z), 0)$$
+
+Where:
+- $m_i(z)$ is monthly surface mass balance for grid point $i$ [mm w.e.]
+- $f_P$ is precipitation factor (default: 1.6)
+- $P_i^{solid}(z)$ is solid precipitation [mm w.e.]
+- $\mu$ is air temperature sensitivity [mm w.e. K$^{-1}$]
+- $T_i^m(z)$ is air temperature above the threshold for ice melt [K]
+
+### Frontal Ablation for Marine-Terminating Glaciers
+
+For marine-terminating glaciers, frontal ablation is determined using:
+
+$$Q_f = k \times d \times h \times w$$
+
+Where:
+- $Q_f$ is the frontal ablation flux
+- $k$ is the water-depth sensitivity parameter [yr$^{-1}$]
+- $d$ is water depth at the terminus [m]
+- $h$ is ice thickness at the terminus [m]
+- $w$ is glacier width at the terminus [m]
+
+### Temperature Sensitivity Calibration
+
+The temperature sensitivity ($\mu$) is calibrated using:
+
+$$\mu = \frac{f_P P_{solid} - (\Delta M_{awl} + C + f_{bwl} \Delta M_f) / A_{RGI}}{T_m}$$
+
+Where:
+- $\Delta M_{awl}$ is observed annual volume change above sea level [Gt/yr]
+- $C$ is observed annual frontal ablation rate [Gt/yr]
+- $\Delta M_f$ is observed annual volume retreat due to area changes in terminus region [Gt/yr]
+- $f_{bwl}$ is fraction of $\Delta M_f$ occurring below waterline
+- $A_{RGI}$ is glacier surface area [km$^2$]
+- $T_m$ is annually accumulated air temperature above melt threshold [K]
+
+### Total Freshwater Runoff
+
+The total annual freshwater runoff from a glacier is calculated as:
+
+$$TR = \sum GR_{i,s,r} + SR + RR$$
+
+Where:
+- $TR$ is total liquid freshwater runoff
+- $GR_{i,s,r}$ denotes the sum of runoff from glacier ice ($GR_i$), snow ($GR_s$), and rain ($GR_r$)
+- $SR$ is snowmelt off-glacier (in deglaciated areas)
+- $RR$ is rain runoff off-glacier (in deglaciated areas)
+
 ## Usage Notes
 
 This branch is specifically designed for Greenland peripheral glacier studies focusing on freshwater contributions to the ocean and sea level rise. The enhancements allow for detailed projections of glacier area, volume, mass loss, sea level rise, solid ice discharge, and freshwater runoff from 2020 to 2100.
