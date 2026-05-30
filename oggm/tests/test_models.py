@@ -5445,9 +5445,10 @@ class TestHydroRouting:
         q = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
         assert_allclose(_kling_gupta_efficiency(q, q), 1.0, atol=1e-10)
 
-        # q_sim = 2 * q_obs: r=1, alpha=1, beta=2 → KGE = 1-sqrt(0+0+1) = 0
+        # q_sim = 2 * q_obs: r=1, alpha=2, beta=2 → KGE = 1-sqrt(0+1+1) = 1-sqrt(2)
         q_obs = np.array([1.0, 2.0, 3.0, 4.0])
-        assert_allclose(_kling_gupta_efficiency(q_obs * 2.0, q_obs), 0.0, atol=1e-10)
+        assert_allclose(_kling_gupta_efficiency(q_obs * 2.0, q_obs),
+                        1.0 - np.sqrt(2.0), atol=1e-10)
 
         # All NaN simulated → returns -inf
         assert _kling_gupta_efficiency(
