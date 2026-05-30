@@ -140,15 +140,15 @@ def _lon_to_region(lon_deg, lat_deg=0.0):
 
 
 def _get_hydrobasins_file(region, level, local_dir='', use_lakes=True):
-    """Return a local path to the HydroBASINS shapefile for *region/level*.
+    """Return a geopandas-readable path for the HydroBASINS shapefile.
 
-    Attempts the following in order:
-    1. ``local_dir`` override (pre-downloaded files).
-       Searches for both the customized-with-lakes filename and the
-       standard filename so users can place either variant in the directory.
-    2. Download via :func:`oggm.utils.file_downloader`.
-       Uses the customized-with-lakes URL by default (``use_lakes=True``),
-       which is preferred for glacierized catchments.
+    Search order
+    ------------
+    1. *local_dir* — individual level ZIP  (``hybas_lake_{r}_lev{NN}_v1c.zip``)
+    2. *local_dir* — combined all-levels ZIP (``hybas_lake_{r}_lev01-12_v1c.zip``)
+       with the specific level's shapefile referenced via a GDAL
+       ``/vsizip/`` path so geopandas reads only the requested layer.
+    3. Download the individual level ZIP via :func:`oggm.utils.file_downloader`.
 
     Parameters
     ----------
@@ -157,43 +157,77 @@ def _get_hydrobasins_file(region, level, local_dir='', use_lakes=True):
     level : int
         Pfaffstetter aggregation level 1–12.
     local_dir : str
-        Directory to search for pre-downloaded ZIP / SHP files.
+        Directory that may contain pre-downloaded ZIP files.
     use_lakes : bool
-        If ``True`` (default), use the "customized with lakes" variant
-        (``hybas_lake_{region}_lev{NN}_v1c.zip``).  Set ``False`` to use
-        the standard variant (``hybas_{region}_lev{NN}_v1c.zip``).
+        ``True`` (default) → "customized with lakes" variant
+        (``hybas_lake_*``).  ``False`` → standard variant (``hybas_*``).
 
     Returns
     -------
     str
-        Local path to the ZIP archive (may be passed to
-        ``gpd.read_file('zip://' + path)``).
+        A path string that can be passed **directly** to
+        :func:`geopandas.read_file`.  This is either:
+        * ``'zip://' + local_path``  for a standalone level ZIP, or
+        * ``'/vsizip/{combo_zip}/{shp_name}'``  for a combined ZIP.
     """
-    fname_lakes    = f'hybas_lake_{region}_lev{level:02d}_v1c.zip'
-    fname_standard = f'hybas_{region}_lev{level:02d}_v1c.zip'
-    # Primary filename depends on variant; fallback to the other if missing
-    fname_primary   = fname_lakes    if use_lakes else fname_standard
-    fname_fallback  = fname_standard if use_lakes else fname_lakes
+    import zipfile as _zipfile
+
+    # ---- filename components ------------------------------------------------
+    if use_lakes:
+        shp_name     = f'hybas_lake_{region}_lev{level:02d}_v1c.shp'
+        indiv_zip    = f'hybas_lake_{region}_lev{level:02d}_v1c.zip'
+        combo_zip    = f'hybas_lake_{region}_lev01-12_v1c.zip'
+        fb_shp_name  = f'hybas_{region}_lev{level:02d}_v1c.shp'
+        fb_indiv_zip = f'hybas_{region}_lev{level:02d}_v1c.zip'
+        fb_combo_zip = f'hybas_{region}_lev01-12_v1c.zip'
+    else:
+        shp_name     = f'hybas_{region}_lev{level:02d}_v1c.shp'
+        indiv_zip    = f'hybas_{region}_lev{level:02d}_v1c.zip'
+        combo_zip    = f'hybas_{region}_lev01-12_v1c.zip'
+        fb_shp_name  = f'hybas_lake_{region}_lev{level:02d}_v1c.shp'
+        fb_indiv_zip = f'hybas_lake_{region}_lev{level:02d}_v1c.zip'
+        fb_combo_zip = f'hybas_lake_{region}_lev01-12_v1c.zip'
 
     if local_dir:
-        for fname in (fname_primary, fname_fallback):
+        # 1. Individual level ZIP (preferred — one shapefile per zip)
+        for fname in (indiv_zip, fb_indiv_zip):
             candidate = os.path.join(local_dir, fname)
             if os.path.isfile(candidate):
-                log.debug('_get_hydrobasins_file: using local file %s', candidate)
-                return candidate
+                log.debug('_get_hydrobasins_file: using %s', candidate)
+                return 'zip://' + candidate
 
+        # 2. Combined all-levels ZIP → GDAL /vsizip/ with explicit layer
+        for (combo, shp) in [(combo_zip, shp_name),
+                              (fb_combo_zip, fb_shp_name)]:
+            combo_path = os.path.join(local_dir, combo)
+            if not os.path.isfile(combo_path):
+                continue
+            try:
+                with _zipfile.ZipFile(combo_path) as zf:
+                    basenames = {os.path.basename(n) for n in zf.namelist()}
+            except Exception:
+                continue
+            # Pick whichever shapefile name is present
+            hit = shp if shp in basenames else (fb_shp_name if fb_shp_name in basenames else None)
+            if hit is not None:
+                read_path = f'/vsizip/{combo_path}/{hit}'
+                log.debug('_get_hydrobasins_file: using combined zip %s !%s',
+                          combo_path, hit)
+                return read_path
+
+    # 3. Download the individual level ZIP
     url_path = (_HYBAS_PATH_LAKES if use_lakes else _HYBAS_PATH_STANDARD)
     url = _hydrosheds_server() + url_path.format(region=region, level=level)
-    local = utils.file_downloader(url)
-    if local is None:
+    downloaded = utils.file_downloader(url)
+    if downloaded is None:
         raise FileNotFoundError(
             f'Could not download HydroBASINS level-{level} for region '
             f'"{region}" from:\n  {url}\n'
             'Set cfg.PARAMS["hydrobasins_local_dir"] to a directory '
-            'containing pre-downloaded files, or '
-            'cfg.PARAMS["hydrobasins_server"] to an accessible mirror.'
+            'containing the pre-downloaded ZIP (individual level or combined '
+            'lev01-12), or cfg.PARAMS["hydrobasins_server"] to a mirror.'
         )
-    return local
+    return 'zip://' + downloaded
 
 
 def _get_hydrorivers_file(region, local_dir=''):
@@ -283,10 +317,12 @@ def get_hydrobasins(bbox, level=8, region=None, use_lakes=True):
         region = _lon_to_region(lon_c, lat_c)
 
     local_dir = _hydrobasins_local_dir()
-    zpath = _get_hydrobasins_file(region, level, local_dir=local_dir,
-                                  use_lakes=use_lakes)
+    # _get_hydrobasins_file returns a full geopandas-readable path:
+    # 'zip://...' for standalone ZIPs, '/vsizip/...' for combined ZIPs.
+    read_path = _get_hydrobasins_file(region, level, local_dir=local_dir,
+                                      use_lakes=use_lakes)
 
-    gdf = gpd.read_file('zip://' + zpath)
+    gdf = gpd.read_file(read_path)
     # Clip to bounding box (spatial subset)
     gdf = gdf.cx[lon_min:lon_max, lat_min:lat_max].copy()
     gdf = gdf.reset_index(drop=True)
