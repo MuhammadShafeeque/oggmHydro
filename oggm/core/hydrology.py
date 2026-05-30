@@ -8,9 +8,12 @@ to have been run first (model_diagnostics file must exist).
 Phase 1: Single linear reservoir  — route_hydro_output()
 Phase 2: Two-component reservoir  — route_hydro_output_2c()
 Phase 3: Basin-level aggregation  — aggregate_basin_discharge()
+Phase 4: KGE calibration          — calibrate_routing_params()
 """
 
+import json
 import logging
+import os
 import shutil
 
 import numpy as np
@@ -370,3 +373,244 @@ def aggregate_basin_discharge(gdirs, filesuffix='', basin_id=None):
         'basin_id': str(basin_id) if basin_id is not None else 'unknown',
     }
     return ds_basin
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Kling-Gupta calibration
+# ---------------------------------------------------------------------------
+
+def _kling_gupta_efficiency(q_sim, q_obs):
+    """Kling-Gupta Efficiency (KGE; Gupta et al. 2009).
+
+    .. math::
+
+        KGE = 1 - \\sqrt{(r-1)^2 + (\\alpha-1)^2 + (\\beta-1)^2}
+
+    where :math:`r` is the Pearson correlation coefficient,
+    :math:`\\alpha = \\sigma_{sim}/\\sigma_{obs}` the variability ratio,
+    and :math:`\\beta = \\mu_{sim}/\\mu_{obs}` the bias ratio.
+
+    Parameters
+    ----------
+    q_sim : array-like, shape (N,)
+        Simulated discharge [any consistent unit].
+    q_obs : array-like, shape (N,)
+        Observed discharge [same unit].
+
+    Returns
+    -------
+    kge : float
+        KGE value in (−∞, 1].  Perfect score = 1.0.
+        Returns ``-np.inf`` if fewer than 2 finite paired values exist.
+    """
+    q_sim = np.asarray(q_sim, dtype=float)
+    q_obs = np.asarray(q_obs, dtype=float)
+    mask = np.isfinite(q_sim) & np.isfinite(q_obs)
+    if mask.sum() < 2:
+        return -np.inf
+    qs, qo = q_sim[mask], q_obs[mask]
+    r = np.corrcoef(qs, qo)[0, 1]
+    alpha = qs.std() / qo.std() if qo.std() > 0 else np.inf
+    beta = qs.mean() / qo.mean() if qo.mean() > 0 else np.inf
+    return float(1.0 - np.sqrt((r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2))
+
+
+def _extract_model_years(time_values):
+    """Extract integer calendar years from an OGGM time coordinate.
+
+    Handles both :class:`cftime.datetime` objects (the common OGGM case)
+    and numpy/pandas datetime64 values.
+
+    Parameters
+    ----------
+    time_values : array-like
+        Time coordinate values from an OGGM ``model_diagnostics`` dataset.
+
+    Returns
+    -------
+    years : np.ndarray of int
+    """
+    years = []
+    for t in time_values:
+        if hasattr(t, 'year'):           # cftime.datetime
+            years.append(int(t.year))
+        else:                            # numpy datetime64 / pandas Timestamp
+            import pandas as pd
+            years.append(int(pd.Timestamp(t).year))
+    return np.array(years, dtype=int)
+
+
+def calibrate_routing_params(gdir, obs_discharge_m3s, obs_years,
+                              filesuffix='', scheme='single',
+                              method='Nelder-Mead',
+                              output_filesuffix=None):
+    """Calibrate reservoir residence time(s) against observed annual discharge.
+
+    Minimises ``1 − KGE`` with respect to the routing residence time(s)
+    using :func:`scipy.optimize.minimize`.  Model runoff is read from the
+    ``model_diagnostics`` netCDF **once**; routing is performed purely in
+    memory during optimisation (no file I/O per iteration).
+
+    The calibrated parameters are written to
+    ``<gdir.dir>/hydro_calib_params.json`` and returned as a dict.
+
+    Parameters
+    ----------
+    gdir : :class:`oggm.GlacierDirectory`
+    obs_discharge_m3s : array-like, shape (N,)
+        Observed **annual** discharge [m³ s⁻¹].
+    obs_years : array-like of int, shape (N,)
+        Calendar years corresponding to *obs_discharge_m3s*.
+    filesuffix : str
+        Suffix of the ``model_diagnostics`` file from ``run_with_hydro()``.
+    scheme : {'single', 'two_component'}
+        Routing model to calibrate.  ``'single'`` optimises one parameter
+        (``k_months``); ``'two_component'`` optimises two
+        (``k_fast_months``, ``k_slow_months``).
+    method : str
+        :func:`scipy.optimize.minimize` method (default: ``'Nelder-Mead'``).
+    output_filesuffix : str, optional
+        If provided, the calibrated routing result is written to a new
+        ``model_diagnostics`` file with this suffix.
+
+    Returns
+    -------
+    calib_result : dict
+        Contains: ``'scheme'``, ``'kge'``, ``'n_obs'``, ``'success'``,
+        ``'obs_years_range'``, and either ``'k_months'`` (single) or
+        ``'k_fast_months'`` + ``'k_slow_months'`` (two_component).
+
+    Raises
+    ------
+    ValueError
+        If *scheme* is unknown, arrays lengths differ, or fewer than 3
+        overlapping years exist between model output and observations.
+    ImportError
+        If :mod:`scipy` is not installed.
+    """
+    try:
+        from scipy.optimize import minimize
+    except ImportError as exc:
+        raise ImportError(
+            'scipy is required for calibration.  '
+            'Install with: conda install scipy'
+        ) from exc
+
+    obs_discharge_m3s = np.asarray(obs_discharge_m3s, dtype=float)
+    obs_years = np.asarray(obs_years, dtype=int)
+
+    if len(obs_discharge_m3s) != len(obs_years):
+        raise ValueError(
+            'obs_discharge_m3s and obs_years must have the same length '
+            f'(got {len(obs_discharge_m3s)} and {len(obs_years)})'
+        )
+    if scheme not in ('single', 'two_component'):
+        raise ValueError(
+            f"scheme must be 'single' or 'two_component', got {scheme!r}"
+        )
+
+    # --- Read model runoff once ---
+    fpath = gdir.get_filepath('model_diagnostics', filesuffix=filesuffix)
+    with xr.open_dataset(fpath) as ds:
+        time = ds['time'].values
+        rain_kgyr = (ds['liq_prcp_on_glacier'].values +
+                     ds['liq_prcp_off_glacier'].values)
+        melt_kgyr = (ds['melt_on_glacier'].values +
+                     ds['melt_off_glacier'].values)
+
+    runoff_kgyr = rain_kgyr + melt_kgyr
+    model_years = _extract_model_years(time)
+    valid_model = ~np.isnan(runoff_kgyr)
+
+    # --- Align obs and model to overlapping valid years ---
+    common_years = np.intersect1d(obs_years, model_years[valid_model])
+    if len(common_years) < 3:
+        raise ValueError(
+            f'Only {len(common_years)} overlapping valid year(s) between '
+            f'model ({model_years[valid_model].min()}–'
+            f'{model_years[valid_model].max()}) and observations '
+            f'({obs_years.min()}–{obs_years.max()}).  Need ≥ 3.'
+        )
+
+    obs_mask = np.isin(obs_years, common_years)
+    mod_mask = np.isin(model_years, common_years) & valid_model
+
+    q_obs = obs_discharge_m3s[obs_mask]
+    rain_m3s = rain_kgyr[mod_mask] / _RHO_WATER / _SEC_PER_YEAR
+    melt_m3s = melt_kgyr[mod_mask] / _RHO_WATER / _SEC_PER_YEAR
+    runoff_m3s = rain_m3s + melt_m3s
+
+    # --- Define cost function (routing in memory, no I/O) ---
+    if scheme == 'single':
+        def _cost(params):
+            k = float(params[0])
+            if k <= 0.01:
+                return 2.0           # penalty for non-physical k
+            q_sim = _linear_reservoir(runoff_m3s, k=k / 12.0, dt=1.0)
+            return 1.0 - _kling_gupta_efficiency(q_sim, q_obs)
+
+        x0 = [cfg.PARAMS.get('routing_k_months', _DEFAULT_K_MONTHS)]
+        bounds = [(0.1, 120.0)]
+
+    else:  # two_component
+        def _cost(params):
+            kf, ks = float(params[0]), float(params[1])
+            if kf <= 0.01 or ks <= 0.01:
+                return 2.0
+            q_fast = _linear_reservoir(rain_m3s, k=kf / 12.0, dt=1.0)
+            q_slow = _linear_reservoir(melt_m3s, k=ks / 12.0, dt=1.0)
+            return 1.0 - _kling_gupta_efficiency(q_fast + q_slow, q_obs)
+
+        x0 = [cfg.PARAMS.get('routing_k_fast_months', _DEFAULT_K_FAST_MONTHS),
+              cfg.PARAMS.get('routing_k_slow_months', _DEFAULT_K_SLOW_MONTHS)]
+        bounds = [(0.1, 24.0), (1.0, 120.0)]
+
+    # --- Run optimiser ---
+    opt = minimize(_cost, x0, method=method,
+                   options={'xatol': 0.01, 'fatol': 0.001, 'maxiter': 500})
+    kge_val = float(1.0 - opt.fun)
+
+    # --- Build result dict ---
+    if scheme == 'single':
+        calib_result = {
+            'scheme': 'single',
+            'k_months': float(opt.x[0]),
+            'kge': kge_val,
+            'n_obs': int(len(common_years)),
+            'success': bool(opt.success),
+            'obs_years_range': [int(common_years.min()), int(common_years.max())],
+        }
+    else:
+        calib_result = {
+            'scheme': 'two_component',
+            'k_fast_months': float(opt.x[0]),
+            'k_slow_months': float(opt.x[1]),
+            'kge': kge_val,
+            'n_obs': int(len(common_years)),
+            'success': bool(opt.success),
+            'obs_years_range': [int(common_years.min()), int(common_years.max())],
+        }
+
+    log.info('(%s) calibrate_routing_params: KGE=%.3f, success=%s, result=%s',
+             gdir.rgi_id, kge_val, opt.success,
+             {k: v for k, v in calib_result.items()
+              if k not in ('success', 'n_obs', 'obs_years_range', 'scheme')})
+
+    # --- Persist to gdir directory ---
+    calib_path = os.path.join(gdir.dir, 'hydro_calib_params.json')
+    with open(calib_path, 'w') as fh:
+        json.dump(calib_result, fh, indent=2)
+
+    # --- Optionally apply calibrated routing and write output ---
+    if output_filesuffix is not None:
+        if scheme == 'single':
+            route_hydro_output(gdir, filesuffix=filesuffix,
+                               k_months=calib_result['k_months'],
+                               output_filesuffix=output_filesuffix)
+        else:
+            route_hydro_output_2c(gdir, filesuffix=filesuffix,
+                                  k_fast_months=calib_result['k_fast_months'],
+                                  k_slow_months=calib_result['k_slow_months'],
+                                  output_filesuffix=output_filesuffix)
+
+    return calib_result

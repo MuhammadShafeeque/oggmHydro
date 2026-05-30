@@ -5437,6 +5437,105 @@ class TestHydroRouting:
                                                filesuffix='_sfx_dst')) as ds:
             assert 'discharge_m3s' in ds
 
+    def test_kge_function(self):
+        """KGE: perfect=1, analytical cases, NaN handling."""
+        from oggm.core.hydrology import _kling_gupta_efficiency
+
+        # Perfect forecast → KGE = 1
+        q = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        assert_allclose(_kling_gupta_efficiency(q, q), 1.0, atol=1e-10)
+
+        # q_sim = 2 * q_obs: r=1, alpha=1, beta=2 → KGE = 1-sqrt(0+0+1) = 0
+        q_obs = np.array([1.0, 2.0, 3.0, 4.0])
+        assert_allclose(_kling_gupta_efficiency(q_obs * 2.0, q_obs), 0.0, atol=1e-10)
+
+        # All NaN simulated → returns -inf
+        assert _kling_gupta_efficiency(
+            np.full(5, np.nan), np.ones(5)) == -np.inf
+
+        # Single valid point (< 2) → returns -inf
+        q_one = np.array([1.0, np.nan, np.nan])
+        assert _kling_gupta_efficiency(q_one, np.ones(3)) == -np.inf
+
+        # Worse-than-mean forecast is still finite (may be very negative)
+        q_bad = np.array([10.0, 1.0, 10.0, 1.0])
+        kge_bad = _kling_gupta_efficiency(q_bad, q_obs)
+        assert np.isfinite(kge_bad)
+        assert kge_bad < 1.0
+
+    @pytest.mark.slow
+    def test_calibrate_routing_params(self, hef_gdir, inversion_params):
+        """Calibration should recover a known routing k from synthetic obs."""
+        import os
+        from oggm.core.hydrology import _extract_model_years
+
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=30,
+                             output_filesuffix='_calib_test')
+
+        # --- Generate synthetic "observations" with k_true = 18 months ---
+        k_true = 18.0
+        tasks.route_hydro_output(gdir, filesuffix='_calib_test',
+                                 k_months=k_true,
+                                 output_filesuffix='_calib_truth')
+
+        with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                               filesuffix='_calib_truth')) as ds:
+            model_years = _extract_model_years(ds['time'].values)
+            q_truth = ds['discharge_m3s'].values
+
+        valid = np.isfinite(q_truth)
+        obs_years = model_years[valid]
+        obs_q = q_truth[valid]
+
+        # --- Calibrate against synthetic obs (single scheme) ---
+        result = tasks.calibrate_routing_params(
+            gdir,
+            obs_discharge_m3s=obs_q,
+            obs_years=obs_years,
+            filesuffix='_calib_test',
+            scheme='single',
+        )
+
+        assert result['kge'] > 0.9, f"KGE {result['kge']:.3f} < 0.9"
+        assert 'k_months' in result
+        # Recovered k should be within 50 % of the truth for annual data
+        k_rec = result['k_months']
+        assert 0.5 * k_true <= k_rec <= 2.0 * k_true, (
+            f'k_months={k_rec:.1f} too far from truth={k_true:.1f}')
+        assert result['n_obs'] > 0
+
+        # JSON file must be written
+        calib_path = os.path.join(gdir.dir, 'hydro_calib_params.json')
+        assert os.path.exists(calib_path)
+
+        # --- Two-component calibration ---
+        tasks.route_hydro_output_2c(gdir, filesuffix='_calib_test',
+                                    k_fast_months=1.0, k_slow_months=12.0,
+                                    output_filesuffix='_calib_truth_2c')
+
+        with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                               filesuffix='_calib_truth_2c')) as ds:
+            model_years_2c = _extract_model_years(ds['time'].values)
+            q_truth_2c = ds['discharge_m3s'].values
+
+        valid_2c = np.isfinite(q_truth_2c)
+        result_2c = tasks.calibrate_routing_params(
+            gdir,
+            obs_discharge_m3s=q_truth_2c[valid_2c],
+            obs_years=model_years_2c[valid_2c],
+            filesuffix='_calib_test',
+            scheme='two_component',
+        )
+
+        assert result_2c['kge'] > 0.9, f"2c KGE {result_2c['kge']:.3f} < 0.9"
+        assert 'k_fast_months' in result_2c
+        assert 'k_slow_months' in result_2c
+
 
 class TestMassRedis:
 
