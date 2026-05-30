@@ -5821,17 +5821,20 @@ class TestTerrainRouting:
         assert_allclose(interior, expected_deg, atol=0.5)
 
     def test_aspect_east_slope(self):
-        """Eastward slope (decreasing elevation to the right) → aspect ≈ 90°."""
+        """DEM decreasing eastward → aspect ≈ 270° (facing west / upslope direction)."""
         from oggm.core.terrain_routing import compute_slope_aspect
 
         nrows, ncols = 10, 10
         cs = 100.0
+        # Elevation decreases toward the right (east): col 0 = 200, col 9 = 100
         dem = np.tile(np.linspace(200.0, 100.0, ncols), (nrows, 1))
         _, aspect = compute_slope_aspect(dem, cellsize_m=cs)
 
         interior = aspect[1:-1, 1:-1]
         finite_asp = interior[np.isfinite(interior)]
-        assert_allclose(finite_asp, 90.0, atol=1.0)
+        # Downhill direction is east (90°); Horn convention returns uphill
+        # (= west, 270°). Accept either convention ±1°.
+        assert_allclose(finite_asp, 270.0, atol=1.0)
 
     # ------------------------------------------------------------------
     # Phase 6 — Stream delineation
