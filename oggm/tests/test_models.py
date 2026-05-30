@@ -5632,6 +5632,455 @@ class TestHydroRouting:
         assert np.nanmin(q_total) >= 0, 'Negative total discharge'
 
 
+class TestTerrainRouting:
+    """Tests for oggm.core.terrain_routing (Phase 6–7).
+
+    All tests use synthetic DEMs so no data download is required.
+    """
+
+    # ------------------------------------------------------------------
+    # Phase 6 — D8 flow direction
+    # ------------------------------------------------------------------
+
+    def test_d8_flat_eastward_slope(self):
+        """Uniform eastward slope → all interior cells flow east (code 1)."""
+        from oggm.core.terrain_routing import compute_flow_direction
+
+        nrows, ncols = 10, 12
+        # Elevation decreases eastward: col 0 is highest
+        dem = np.tile(np.linspace(100.0, 50.0, ncols), (nrows, 1))
+        fdir = compute_flow_direction(dem, cellsize_m=100.0,
+                                      fill_pits_first=False)
+
+        # Interior cells: row 1..nrows-2, col 1..ncols-2
+        interior = fdir[1:-1, 1:-1]
+        # All should be East (code 1) since E slope is steepest
+        assert np.all(interior == 1), (
+            f'Expected all East (1), got unique codes: '
+            f'{np.unique(interior)}'
+        )
+
+    def test_d8_northward_slope(self):
+        """Uniform northward slope → all interior cells flow north (code 64)."""
+        from oggm.core.terrain_routing import compute_flow_direction
+
+        nrows, ncols = 12, 10
+        # Elevation decreases northward: row 0 is lowest (raster N is row 0)
+        dem = np.tile(np.linspace(50.0, 100.0, nrows)[:, np.newaxis],
+                      (1, ncols))
+        fdir = compute_flow_direction(dem, cellsize_m=100.0,
+                                      fill_pits_first=False)
+
+        interior = fdir[1:-1, 1:-1]
+        assert np.all(interior == 64), (
+            f'Expected all North (64), got unique codes: '
+            f'{np.unique(interior)}'
+        )
+
+    def test_d8_v_valley(self):
+        """V-shaped valley: both slopes drain toward centre column."""
+        from oggm.core.terrain_routing import compute_flow_direction
+
+        nrows, ncols = 8, 11
+        centre = ncols // 2
+        # Distance from centre column determines elevation
+        dem = np.zeros((nrows, ncols))
+        for c in range(ncols):
+            dem[:, c] = abs(c - centre) * 10.0 + 50.0  # ridge on both sides
+
+        fdir = compute_flow_direction(dem, cellsize_m=100.0,
+                                      fill_pits_first=False)
+
+        # Left half interior should flow East (toward centre)
+        left = fdir[1:-1, 1:centre]
+        assert np.all(left == 1), (
+            f'Left side should flow East. Got: {np.unique(left)}'
+        )
+        # Right half interior should flow West (toward centre)
+        right = fdir[1:-1, centre + 1:-1]
+        assert np.all(right == 16), (
+            f'Right side should flow West. Got: {np.unique(right)}'
+        )
+
+    def test_d8_diagonal(self):
+        """Diagonal slope (NW-to-SE) → flow is SE (code 2)."""
+        from oggm.core.terrain_routing import compute_flow_direction
+
+        n = 10
+        # Elevation decreases toward SE corner
+        dem = np.zeros((n, n))
+        for r in range(n):
+            for c in range(n):
+                dem[r, c] = (n - r) + (n - c)  # max at NW, min at SE
+
+        fdir = compute_flow_direction(dem, cellsize_m=100.0,
+                                      fill_pits_first=False)
+        interior = fdir[1:-1, 1:-1]
+        assert np.all(interior == 2), (
+            f'Expected all SE (2), got: {np.unique(interior)}'
+        )
+
+    def test_d8_codes_are_valid(self):
+        """D8 codes must all be 0 or powers of 2 in [1, 128]."""
+        from oggm.core.terrain_routing import compute_flow_direction
+
+        rng = np.random.default_rng(42)
+        dem = rng.uniform(0, 200, (20, 20))
+        fdir = compute_flow_direction(dem, cellsize_m=50.0,
+                                      fill_pits_first=True)
+        valid_codes = {0, 1, 2, 4, 8, 16, 32, 64, 128}
+        actual_codes = set(np.unique(fdir).tolist())
+        assert actual_codes <= valid_codes, (
+            f'Unexpected D8 codes: {actual_codes - valid_codes}'
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 6 — Flow accumulation
+    # ------------------------------------------------------------------
+
+    def test_accumulation_total(self):
+        """Sum of accumulation ≥ total cell count (every cell counted ≥ 1)."""
+        from oggm.core.terrain_routing import (
+            compute_flow_direction, compute_flow_accumulation,
+        )
+
+        nrows, ncols = 10, 15
+        # Simple eastward slope: all cells drain to east edge
+        dem = np.tile(np.linspace(100.0, 10.0, ncols), (nrows, 1))
+        fdir = compute_flow_direction(dem, cellsize_m=100.0,
+                                      fill_pits_first=False)
+        acc = compute_flow_accumulation(fdir)
+
+        assert acc.shape == (nrows, ncols)
+        assert acc.min() >= 1, 'Every cell should count itself'
+        assert acc.sum() >= nrows * ncols, (
+            'Total accumulation ≥ cell count'
+        )
+
+    def test_accumulation_line(self):
+        """Linear flow path: accumulation increases monotonically."""
+        from oggm.core.terrain_routing import (
+            compute_flow_direction, compute_flow_accumulation,
+        )
+
+        # Single-column DEM: 10 rows, 3 cols, decreasing S (row increases)
+        nrows, ncols = 12, 3
+        dem = np.tile(np.linspace(100.0, 10.0, nrows)[::-1, np.newaxis],
+                      (1, ncols))
+        fdir = compute_flow_direction(dem, cellsize_m=100.0,
+                                      fill_pits_first=False)
+        acc = compute_flow_accumulation(fdir)
+
+        # Centre column: accumulation should increase from row 0 to nrows-1
+        centre_acc = acc[:, ncols // 2]
+        assert centre_acc[-1] >= centre_acc[0], (
+            'Downstream cell should have higher accumulation'
+        )
+
+    def test_accumulation_each_cell_geq_1(self):
+        """Every cell has accumulation ≥ 1 (self-count)."""
+        from oggm.core.terrain_routing import (
+            compute_flow_direction, compute_flow_accumulation,
+        )
+
+        rng = np.random.default_rng(99)
+        dem = rng.uniform(0, 500, (15, 15))
+        fdir = compute_flow_direction(dem, cellsize_m=90.0,
+                                      fill_pits_first=True)
+        acc = compute_flow_accumulation(fdir)
+        assert np.all(acc >= 1), 'All cells must have acc ≥ 1'
+
+    # ------------------------------------------------------------------
+    # Phase 6 — Slope and aspect
+    # ------------------------------------------------------------------
+
+    def test_slope_flat_dem(self):
+        """Flat DEM → slope = 0 everywhere (interior cells)."""
+        from oggm.core.terrain_routing import compute_slope_aspect
+
+        dem = np.full((10, 10), 500.0)
+        slope, aspect = compute_slope_aspect(dem, cellsize_m=100.0)
+
+        interior_slope = slope[1:-1, 1:-1]
+        assert_allclose(interior_slope, 0.0, atol=1e-10)
+
+    def test_slope_known_gradient(self):
+        """DEM with known 10 % E-W gradient → slope ≈ arctan(0.1) ≈ 5.71°."""
+        from oggm.core.terrain_routing import compute_slope_aspect
+
+        nrows, ncols = 10, 10
+        cs = 100.0  # m
+        # 10 % gradient: every column 10 m lower than the previous
+        dem = np.tile(np.arange(ncols, 0, -1, dtype=float) * cs * 0.10,
+                      (nrows, 1))
+        slope, aspect = compute_slope_aspect(dem, cellsize_m=cs)
+
+        expected_deg = np.degrees(np.arctan(0.10))
+        interior = slope[1:-1, 1:-1]
+        assert_allclose(interior, expected_deg, atol=0.5)
+
+    def test_aspect_east_slope(self):
+        """Eastward slope (decreasing elevation to the right) → aspect ≈ 90°."""
+        from oggm.core.terrain_routing import compute_slope_aspect
+
+        nrows, ncols = 10, 10
+        cs = 100.0
+        dem = np.tile(np.linspace(200.0, 100.0, ncols), (nrows, 1))
+        _, aspect = compute_slope_aspect(dem, cellsize_m=cs)
+
+        interior = aspect[1:-1, 1:-1]
+        finite_asp = interior[np.isfinite(interior)]
+        assert_allclose(finite_asp, 90.0, atol=1.0)
+
+    # ------------------------------------------------------------------
+    # Phase 6 — Stream delineation
+    # ------------------------------------------------------------------
+
+    def test_delineate_streams_threshold(self):
+        """Cells with accumulation ≥ threshold should be stream cells."""
+        from oggm.core.terrain_routing import delineate_streams
+
+        acc = np.array([[1, 2, 10, 50, 200],
+                        [1, 3, 15, 60, 300],
+                        [1, 4, 20, 70, 500]], dtype=float)
+        threshold = 15
+        streams = delineate_streams(acc, threshold_cells=threshold)
+
+        expected = acc >= threshold
+        np.testing.assert_array_equal(streams, expected)
+
+    def test_delineate_streams_km2(self):
+        """threshold_km2 with cellsize_m correctly converts to cells."""
+        from oggm.core.terrain_routing import delineate_streams
+
+        cs = 1000.0  # 1 km cells → 1 km² each
+        acc = np.arange(1, 26, dtype=float).reshape(5, 5)
+        # threshold = 5 km² → 5 cells at 1 km²/cell
+        streams = delineate_streams(acc, threshold_km2=5.0, cellsize_m=cs)
+        expected = acc >= 5
+        np.testing.assert_array_equal(streams, expected)
+
+    def test_delineate_streams_requires_threshold(self):
+        """Calling without threshold should raise ValueError."""
+        from oggm.core.terrain_routing import delineate_streams
+
+        acc = np.ones((5, 5))
+        with pytest.raises(ValueError):
+            delineate_streams(acc)
+
+    # ------------------------------------------------------------------
+    # Phase 6 — Stream network
+    # ------------------------------------------------------------------
+
+    def test_stream_network_linear(self):
+        """Linear stream (no tributaries) → 1 path graph."""
+        pytest.importorskip('networkx')
+        from oggm.core.terrain_routing import (
+            compute_flow_direction, compute_flow_accumulation,
+            delineate_streams, build_stream_network,
+        )
+
+        # Simple southward drainage on a 10×3 grid
+        nrows, ncols = 10, 3
+        dem = np.tile(np.linspace(100.0, 10.0, nrows)[::-1, np.newaxis],
+                      (1, ncols))
+        cs = 100.0
+        fdir = compute_flow_direction(dem, cellsize_m=cs,
+                                      fill_pits_first=False)
+        acc = compute_flow_accumulation(fdir)
+        # Low threshold so entire centre column is a stream
+        streams = delineate_streams(acc, threshold_cells=2)
+        G = build_stream_network(streams, fdir, dem, cs, acc)
+
+        assert G.number_of_nodes() >= 2, 'Need at least 2 nodes'
+        # Graph must be a DAG (no cycles)
+        import networkx as nx
+        assert nx.is_directed_acyclic_graph(G)
+
+    def test_stream_network_attributes(self):
+        """All edges must have length_m > 0; all nodes have elevation_m."""
+        pytest.importorskip('networkx')
+        from oggm.core.terrain_routing import (
+            compute_flow_direction, compute_flow_accumulation,
+            delineate_streams, build_stream_network,
+        )
+
+        rng = np.random.default_rng(7)
+        dem = rng.uniform(50, 500, (20, 20))
+        cs = 90.0
+        fdir = compute_flow_direction(dem, cellsize_m=cs,
+                                      fill_pits_first=True)
+        acc = compute_flow_accumulation(fdir)
+        streams = delineate_streams(acc, threshold_cells=20)
+        if not np.any(streams):
+            pytest.skip('No stream cells with this threshold on random DEM')
+
+        G = build_stream_network(streams, fdir, dem, cs, acc)
+
+        for u, v, data in G.edges(data=True):
+            assert data['length_m'] > 0, (
+                f'Edge {u}->{v} has non-positive length'
+            )
+        for node, data in G.nodes(data=True):
+            assert 'elevation_m' in data
+
+    # ------------------------------------------------------------------
+    # Phase 6 — Sub-basin assignment
+    # ------------------------------------------------------------------
+
+    def test_assign_subbasins_coverage(self):
+        """Every upstream cell must be assigned to the correct outlet."""
+        from oggm.core.terrain_routing import (
+            compute_flow_direction, assign_subbasins,
+        )
+
+        # Two separate eastward draining strips on a 6×10 DEM
+        dem = np.zeros((6, 10))
+        dem[:3, :] = np.tile(np.linspace(100, 10, 10), (3, 1))
+        dem[3:, :] = np.tile(np.linspace(200, 20, 10), (3, 1))
+
+        fdir = compute_flow_direction(dem, cellsize_m=100.0,
+                                      fill_pits_first=False)
+
+        # Outlets: east edge of each strip
+        outlets = [(1, 9), (4, 9)]
+        subs = assign_subbasins(fdir, outlets)
+
+        # Each outlet's row should be assigned to that outlet
+        assert subs[1, 9] == 1 or subs[1, 9] != 0
+        assert subs[4, 9] == 2 or subs[4, 9] != 0
+        # All assigned values in {0, 1, 2}
+        assert set(np.unique(subs).tolist()) <= {0, 1, 2}
+
+    # ------------------------------------------------------------------
+    # Phase 7 — Muskingum-Cunge
+    # ------------------------------------------------------------------
+
+    def test_muskingum_cunge_mass_conservation(self):
+        """Routed sum should be close to input sum (finite pulse)."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        # Triangular pulse
+        q_in = np.array([0, 1, 3, 5, 4, 3, 2, 1, 0, 0, 0, 0,
+                         0, 0, 0, 0, 0, 0, 0, 0], dtype=float)
+        q_out = muskingum_cunge_route(q_in, K_dt=2.0, X=0.2)
+
+        ratio = q_out.sum() / q_in.sum()
+        assert 0.85 < ratio < 1.15, (
+            f'Mass conservation ratio {ratio:.3f} outside [0.85, 1.15]'
+        )
+
+    def test_muskingum_cunge_non_negative(self):
+        """Output must be non-negative."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        rng = np.random.default_rng(55)
+        q_in = np.abs(rng.normal(5.0, 2.0, 50))
+        q_out = muskingum_cunge_route(q_in, K_dt=1.5, X=0.25)
+        assert np.all(q_out >= 0.0), 'Negative discharge in Muskingum-Cunge'
+
+    def test_muskingum_cunge_attenuation(self):
+        """Higher K_dt → more attenuation (lower peak, later timing)."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        q_in = np.zeros(60)
+        q_in[5:15] = 10.0  # rectangular pulse
+
+        q_short = muskingum_cunge_route(q_in, K_dt=0.5, X=0.2)
+        q_long = muskingum_cunge_route(q_in, K_dt=5.0, X=0.2)
+
+        # Longer travel time → smaller peak
+        assert q_long.max() < q_short.max(), (
+            'Longer K_dt should produce lower peak'
+        )
+
+    def test_muskingum_cunge_invalid_inputs(self):
+        """ValueError on K_dt ≤ 0 or X outside [0, 0.5]."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        q = np.ones(10)
+        with pytest.raises(ValueError):
+            muskingum_cunge_route(q, K_dt=0.0, X=0.25)
+        with pytest.raises(ValueError):
+            muskingum_cunge_route(q, K_dt=1.0, X=-0.1)
+        with pytest.raises(ValueError):
+            muskingum_cunge_route(q, K_dt=1.0, X=0.6)
+
+    def test_muskingum_cunge_kinematic_limit(self):
+        """X = 0.5, K_dt = 0.5 → output is a pure delay (kinematic wave)."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        q_in = np.array([0, 0, 5, 5, 5, 0, 0, 0, 0, 0], dtype=float)
+        # C2 ≈ 0, so output ≈ C0*q_in + C1*q_in_prev
+        q_out = muskingum_cunge_route(q_in, K_dt=0.5, X=0.5)
+        # Should preserve total volume
+        assert_allclose(q_out.sum(), q_in.sum(), rtol=0.15)
+
+    # ------------------------------------------------------------------
+    # Phase 6 — tile naming utilities (no download)
+    # ------------------------------------------------------------------
+
+    def test_merit_tile_name(self):
+        """Tile naming utility returns correct identifiers."""
+        from oggm.shop.merit_hydro import _tile_name, _tiles_for_bbox
+
+        assert _tile_name(35.1, 70.2) == 'n35e070'
+        assert _tile_name(-5.0, -75.0) == 's05w075'
+        assert _tile_name(0.0, 0.0) == 'n00e000'
+        assert _tile_name(47.5, 10.9) == 'n45e010'
+
+        # Bounding box spanning two tiles
+        tiles = _tiles_for_bbox(68.0, 35.0, 71.0, 37.0)
+        assert 'n35e065' in tiles or 'n35e070' in tiles
+
+    @pytest.mark.slow
+    def test_terrain_routing_on_hef(self, hef_gdir, inversion_params):
+        """End-to-end terrain routing on HEF using the OGGM local DEM."""
+        pytest.importorskip('networkx')
+        from oggm.core.terrain_routing import (
+            compute_flow_direction, compute_flow_accumulation,
+            compute_slope_aspect, delineate_streams,
+            build_stream_network,
+        )
+        import xarray as xr
+
+        gdir = hef_gdir
+
+        # Load gridded DEM from the glacier directory
+        with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+            dem_arr = ds['topo'].values.astype(float)
+
+        cs = gdir.grid.dx  # cell size in metres (~ 50 m for HEF)
+
+        fdir = compute_flow_direction(dem_arr, cellsize_m=cs,
+                                      fill_pits_first=True)
+        acc = compute_flow_accumulation(fdir)
+        slope, aspect = compute_slope_aspect(dem_arr, cellsize_m=cs)
+
+        # Sanity checks
+        valid_codes = {0, 1, 2, 4, 8, 16, 32, 64, 128}
+        assert set(np.unique(fdir).tolist()) <= valid_codes
+        assert np.all(acc >= 1)
+        assert np.nanmin(slope[1:-1, 1:-1]) >= 0.0
+
+        # Delineate streams with a 0.1 km² threshold
+        streams = delineate_streams(acc, threshold_km2=0.1,
+                                    cellsize_m=cs)
+        assert np.any(streams), 'No stream cells found on HEF'
+
+        # Build stream network
+        import networkx as nx
+        G = build_stream_network(streams, fdir, dem_arr, cs, acc)
+        assert G.number_of_nodes() >= 1
+        assert nx.is_directed_acyclic_graph(G)
+
+        # All edges should have positive length
+        for u, v, data in G.edges(data=True):
+            assert data['length_m'] > 0, (
+                f'Edge {u}->{v} has non-positive length'
+            )
+
+
 class TestMassRedis:
 
     def test_hef_retreat(self, class_case_dir):

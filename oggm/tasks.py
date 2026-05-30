@@ -67,6 +67,14 @@ from oggm.core.hydrology import route_hydro_output_2c
 from oggm.core.hydrology import route_hydro_output_5c
 from oggm.core.hydrology import aggregate_basin_discharge
 from oggm.core.hydrology import calibrate_routing_params
+from oggm.core.terrain_routing import compute_flow_direction
+from oggm.core.terrain_routing import compute_flow_accumulation
+from oggm.core.terrain_routing import compute_slope_aspect
+from oggm.core.terrain_routing import delineate_streams
+from oggm.core.terrain_routing import build_stream_network
+from oggm.core.terrain_routing import assign_subbasins
+from oggm.core.terrain_routing import muskingum_cunge_route
+from oggm.core.terrain_routing import route_stream_network
 from oggm.core.dynamic_spinup import run_dynamic_spinup
 from oggm.core.dynamic_spinup import run_dynamic_melt_f_calibration
 from oggm.utils import copy_to_basedir
