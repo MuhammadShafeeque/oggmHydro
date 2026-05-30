@@ -6067,9 +6067,8 @@ class TestTerrainRouting:
         assert np.all(acc >= 1)
         assert np.nanmin(slope[1:-1, 1:-1]) >= 0.0
 
-        # Delineate streams with a 0.1 km² threshold
-        streams = delineate_streams(acc, threshold_km2=0.1,
-                                    cellsize_m=cs)
+        # Delineate streams with a 5-cell threshold (robust across grid sizes)
+        streams = delineate_streams(acc, threshold_cells=5)
         assert np.any(streams), 'No stream cells found on HEF'
 
         # Build stream network
