@@ -64,6 +64,7 @@ from oggm.core.flowline import run_with_hydro
 from oggm.core.flowline import compute_fl_diagnostics_quantiles
 from oggm.core.hydrology import route_hydro_output
 from oggm.core.hydrology import route_hydro_output_2c
+from oggm.core.hydrology import route_hydro_output_5c
 from oggm.core.hydrology import aggregate_basin_discharge
 from oggm.core.hydrology import calibrate_routing_params
 from oggm.core.dynamic_spinup import run_dynamic_spinup

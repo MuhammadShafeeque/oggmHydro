@@ -4046,11 +4046,13 @@ def run_with_hydro(gdir, run_task=None, store_monthly_hydro=False,
     bin_elev_2ds = []
     ref_areas = []
     snow_buckets = []
+    swe_buckets = []   # on-glacier SWE state for snowmelt/icemelt split
     for fl in fmod_ref.fls:
         # Glacier area on bins
         bin_area = fl.bin_area_m2
         ref_areas.append(bin_area)
         snow_buckets.append(bin_area * 0)
+        swe_buckets.append(bin_area * 0)
 
         # Output 2d data
         shape = len(years), len(bin_area)
@@ -4102,6 +4104,16 @@ def run_with_hydro(gdir, run_task=None, store_monthly_hydro=False,
         },
         'melt_on_glacier': {
             'description': 'On-glacier melt',
+            'unit': 'kg yr-1',
+            'data': np.zeros(oshape),
+        },
+        'snowmelt_on_glacier': {
+            'description': 'On-glacier snowmelt (SWE-derived snow component)',
+            'unit': 'kg yr-1',
+            'data': np.zeros(oshape),
+        },
+        'icemelt_on_glacier': {
+            'description': 'On-glacier ice melt (SWE-derived ice component)',
             'unit': 'kg yr-1',
             'data': np.zeros(oshape),
         },
@@ -4165,8 +4177,10 @@ def run_with_hydro(gdir, run_task=None, store_monthly_hydro=False,
             off_area_out = 0
             on_area_out = 0
 
-            for fl_id, (ref_area, snow_bucket, bin_area_2d, bin_elev_2d) in \
-                    enumerate(zip(ref_areas, snow_buckets, bin_area_2ds, bin_elev_2ds)):
+            for fl_id, (ref_area, snow_bucket, swe_band,
+                        bin_area_2d, bin_elev_2d) in enumerate(
+                    zip(ref_areas, snow_buckets, swe_buckets,
+                        bin_area_2ds, bin_elev_2ds)):
 
                 bin_area = bin_area_2d[i, :]
                 bin_elev = bin_elev_2d[i, :]
@@ -4231,6 +4245,17 @@ def run_with_hydro(gdir, run_task=None, store_monthly_hydro=False,
                 # Update bucket
                 snow_bucket -= melt_off_g
 
+                # --- Phase 5: on-glacier SWE split (snowmelt / icemelt) ---
+                # Accumulate fresh snowfall into the on-glacier snow layer
+                swe_band += prcpsol_on_g
+                # Only non-negative melt participates in the split
+                _melt_on_g_pos = utils.clip_min(melt_on_g, 0)
+                # Snow melts preferentially before ice (TI model convention)
+                snowmelt_on_g = np.minimum(_melt_on_g_pos, swe_band)
+                icemelt_on_g = _melt_on_g_pos - snowmelt_on_g
+                swe_band -= snowmelt_on_g
+                swe_band[:] = utils.clip_min(swe_band, 0)
+
                 # This is recomputed each month but well
                 off_area_out += np.sum(off_area)
                 on_area_out += np.sum(bin_area)
@@ -4244,6 +4269,8 @@ def run_with_hydro(gdir, run_task=None, store_monthly_hydro=False,
                 out['liq_prcp_on_glacier']['data'][i, m-1] += np.sum(liq_prcp_on_g)
                 out['snowfall_off_glacier']['data'][i, m-1] += np.sum(prcpsol_off_g)
                 out['snowfall_on_glacier']['data'][i, m-1] += np.sum(prcpsol_on_g)
+                out['snowmelt_on_glacier']['data'][i, m-1] += np.sum(snowmelt_on_g)
+                out['icemelt_on_glacier']['data'][i, m-1] += np.sum(icemelt_on_g)
 
                 # Snow bucket is a state variable - stored at end of timestamp
                 if store_monthly_hydro:
@@ -4324,6 +4351,21 @@ def run_with_hydro(gdir, run_task=None, store_monthly_hydro=False,
             out['snowfall_on_glacier']['data'][i, :] -= utils.clip_max(g_melt - residual_mb, 0)
             # assure that new melt_on_glacier is non-negative
             out['melt_on_glacier']['data'][i, :] = utils.clip_min(g_melt - residual_mb, 0)
+
+        # Phase 5: rescale snowmelt/icemelt proportionally so that
+        # snowmelt_on_glacier + icemelt_on_glacier == melt_on_glacier
+        _g_melt_new = out['melt_on_glacier']['data'][i, :]
+        _g_sm = out['snowmelt_on_glacier']['data'][i, :]
+        _g_im = out['icemelt_on_glacier']['data'][i, :]
+        _g_split_total = _g_sm + _g_im
+        with np.errstate(invalid='ignore', divide='ignore'):
+            _snow_frac = np.where(_g_split_total > 1e-10,
+                                  _g_sm / _g_split_total, 0.5)
+        _snow_frac = np.clip(_snow_frac, 0.0, 1.0)
+        out['snowmelt_on_glacier']['data'][i, :] = (
+            _g_melt_new * _snow_frac)
+        out['icemelt_on_glacier']['data'][i, :] = (
+            _g_melt_new * (1.0 - _snow_frac))
 
         out['model_mb']['data'][i] = model_mb
         out['residual_mb']['data'][i] = residual_mb

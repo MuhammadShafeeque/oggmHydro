@@ -617,3 +617,181 @@ def calibrate_routing_params(gdir, obs_discharge_m3s, obs_years,
                                   output_filesuffix=output_filesuffix)
 
     return calib_result
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — five-component entity task
+# ---------------------------------------------------------------------------
+
+_DEFAULT_K_RAIN_MONTHS = 0.5   # rain on/off glacier [months]
+_DEFAULT_K_SNOW_MONTHS = 2.0   # snowmelt on/off glacier [months]
+_DEFAULT_K_ICE_MONTHS = 8.0    # ice melt (subglacial drainage) [months]
+
+
+@entity_task(log, writes=['model_diagnostics'])
+def route_hydro_output_5c(gdir, filesuffix='',
+                           k_rain_months=None,
+                           k_snow_months=None,
+                           k_ice_months=None,
+                           output_filesuffix=None):
+    """Route runoff using a five-component linear reservoir model.
+
+    Separates runoff into five physically distinct components, routes each
+    through its own linear reservoir, then sums to total discharge.
+
+    Requires :func:`oggm.tasks.run_with_hydro` to have been run **after**
+    the Phase 5 update to ``flowline.py`` that adds per-band SWE tracking.
+    The ``model_diagnostics`` file must contain ``snowmelt_on_glacier`` and
+    ``icemelt_on_glacier``.
+
+    Component assignment
+    --------------------
+    * ``liq_prcp_on_glacier``  → fast rain-on-ice reservoir  (k_rain_months)
+    * ``liq_prcp_off_glacier`` → fast rain-off-ice reservoir (k_rain_months)
+    * ``snowmelt_on_glacier``  → medium snowmelt reservoir   (k_snow_months)
+    * ``melt_off_glacier``     → off-glacier snowmelt        (k_snow_months * 1.5)
+    * ``icemelt_on_glacier``   → slow ice-melt reservoir     (k_ice_months)
+
+    Parameters
+    ----------
+    gdir : :class:`oggm.GlacierDirectory`
+    filesuffix : str
+        Suffix of the ``model_diagnostics`` file from ``run_with_hydro()``.
+    k_rain_months : float, optional
+        Residence time for rain components [months].
+        Defaults to ``cfg.PARAMS['routing_k_rain_months']`` (fallback: 0.5).
+    k_snow_months : float, optional
+        Residence time for on-glacier snowmelt [months].
+        Defaults to ``cfg.PARAMS['routing_k_snow_months']`` (fallback: 2.0).
+    k_ice_months : float, optional
+        Residence time for ice melt [months].
+        Defaults to ``cfg.PARAMS['routing_k_ice_months']`` (fallback: 8.0).
+    output_filesuffix : str, optional
+        Filesuffix for the output file.  If *None*, appends in-place.
+
+    Raises
+    ------
+    RuntimeError
+        If ``snowmelt_on_glacier`` or ``icemelt_on_glacier`` are missing
+        (Phase 5 SWE split not available in the diagnostics file).
+    """
+    if k_rain_months is None:
+        k_rain_months = cfg.PARAMS.get('routing_k_rain_months',
+                                       _DEFAULT_K_RAIN_MONTHS)
+    if k_snow_months is None:
+        k_snow_months = cfg.PARAMS.get('routing_k_snow_months',
+                                       _DEFAULT_K_SNOW_MONTHS)
+    if k_ice_months is None:
+        k_ice_months = cfg.PARAMS.get('routing_k_ice_months',
+                                      _DEFAULT_K_ICE_MONTHS)
+
+    fpath = gdir.get_filepath('model_diagnostics', filesuffix=filesuffix)
+    with xr.open_dataset(fpath) as ds:
+        if 'snowmelt_on_glacier' not in ds or 'icemelt_on_glacier' not in ds:
+            raise RuntimeError(
+                'snowmelt_on_glacier / icemelt_on_glacier not found in '
+                f'{fpath}. Re-run run_with_hydro() after the Phase 5 '
+                'update to flowline.py, and ensure snowmelt_on_glacier '
+                'and icemelt_on_glacier are in store_diagnostic_variables.'
+            )
+        time = ds['time'].values
+        rain_on_kgyr = ds['liq_prcp_on_glacier'].values
+        rain_off_kgyr = ds['liq_prcp_off_glacier'].values
+        snowmelt_on_kgyr = ds['snowmelt_on_glacier'].values
+        snowmelt_off_kgyr = ds['melt_off_glacier'].values
+        icemelt_kgyr = ds['icemelt_on_glacier'].values
+
+    # Identify valid (non-NaN) timesteps
+    combined = (rain_on_kgyr + rain_off_kgyr + snowmelt_on_kgyr +
+                snowmelt_off_kgyr + icemelt_kgyr)
+    valid = ~np.isnan(combined)
+    if not valid.any():
+        raise RuntimeError(
+            f'All runoff values are NaN in {fpath}. '
+            'Did run_with_hydro() complete successfully?'
+        )
+
+    # Unit conversion: kg yr-1 → m3 s-1
+    def _to_m3s(arr):
+        return arr[valid] / _RHO_WATER / _SEC_PER_YEAR
+
+    rain_on_m3s = _to_m3s(rain_on_kgyr)
+    rain_off_m3s = _to_m3s(rain_off_kgyr)
+    snowmelt_on_m3s = _to_m3s(snowmelt_on_kgyr)
+    snowmelt_off_m3s = _to_m3s(snowmelt_off_kgyr)
+    icemelt_m3s = _to_m3s(icemelt_kgyr)
+
+    # Route each component (k in years for annual dt=1 yr)
+    q_rain_on = _linear_reservoir(
+        rain_on_m3s, k=k_rain_months / 12.0, dt=1.0)
+    q_rain_off = _linear_reservoir(
+        rain_off_m3s, k=k_rain_months / 12.0, dt=1.0)
+    q_snowmelt_on = _linear_reservoir(
+        snowmelt_on_m3s, k=k_snow_months / 12.0, dt=1.0)
+    q_snowmelt_off = _linear_reservoir(
+        snowmelt_off_m3s, k=(k_snow_months * 1.5) / 12.0, dt=1.0)
+    q_icemelt = _linear_reservoir(
+        icemelt_m3s, k=k_ice_months / 12.0, dt=1.0)
+    q_total = (q_rain_on + q_rain_off + q_snowmelt_on +
+               q_snowmelt_off + q_icemelt)
+
+    # Pad back to full time-axis length (NaN for invalid positions)
+    n_full = len(time)
+
+    def _pad(arr):
+        out = np.full(n_full, np.nan)
+        out[valid] = arr
+        return out
+
+    # Build output dataset
+    out_ds = xr.Dataset()
+    out_ds.coords['time'] = time
+
+    out_ds['discharge_5c_m3s'] = ('time', _pad(q_total))
+    out_ds['discharge_5c_m3s'].attrs = {
+        'description': 'Total routed discharge (5-component)',
+        'units': 'm3 s-1',
+        'routing_scheme': 'five_component_linear_reservoir',
+        'k_rain_months': float(k_rain_months),
+        'k_snow_months': float(k_snow_months),
+        'k_ice_months': float(k_ice_months),
+    }
+    out_ds['discharge_rain_on_m3s'] = ('time', _pad(q_rain_on))
+    out_ds['discharge_rain_on_m3s'].attrs = {
+        'description': 'Routed rain-on-glacier component',
+        'units': 'm3 s-1',
+    }
+    out_ds['discharge_rain_off_m3s'] = ('time', _pad(q_rain_off))
+    out_ds['discharge_rain_off_m3s'].attrs = {
+        'description': 'Routed rain-off-glacier component',
+        'units': 'm3 s-1',
+    }
+    out_ds['discharge_snowmelt_on_m3s'] = ('time', _pad(q_snowmelt_on))
+    out_ds['discharge_snowmelt_on_m3s'].attrs = {
+        'description': 'Routed on-glacier snowmelt component',
+        'units': 'm3 s-1',
+    }
+    out_ds['discharge_snowmelt_off_m3s'] = ('time', _pad(q_snowmelt_off))
+    out_ds['discharge_snowmelt_off_m3s'].attrs = {
+        'description': 'Routed off-glacier snowmelt component',
+        'units': 'm3 s-1',
+    }
+    out_ds['discharge_icemelt_m3s'] = ('time', _pad(q_icemelt))
+    out_ds['discharge_icemelt_m3s'].attrs = {
+        'description': 'Routed ice-melt component',
+        'units': 'm3 s-1',
+    }
+
+    if output_filesuffix is not None:
+        write_path = gdir.get_filepath('model_diagnostics',
+                                       filesuffix=output_filesuffix)
+        shutil.copy(fpath, write_path)
+    else:
+        write_path = fpath
+
+    out_ds.to_netcdf(write_path, mode='a')
+    log.debug(
+        '(%s) route_hydro_output_5c done (k_rain=%.1f, k_snow=%.1f, '
+        'k_ice=%.1f months)',
+        gdir.rgi_id, k_rain_months, k_snow_months, k_ice_months,
+    )

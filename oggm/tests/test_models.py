@@ -5538,6 +5538,99 @@ class TestHydroRouting:
         assert 'k_fast_months' in result_2c
         assert 'k_slow_months' in result_2c
 
+    @pytest.mark.slow
+    def test_5component_split(self, hef_gdir, inversion_params):
+        """snowmelt_on_glacier + icemelt_on_glacier must equal melt_on_glacier."""
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+        # Ensure Phase 5 variables are stored
+        diag_vars = cfg.PARAMS['store_diagnostic_variables']
+        if 'snowmelt_on_glacier' not in diag_vars:
+            cfg.PARAMS['store_diagnostic_variables'] = (
+                diag_vars + ', snowmelt_on_glacier, icemelt_on_glacier')
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=10,
+                             store_monthly_hydro=True,
+                             output_filesuffix='_5c_split_test')
+
+        with xr.open_dataset(gdir.get_filepath(
+                'model_diagnostics',
+                filesuffix='_5c_split_test')) as ds:
+            assert 'snowmelt_on_glacier' in ds, (
+                'snowmelt_on_glacier not stored; '
+                'check store_diagnostic_variables in params.cfg')
+            assert 'icemelt_on_glacier' in ds, (
+                'icemelt_on_glacier not stored')
+            melt = ds['melt_on_glacier'].values
+            snowmelt = ds['snowmelt_on_glacier'].values
+            icemelt = ds['icemelt_on_glacier'].values
+
+        valid = (np.isfinite(melt) & np.isfinite(snowmelt) &
+                 np.isfinite(icemelt))
+        assert valid.any(), 'No finite values found'
+        # Conservation: snowmelt + icemelt == melt_on_glacier
+        assert_allclose(snowmelt[valid] + icemelt[valid], melt[valid],
+                        rtol=1e-6,
+                        err_msg='snowmelt + icemelt != melt_on_glacier')
+        # Both components non-negative
+        assert np.all(snowmelt[valid] >= -1e-10), 'Negative snowmelt'
+        assert np.all(icemelt[valid] >= -1e-10), 'Negative icemelt'
+        # During ablation season icemelt should be > 0 somewhere
+        assert icemelt[valid].max() > 0, 'No ice melt found (unexpected)'
+
+    @pytest.mark.slow
+    def test_route_hydro_output_5c(self, hef_gdir, inversion_params):
+        """Five-component routing produces 5 discharge variables that sum."""
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+        diag_vars = cfg.PARAMS['store_diagnostic_variables']
+        if 'snowmelt_on_glacier' not in diag_vars:
+            cfg.PARAMS['store_diagnostic_variables'] = (
+                diag_vars + ', snowmelt_on_glacier, icemelt_on_glacier')
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=20,
+                             store_monthly_hydro=True,
+                             output_filesuffix='_5c_routing_test')
+
+        tasks.route_hydro_output_5c(
+            gdir,
+            filesuffix='_5c_routing_test',
+            k_rain_months=0.5,
+            k_snow_months=2.0,
+            k_ice_months=8.0,
+        )
+
+        components = [
+            'discharge_5c_m3s',
+            'discharge_rain_on_m3s',
+            'discharge_rain_off_m3s',
+            'discharge_snowmelt_on_m3s',
+            'discharge_snowmelt_off_m3s',
+            'discharge_icemelt_m3s',
+        ]
+        with xr.open_dataset(gdir.get_filepath(
+                'model_diagnostics',
+                filesuffix='_5c_routing_test')) as ds:
+            for var in components:
+                assert var in ds, f'{var} missing from output'
+
+            q_total = ds['discharge_5c_m3s'].values
+            q_parts = (ds['discharge_rain_on_m3s'].values +
+                       ds['discharge_rain_off_m3s'].values +
+                       ds['discharge_snowmelt_on_m3s'].values +
+                       ds['discharge_snowmelt_off_m3s'].values +
+                       ds['discharge_icemelt_m3s'].values)
+
+        valid_5c = np.isfinite(q_total)
+        # Total = sum of 5 components
+        assert_allclose(q_total[valid_5c], q_parts[valid_5c], rtol=1e-10)
+        # All values non-negative
+        assert np.nanmin(q_total) >= 0, 'Negative total discharge'
+
 
 class TestMassRedis:
 
