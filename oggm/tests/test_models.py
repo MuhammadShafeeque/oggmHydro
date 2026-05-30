@@ -6084,6 +6084,235 @@ class TestTerrainRouting:
             )
 
 
+class TestChannelRouting:
+    """Tests for Phase 7 — Muskingum-Cunge channel routing entity task.
+
+    Fast tests use synthetic NetworkX graphs with no gdir required.
+    Slow tests use the HEF demo glacier and require --run-slow.
+    """
+
+    # ------------------------------------------------------------------
+    # Fast unit tests (no gdir)
+    # ------------------------------------------------------------------
+
+    def test_node_contributions_linear_network(self):
+        """Linear A→B→C: contributions should partition acc correctly."""
+        import networkx as nx
+        from oggm.core.hydrology import _compute_node_contributions
+
+        G = nx.DiGraph()
+        # Three nodes in series: A (headwater) → B (junction) → C (outlet)
+        # A=(0,0), B=(1,0), C=(2,0)
+        G.add_edge((0, 0), (1, 0))
+        G.add_edge((1, 0), (2, 0))
+
+        # Synthetic accumulation: A has 5 upstream cells, B has 10, C has 15
+        acc = np.zeros((3, 1), dtype=float)
+        acc[0, 0] = 5.0
+        acc[1, 0] = 10.0
+        acc[2, 0] = 15.0
+
+        fracs = _compute_node_contributions(G, acc)
+
+        # A: 5 - 0 (no preds) = 5
+        # B: 10 - 5 (pred A) = 5
+        # C: 15 - 10 (pred B) = 5
+        # Total = 15; each fraction = 5/15 ≈ 1/3
+        assert_allclose(fracs[(0, 0)], 5.0 / 15.0, rtol=1e-9)
+        assert_allclose(fracs[(1, 0)], 5.0 / 15.0, rtol=1e-9)
+        assert_allclose(fracs[(2, 0)], 5.0 / 15.0, rtol=1e-9)
+        assert_allclose(sum(fracs.values()), 1.0, rtol=1e-9)
+
+    def test_node_contributions_branching_network(self):
+        """Y-network: two headwaters draining to one outlet."""
+        import networkx as nx
+        from oggm.core.hydrology import _compute_node_contributions
+
+        G = nx.DiGraph()
+        # L=(0,0) and R=(0,2) both drain to outlet O=(1,1)
+        G.add_edge((0, 0), (1, 1))
+        G.add_edge((0, 2), (1, 1))
+
+        acc = np.zeros((2, 3), dtype=float)
+        acc[0, 0] = 8.0    # L headwater
+        acc[0, 2] = 4.0    # R headwater
+        acc[1, 1] = 20.0   # outlet sees both upstreams
+
+        fracs = _compute_node_contributions(G, acc)
+
+        # L: 8, R: 4, O: 20 - 8 - 4 = 8; total = 20
+        assert_allclose(fracs[(0, 0)], 8.0 / 20.0, rtol=1e-9)
+        assert_allclose(fracs[(0, 2)], 4.0 / 20.0, rtol=1e-9)
+        assert_allclose(fracs[(1, 1)], 8.0 / 20.0, rtol=1e-9)
+        assert_allclose(sum(fracs.values()), 1.0, rtol=1e-9)
+
+    def test_node_contributions_single_node(self):
+        """Single node graph: fraction = 1.0."""
+        import networkx as nx
+        from oggm.core.hydrology import _compute_node_contributions
+
+        G = nx.DiGraph()
+        G.add_node((5, 3))
+
+        acc = np.ones((10, 10), dtype=float) * 42.0
+        fracs = _compute_node_contributions(G, acc)
+
+        assert_allclose(fracs[(5, 3)], 1.0, rtol=1e-9)
+
+    # ------------------------------------------------------------------
+    # Slow integration tests (require HEF gdir)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.slow
+    def test_channel_routing_output_variables(self, hef_gdir, inversion_params):
+        """compute_channel_routing writes discharge_terrain_m3s."""
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+        diag_vars = cfg.PARAMS['store_diagnostic_variables']
+        if 'snowmelt_on_glacier' not in diag_vars:
+            cfg.PARAMS['store_diagnostic_variables'] = (
+                diag_vars + ', snowmelt_on_glacier, icemelt_on_glacier')
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=20,
+                             store_monthly_hydro=True,
+                             output_filesuffix='_ch_vars_test')
+        tasks.route_hydro_output_5c(gdir, filesuffix='_ch_vars_test')
+        tasks.compute_channel_routing(gdir, filesuffix='_ch_vars_test')
+
+        with xr.open_dataset(gdir.get_filepath(
+                'model_diagnostics',
+                filesuffix='_ch_vars_test')) as ds:
+            assert 'discharge_terrain_m3s' in ds, (
+                'discharge_terrain_m3s not written by compute_channel_routing')
+            attrs = ds['discharge_terrain_m3s'].attrs
+            assert attrs.get('routing_scheme') in ('muskingum_cunge', 'trivial')
+            assert 'units' in attrs
+
+    @pytest.mark.slow
+    def test_channel_routing_nonnegative(self, hef_gdir, inversion_params):
+        """Terrain-routed discharge must be non-negative."""
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+        diag_vars = cfg.PARAMS['store_diagnostic_variables']
+        if 'snowmelt_on_glacier' not in diag_vars:
+            cfg.PARAMS['store_diagnostic_variables'] = (
+                diag_vars + ', snowmelt_on_glacier, icemelt_on_glacier')
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=20,
+                             store_monthly_hydro=True,
+                             output_filesuffix='_ch_nonneg_test')
+        tasks.route_hydro_output_5c(gdir, filesuffix='_ch_nonneg_test')
+        tasks.compute_channel_routing(gdir, filesuffix='_ch_nonneg_test')
+
+        with xr.open_dataset(gdir.get_filepath(
+                'model_diagnostics',
+                filesuffix='_ch_nonneg_test')) as ds:
+            q = ds['discharge_terrain_m3s'].values
+        assert np.nanmin(q) >= 0.0, (
+            f'Negative terrain discharge: min={np.nanmin(q):.4f} m³/s')
+
+    @pytest.mark.slow
+    def test_channel_routing_mass_conservation(self, hef_gdir, inversion_params):
+        """Sum of terrain-routed discharge ≈ sum of hillslope discharge."""
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+        diag_vars = cfg.PARAMS['store_diagnostic_variables']
+        if 'snowmelt_on_glacier' not in diag_vars:
+            cfg.PARAMS['store_diagnostic_variables'] = (
+                diag_vars + ', snowmelt_on_glacier, icemelt_on_glacier')
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=20,
+                             store_monthly_hydro=True,
+                             output_filesuffix='_ch_mass_test')
+        tasks.route_hydro_output_5c(gdir, filesuffix='_ch_mass_test')
+        tasks.compute_channel_routing(gdir, filesuffix='_ch_mass_test')
+
+        with xr.open_dataset(gdir.get_filepath(
+                'model_diagnostics',
+                filesuffix='_ch_mass_test')) as ds:
+            q_hillslope = ds['discharge_5c_m3s'].values
+            q_terrain = ds['discharge_terrain_m3s'].values
+
+        # At annual timestep K << dt, so terrain sum ≈ hillslope sum
+        ratio = np.nansum(q_terrain) / np.nansum(q_hillslope)
+        assert 0.85 < ratio < 1.15, (
+            f'Mass ratio hillslope→terrain {ratio:.3f} outside [0.85, 1.15]')
+
+    @pytest.mark.slow
+    def test_channel_routing_output_filesuffix(self, hef_gdir, inversion_params):
+        """output_filesuffix writes to a new file, leaving the input intact."""
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+        diag_vars = cfg.PARAMS['store_diagnostic_variables']
+        if 'snowmelt_on_glacier' not in diag_vars:
+            cfg.PARAMS['store_diagnostic_variables'] = (
+                diag_vars + ', snowmelt_on_glacier, icemelt_on_glacier')
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=20,
+                             store_monthly_hydro=True,
+                             output_filesuffix='_ch_sfx_src')
+        tasks.route_hydro_output_5c(gdir, filesuffix='_ch_sfx_src')
+        tasks.compute_channel_routing(gdir,
+                                      filesuffix='_ch_sfx_src',
+                                      output_filesuffix='_ch_sfx_dst')
+
+        # Source must NOT contain discharge_terrain_m3s
+        with xr.open_dataset(gdir.get_filepath(
+                'model_diagnostics',
+                filesuffix='_ch_sfx_src')) as ds:
+            assert 'discharge_terrain_m3s' not in ds, (
+                'discharge_terrain_m3s should NOT be in source file')
+
+        # Destination must contain it
+        with xr.open_dataset(gdir.get_filepath(
+                'model_diagnostics',
+                filesuffix='_ch_sfx_dst')) as ds:
+            assert 'discharge_terrain_m3s' in ds, (
+                'discharge_terrain_m3s missing from destination file')
+
+    @pytest.mark.slow
+    def test_channel_routing_trivial_fallback(self, hef_gdir, inversion_params):
+        """Very high threshold → no streams → trivial pass-through."""
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+        diag_vars = cfg.PARAMS['store_diagnostic_variables']
+        if 'snowmelt_on_glacier' not in diag_vars:
+            cfg.PARAMS['store_diagnostic_variables'] = (
+                diag_vars + ', snowmelt_on_glacier, icemelt_on_glacier')
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=10,
+                             store_monthly_hydro=True,
+                             output_filesuffix='_ch_trivial_test')
+        tasks.route_hydro_output_5c(gdir, filesuffix='_ch_trivial_test')
+        # Absurdly high threshold forces trivial routing
+        tasks.compute_channel_routing(gdir,
+                                      filesuffix='_ch_trivial_test',
+                                      stream_threshold_cells=999999)
+
+        with xr.open_dataset(gdir.get_filepath(
+                'model_diagnostics',
+                filesuffix='_ch_trivial_test')) as ds:
+            assert 'discharge_terrain_m3s' in ds
+            attrs = ds['discharge_terrain_m3s'].attrs
+            assert attrs.get('routing_scheme') == 'trivial', (
+                f"Expected trivial routing, got: {attrs.get('routing_scheme')}")
+            # Pass-through: terrain output == hillslope input
+            q_hs = ds['discharge_5c_m3s'].values
+            q_tr = ds['discharge_terrain_m3s'].values
+            valid = np.isfinite(q_hs) & np.isfinite(q_tr)
+            assert_allclose(q_tr[valid], q_hs[valid], rtol=1e-12)
+
+
 class TestMassRedis:
 
     def test_hef_retreat(self, class_case_dir):

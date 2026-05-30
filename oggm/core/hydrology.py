@@ -795,3 +795,288 @@ def route_hydro_output_5c(gdir, filesuffix='',
         'k_ice=%.1f months)',
         gdir.rgi_id, k_rain_months, k_snow_months, k_ice_months,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — Muskingum-Cunge channel routing entity task
+# ---------------------------------------------------------------------------
+
+def _compute_node_contributions(G, acc_arr):
+    """Compute fractional drainage contribution for each stream network node.
+
+    Each node's contribution is its flow accumulation minus the sum of
+    accumulations at all immediate upstream (predecessor) network nodes.
+    This gives the number of cells that drain *directly* to the node without
+    first passing through another stream node.
+
+    Parameters
+    ----------
+    G : nx.DiGraph
+        Stream network from
+        :func:`~oggm.core.terrain_routing.build_stream_network`.
+    acc_arr : np.ndarray, shape (nrows, ncols)
+        Flow accumulation grid aligned with the network's DEM.
+
+    Returns
+    -------
+    fractions : dict
+        ``{(r, c): float}`` — normalised fractional contribution for each
+        node, summing to 1.0 across all nodes.
+    """
+    local_acc = {}
+    for node in G.nodes():
+        r, c = node
+        contrib = float(acc_arr[r, c])
+        for pred in G.predecessors(node):
+            pr, pc = pred
+            contrib -= float(acc_arr[pr, pc])
+        local_acc[node] = max(contrib, 1.0)  # at least 1 cell
+
+    total = max(sum(local_acc.values()), 1.0)
+    return {k: v / total for k, v in local_acc.items()}
+
+
+def _write_trivial_routing(gdir, filesuffix='', output_filesuffix=None):
+    """Copy hillslope discharge directly to terrain routing output.
+
+    Fallback used when the glacier is too small to build a stream network
+    or when no stream cells are found above the delineation threshold.
+    The Phase 5 (or Phase 2 / Phase 1) discharge is written as
+    ``discharge_terrain_m3s`` without any further modification.
+    """
+    fpath = gdir.get_filepath('model_diagnostics', filesuffix=filesuffix)
+    with xr.open_dataset(fpath) as ds:
+        time = ds['time'].values
+        if 'discharge_5c_m3s' in ds:
+            q_passthrough = ds['discharge_5c_m3s'].values.copy()
+        elif 'discharge_m3s' in ds:
+            q_passthrough = ds['discharge_m3s'].values.copy()
+        else:
+            q_passthrough = np.full(len(time), np.nan)
+
+    out_ds = xr.Dataset()
+    out_ds.coords['time'] = time
+    out_ds['discharge_terrain_m3s'] = ('time', q_passthrough)
+    out_ds['discharge_terrain_m3s'].attrs = {
+        'description': (
+            'Glacier discharge (trivial pass-through; '
+            'no stream network available for channel routing)'
+        ),
+        'units': 'm3 s-1',
+        'routing_scheme': 'trivial',
+    }
+
+    if output_filesuffix is not None:
+        write_path = gdir.get_filepath('model_diagnostics',
+                                       filesuffix=output_filesuffix)
+        shutil.copy(fpath, write_path)
+    else:
+        write_path = fpath
+
+    out_ds.to_netcdf(write_path, mode='a')
+
+
+@entity_task(log, writes=['model_diagnostics'])
+def compute_channel_routing(gdir, filesuffix='',
+                             stream_threshold_cells=None,
+                             muskingum_X=None,
+                             celerity_m_per_s=None,
+                             output_filesuffix=None):
+    """Route per-glacier discharge through the terrain stream network.
+
+    Builds a DEM-derived stream network (Phase 6) from the glacier's
+    ``gridded_data`` and routes the prior hillslope-routed discharge
+    (Phase 5 or Phase 2) through the channel network using
+    Muskingum-Cunge channel routing (Phase 7).
+
+    Must be called **after** :func:`route_hydro_output_5c` (or
+    :func:`route_hydro_output`), which provides the hillslope-to-channel
+    routed discharge in ``model_diagnostics``.
+
+    Parameters
+    ----------
+    gdir : :class:`oggm.GlacierDirectory`
+    filesuffix : str
+        Suffix of the ``model_diagnostics`` file containing the prior
+        hillslope-routing output (``discharge_5c_m3s`` or
+        ``discharge_m3s``).
+    stream_threshold_cells : int, optional
+        Minimum upstream cell count to define a stream.
+        Defaults to ``cfg.PARAMS.get('stream_threshold_cells', 5)``.
+    muskingum_X : float, optional
+        Muskingum attenuation coefficient [0, 0.5].
+        X = 0 → maximum attenuation; X = 0.5 → pure translation.
+        Defaults to ``cfg.PARAMS.get('muskingum_X', 0.25)``.
+    celerity_m_per_s : float, optional
+        Kinematic wave celerity [m s⁻¹] for reach travel-time
+        K = L / c_k.
+        Defaults to ``cfg.PARAMS.get('channel_celerity_m_per_s', 1.5)``.
+    output_filesuffix : str, optional
+        Filesuffix for the output ``model_diagnostics`` file.
+        If *None*, results are appended in-place to the input file.
+
+    Writes
+    ------
+    ``discharge_terrain_m3s`` : m³ s⁻¹
+        Muskingum-Cunge routed discharge at the glacier stream outlet.
+        Metadata attributes include routing parameters and network
+        statistics.
+
+    Notes
+    -----
+    Lateral inflow to each stream reach is proportional to its local
+    drainage contribution: the node's flow accumulation minus the sum of
+    immediate upstream network predecessors' accumulations (computed via
+    :func:`_compute_node_contributions`).
+
+    At the annual timestep (typical OGGM output) the Muskingum-Cunge
+    travel-time correction is very small (K ≈ seconds–hours vs
+    Δt = 1 year), so ``discharge_terrain_m3s ≈ discharge_5c_m3s``.
+    The network structure is preserved for sub-annual routing (Phase 9)
+    and multi-glacier basin aggregation (Phase 8).
+
+    If the glacier DEM produces no stream cells above
+    *stream_threshold_cells*, a trivial pass-through is applied and a
+    warning is logged (see :func:`_write_trivial_routing`).
+    """
+    from oggm.core.terrain_routing import (
+        compute_flow_direction,
+        compute_flow_accumulation,
+        delineate_streams,
+        build_stream_network,
+        route_stream_network,
+    )
+
+    # --- Parameters ---
+    if stream_threshold_cells is None:
+        stream_threshold_cells = int(
+            cfg.PARAMS.get('stream_threshold_cells', 5))
+    if muskingum_X is None:
+        muskingum_X = float(cfg.PARAMS.get('muskingum_X', 0.25))
+    if celerity_m_per_s is None:
+        celerity_m_per_s = float(
+            cfg.PARAMS.get('channel_celerity_m_per_s', 1.5))
+
+    # --- Read DEM from gridded_data ---
+    gdata_path = gdir.get_filepath('gridded_data')
+    with xr.open_dataset(gdata_path) as ds:
+        dem_arr = ds['topo'].values.astype(float)
+        if 'glacier_mask' in ds:
+            glacier_mask = ds['glacier_mask'].values.astype(bool)
+        else:
+            glacier_mask = np.ones(dem_arr.shape, dtype=bool)
+
+    # Restrict to glacier domain; non-glacier cells are set to NaN
+    dem_glacier = np.where(glacier_mask, dem_arr, np.nan)
+
+    # Cell size in metres (abs because some grids have negative dy)
+    cellsize_m = abs(float(gdir.grid.dx))
+
+    # --- Phase 6: terrain analysis ---
+    fdir = compute_flow_direction(dem_glacier, cellsize_m,
+                                  fill_pits_first=True)
+    acc = compute_flow_accumulation(fdir)
+    streams = delineate_streams(acc, threshold_cells=stream_threshold_cells)
+
+    if not streams.any():
+        log.warning(
+            '(%s) No stream cells found (threshold=%d cells); '
+            'applying trivial pass-through routing.',
+            gdir.rgi_id, stream_threshold_cells,
+        )
+        _write_trivial_routing(gdir, filesuffix=filesuffix,
+                               output_filesuffix=output_filesuffix)
+        return
+
+    G = build_stream_network(streams, fdir, dem_glacier, cellsize_m,
+                             acc_arr=acc)
+
+    if G.number_of_edges() == 0:
+        log.warning(
+            '(%s) Stream network has no edges (glacier too small); '
+            'applying trivial pass-through routing.',
+            gdir.rgi_id,
+        )
+        _write_trivial_routing(gdir, filesuffix=filesuffix,
+                               output_filesuffix=output_filesuffix)
+        return
+
+    # --- Read hillslope-routed discharge from model_diagnostics ---
+    fpath = gdir.get_filepath('model_diagnostics', filesuffix=filesuffix)
+    with xr.open_dataset(fpath) as ds:
+        time = ds['time'].values
+        if 'discharge_5c_m3s' in ds:
+            q_hillslope_full = ds['discharge_5c_m3s'].values.copy()
+        elif 'discharge_m3s' in ds:
+            q_hillslope_full = ds['discharge_m3s'].values.copy()
+        else:
+            raise RuntimeError(
+                f'No routed discharge found in {fpath}. '
+                'Run route_hydro_output_5c() or route_hydro_output() first.'
+            )
+
+    valid = ~np.isnan(q_hillslope_full)
+    if not valid.any():
+        raise RuntimeError(
+            f'All discharge values are NaN in {fpath}. '
+            'Did run_with_hydro() and a routing step complete successfully?'
+        )
+    q_hillslope = q_hillslope_full[valid]   # shape (n_valid,)
+
+    # --- Build lateral inflow dict ---
+    # Distribute total discharge across nodes proportional to each node's
+    # local drainage contribution (= its accumulation minus predecessors').
+    fractions = _compute_node_contributions(G, acc)
+    lateral_inflow_dict = {
+        node: q_hillslope * frac
+        for node, frac in fractions.items()
+        if frac > 0
+    }
+
+    # --- Muskingum-Cunge routing through the stream network ---
+    q_outlet, _ = route_stream_network(
+        G,
+        lateral_inflow_dict=lateral_inflow_dict,
+        dt_seconds=_SEC_PER_YEAR,
+        muskingum_X=muskingum_X,
+        celerity_m_per_s=celerity_m_per_s,
+    )
+
+    # Pad back to full time length (NaN at invalid timesteps)
+    n_full = len(time)
+    q_terrain_full = np.full(n_full, np.nan)
+    q_terrain_full[valid] = q_outlet
+
+    # --- Build output dataset ---
+    out_ds = xr.Dataset()
+    out_ds.coords['time'] = time
+
+    out_ds['discharge_terrain_m3s'] = ('time', q_terrain_full)
+    out_ds['discharge_terrain_m3s'].attrs = {
+        'description': (
+            'Muskingum-Cunge channel-routed discharge at glacier outlet'
+        ),
+        'units': 'm3 s-1',
+        'routing_scheme': 'muskingum_cunge',
+        'muskingum_X': float(muskingum_X),
+        'celerity_m_per_s': float(celerity_m_per_s),
+        'stream_threshold_cells': int(stream_threshold_cells),
+        'n_stream_nodes': int(G.number_of_nodes()),
+        'n_stream_reaches': int(G.number_of_edges()),
+    }
+
+    # --- Write to file ---
+    if output_filesuffix is not None:
+        write_path = gdir.get_filepath('model_diagnostics',
+                                       filesuffix=output_filesuffix)
+        shutil.copy(fpath, write_path)
+    else:
+        write_path = fpath
+
+    out_ds.to_netcdf(write_path, mode='a')
+    log.debug(
+        '(%s) compute_channel_routing done (%d nodes, %d edges, '
+        'X=%.2f, c=%.1f m/s)',
+        gdir.rgi_id, G.number_of_nodes(), G.number_of_edges(),
+        muskingum_X, celerity_m_per_s,
+    )
