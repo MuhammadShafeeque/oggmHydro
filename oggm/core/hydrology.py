@@ -1464,46 +1464,59 @@ def combine_basin_discharge(gdirs, subbasins_assignment, nonglaciated_ds,
 
     q_glacier = np.nansum(np.stack(all_q_gl, axis=0), axis=0)
 
-    # --- Sum non-glaciated discharge ---
-    # Aggregate over all sub-basins in nonglaciated_ds
+    # --- Sum non-glaciated discharge over all sub-basins ---
     q_ngl_total = nonglaciated_ds['Q_ngl_m3s'].sum(dim='HYBAS_ID').values
     time_ngl = nonglaciated_ds['time'].values
 
     # --- Align time axes ---
-    # Both time axes are expected to be annual (integer years).
-    # Extract year integers from OGGM's time values (can be float or datetime).
+    # Glacier diagnostics are annual; Q_ngl may be monthly or annual.
+    # Extract year integers from any time dtype (float, int, datetime64).
     def _to_years(t_arr):
         if np.issubdtype(t_arr.dtype, np.floating):
             return t_arr.astype(int)
         if np.issubdtype(t_arr.dtype, np.integer):
             return t_arr
-        # Try datetime-like
         try:
             import pandas as pd
             return np.array([pd.Timestamp(tt).year for tt in t_arr])
         except Exception:
             raise ValueError(
-                'Cannot convert time coordinate to integer years. '
-                'Provide annual-resolution time axes.'
+                'Cannot convert time coordinate to integer years.'
             )
 
     yrs_gl = _to_years(time_ref)
-    yrs_ngl = _to_years(time_ngl)
+    yrs_ngl_raw = _to_years(time_ngl)
+
+    # If Q_ngl is sub-annual (monthly), aggregate to annual mean discharge.
+    # Annual mean of a mean-monthly series = mean monthly value, which
+    # is already the correct time-averaged rate [m3 s-1].
+    unique_yrs_ngl = np.unique(yrs_ngl_raw)
+    if len(yrs_ngl_raw) > len(unique_yrs_ngl):
+        log.debug('combine_basin_discharge: resampling sub-annual '
+                  '(%d steps) Q_ngl to %d annual means',
+                  len(yrs_ngl_raw), len(unique_yrs_ngl))
+        q_ngl_annual = np.array(
+            [q_ngl_total[yrs_ngl_raw == yr].mean() for yr in unique_yrs_ngl],
+            dtype=float)
+        q_ngl_total = q_ngl_annual
+        yrs_ngl = unique_yrs_ngl
+    else:
+        yrs_ngl = yrs_ngl_raw
 
     # Intersection of years present in both datasets
     common_years = np.intersect1d(yrs_gl, yrs_ngl)
     if len(common_years) == 0:
         raise ValueError(
             'Glacier and non-glaciated time axes have no overlapping years. '
-            f'Glacier years: {yrs_gl.min()}–{yrs_gl.max()}, '
-            f'Non-glaciated years: {yrs_ngl.min()}–{yrs_ngl.max()}.'
+            f'Glacier years: {yrs_gl.min()}\u2013{yrs_gl.max()}, '
+            f'Non-glaciated years: {yrs_ngl.min()}\u2013{yrs_ngl.max()}.'
         )
 
-    idx_gl = np.isin(yrs_gl, common_years)
+    idx_gl  = np.isin(yrs_gl,  common_years)
     idx_ngl = np.isin(yrs_ngl, common_years)
 
     q_glacier_aligned = q_glacier[idx_gl]
-    q_ngl_aligned = q_ngl_total[idx_ngl]
+    q_ngl_aligned     = q_ngl_total[idx_ngl]
 
     # --- Build output dataset ---
     ds_out = xr.Dataset(
