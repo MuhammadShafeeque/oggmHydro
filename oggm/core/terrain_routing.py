@@ -90,8 +90,8 @@ _D8_OPPOSITE = {1: 16, 16: 1, 2: 32, 32: 2, 4: 64, 64: 4, 8: 128, 128: 8}
 def fill_pits(dem_arr):
     """Fill single-cell pits in a DEM.
 
-    A pit is a cell lower than all 8 neighbours.  This simple filler
-    raises the pit cell to the minimum neighbour elevation.  For
+    A pit is a cell that is strictly lower than ALL 8 valid neighbours.
+    Such cells are raised to the minimum neighbour elevation.  For
     multi-cell depressions, call this iteratively or use pysheds.
 
     Parameters
@@ -108,28 +108,41 @@ def fill_pits(dem_arr):
     nrows, ncols = dem_arr.shape
 
     changed = True
-    while changed:
+    max_iter = 100
+    itr = 0
+    while changed and itr < max_iter:
         changed = False
+        itr += 1
+        # Build min-neighbour and count-of-valid-neighbours arrays
+        min_neigh = np.full((nrows, ncols), np.inf)
+        n_valid = np.zeros((nrows, ncols), dtype=int)
+
         for di in range(8):
             dr, dc = int(_D8_DR[di]), int(_D8_DC[di])
-            # Shift arrays
             r0, r1 = max(0, -dr), min(nrows, nrows - dr)
             c0, c1 = max(0, -dc), min(ncols, ncols - dc)
             r0n, r1n = r0 + dr, r1 + dr
             c0n, c1n = c0 + dc, c1 + dc
 
-            center = filled[r0:r1, c0:c1]
             neigh = filled[r0n:r1n, c0n:c1n]
+            valid = ~np.isnan(neigh)
+            min_neigh[r0:r1, c0:c1] = np.where(
+                valid,
+                np.minimum(min_neigh[r0:r1, c0:c1], neigh),
+                min_neigh[r0:r1, c0:c1]
+            )
+            n_valid[r0:r1, c0:c1] += valid.astype(int)
 
-            # Centre is a pit relative to this neighbour
-            is_pit = (center < neigh) & ~np.isnan(center) & ~np.isnan(neigh)
-            # But also lower than ALL neighbours? — approximate by checking
-            # if raising to neigh makes centre ≥ the opposite neighbour.
-            # Simple single-pass: raise pits found w.r.t. minimum neighbour.
-            new_val = np.where(is_pit, neigh, center)
-            if np.any(new_val != center):
-                filled[r0:r1, c0:c1] = new_val
-                changed = True
+        # A true pit: cell is finite AND strictly below ALL valid neighbours
+        is_true_pit = (
+            np.isfinite(filled)
+            & (n_valid > 0)
+            & (filled < min_neigh)
+        )
+
+        if np.any(is_true_pit):
+            filled = np.where(is_true_pit, min_neigh, filled)
+            changed = True
 
     return filled
 
