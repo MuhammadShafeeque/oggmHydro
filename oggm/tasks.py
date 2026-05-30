@@ -68,6 +68,8 @@ from oggm.core.hydrology import route_hydro_output_5c
 from oggm.core.hydrology import aggregate_basin_discharge
 from oggm.core.hydrology import calibrate_routing_params
 from oggm.core.hydrology import compute_channel_routing
+from oggm.core.hydrology import compute_nonglaciated_runoff
+from oggm.core.hydrology import combine_basin_discharge
 from oggm.core.terrain_routing import compute_flow_direction
 from oggm.core.terrain_routing import compute_flow_accumulation
 from oggm.core.terrain_routing import compute_slope_aspect

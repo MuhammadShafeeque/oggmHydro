@@ -1080,3 +1080,459 @@ def compute_channel_routing(gdir, filesuffix='',
         gdir.rgi_id, G.number_of_nodes(), G.number_of_edges(),
         muskingum_X, celerity_m_per_s,
     )
+
+
+# ===========================================================================
+# Phase 8 — Basin Integration: non-glaciated area runoff model
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Two-bucket snowmelt / soil-moisture runoff model
+# ---------------------------------------------------------------------------
+
+def _run_two_bucket_model(t_celsius, prcp_mm, temp_threshold=0.0,
+                          k_snow_months=2.0, k_soil_months=3.0,
+                          s_fc_mm=150.0, dt_months=1.0):
+    """Two-bucket (snow + soil) conceptual runoff model for non-glaciated area.
+
+    Driven by monthly-mean air temperature *t_celsius* and monthly total
+    precipitation *prcp_mm*, this model partitions precipitation into
+    rain/snowfall, routes snowmelt through a snow water equivalent (SWE)
+    bucket, and routes rain + meltwater through a soil-moisture bucket.
+    Runoff is generated when soil moisture exceeds field capacity.
+
+    Governing equations (monthly timestep)
+    ----------------------------------------
+    Precipitation partitioning::
+
+        P_snow = prcp * (1 - f_rain)
+        P_rain = prcp * f_rain
+        f_rain = sigmoid(4 * (T - T_threshold))  ∈ [0, 1]
+
+    Snow bucket (SWE; mm)::
+
+        M_snow = SWE * (1 - exp(-dt / k_snow))   [snowmelt]
+        SWE[t+1] = SWE[t] + P_snow - M_snow
+
+    Potential evapotranspiration (simplified Hamon)::
+
+        PET = max(0, 0.55 * (T - T_threshold))   [mm month-1]
+
+    Soil bucket (S_soil; mm)::
+
+        S_soil[t+1] = S_soil[t] + P_rain + M_snow - ET - Q_ngl
+        ET = min(PET, S_soil[t] + P_rain + M_snow)
+        Q_ngl = max(0, k_eff * (S_soil[t+1] - S_fc))  [linear release above FC]
+        k_eff = 1 - exp(-dt / k_soil)
+
+    Parameters
+    ----------
+    t_celsius : array-like, shape (N,)
+        Monthly mean air temperature [°C].
+    prcp_mm : array-like, shape (N,)
+        Monthly total precipitation [mm].
+    temp_threshold : float
+        Rain/snow partitioning threshold temperature [°C].  Default: 0 °C.
+    k_snow_months : float
+        Snow residence time (e-folding timescale) [months].  Default: 2.
+    k_soil_months : float
+        Soil drainage timescale [months].  Default: 3.
+    s_fc_mm : float
+        Field capacity (soil moisture threshold above which runoff occurs)
+        [mm].  Default: 150.
+    dt_months : float
+        Timestep size [months].  Default: 1.
+
+    Returns
+    -------
+    q_mm : np.ndarray, shape (N,)
+        Monthly runoff [mm month-1].  Always non-negative.
+    swe : np.ndarray, shape (N,)
+        Snow water equivalent [mm] at each timestep.
+    s_soil : np.ndarray, shape (N,)
+        Soil moisture [mm] at each timestep.
+
+    Notes
+    -----
+    At annual resolution (dt_months = 12) the model collapses to a simple
+    annual water balance; monthly resolution is recommended for seasonal
+    runoff timing.
+    """
+    t = np.asarray(t_celsius, dtype=float)
+    p = np.asarray(prcp_mm, dtype=float)
+    n = len(t)
+
+    if len(p) != n:
+        raise ValueError('t_celsius and prcp_mm must have the same length.')
+    if k_snow_months <= 0 or k_soil_months <= 0:
+        raise ValueError('k_snow_months and k_soil_months must be positive.')
+    if s_fc_mm < 0:
+        raise ValueError('s_fc_mm must be non-negative.')
+
+    # Partition coefficients
+    f_rain = 1.0 / (1.0 + np.exp(-4.0 * (t - temp_threshold)))
+    p_rain = p * f_rain
+    p_snow = p * (1.0 - f_rain)
+
+    # Decay coefficients
+    alpha_snow = np.exp(-dt_months / k_snow_months)
+    k_eff_soil = 1.0 - np.exp(-dt_months / k_soil_months)
+
+    # State arrays
+    swe = np.zeros(n, dtype=float)
+    s_soil = np.zeros(n, dtype=float)
+    q_mm = np.zeros(n, dtype=float)
+
+    # Initialise snow at zero; soil at field capacity
+    swe_state = 0.0
+    soil_state = s_fc_mm
+
+    for i in range(n):
+        # --- Snow bucket ---
+        melt = swe_state * (1.0 - alpha_snow)
+        swe_state = swe_state * alpha_snow + p_snow[i]
+        swe_state = max(swe_state, 0.0)
+
+        # --- PET (simplified Hamon, T-based) ---
+        pet = max(0.0, 0.55 * (t[i] - temp_threshold))
+
+        # --- Soil bucket ---
+        inflow = p_rain[i] + melt
+        avail = soil_state + inflow
+        et = min(pet, avail)
+        soil_pre = avail - et
+        # Linear drainage above field capacity
+        q_i = max(0.0, k_eff_soil * (soil_pre - s_fc_mm))
+        soil_state = soil_pre - q_i
+        soil_state = max(soil_state, 0.0)
+
+        swe[i] = swe_state
+        s_soil[i] = soil_state
+        q_mm[i] = q_i
+
+    return q_mm, swe, s_soil
+
+
+# ---------------------------------------------------------------------------
+# Non-glaciated runoff — per-subbasin function (not an entity_task)
+# ---------------------------------------------------------------------------
+
+def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
+                                temp_threshold=None, k_snow_months=None,
+                                k_soil_months=None, s_fc_mm=None):
+    """Compute non-glaciated area runoff for a set of HydroBASINS sub-basins.
+
+    Applies the two-bucket snowmelt/soil model to each sub-basin independently,
+    driven by area-weighted (centroid-representative) temperature and
+    precipitation from *climate_ds*.
+
+    Parameters
+    ----------
+    subbasins_gdf : :class:`geopandas.GeoDataFrame` or :class:`pandas.DataFrame`
+        Sub-basin metadata.  Must contain at minimum:
+        ``HYBAS_ID``, ``SUB_AREA`` (km²), and—if lapse-rate correction is
+        desired—``centroid_lon``, ``centroid_lat``, ``centroid_elev_m``.
+        A plain DataFrame (no geometry) is also accepted.
+    climate_ds : :class:`xarray.Dataset`
+        Climate forcing with coordinates ``time`` (monthly) and variables:
+        ``temp`` [°C] and ``prcp`` [mm month-1].  If the dataset has spatial
+        dimensions (``lat``, ``lon``), the nearest grid point to each
+        sub-basin centroid is extracted.  Otherwise (single time series),
+        the same forcing is applied to all sub-basins.
+    temp_threshold : float, optional
+        Rain/snow temperature threshold [°C].  Reads
+        ``cfg.PARAMS['nonglaciated_temp_threshold_degC']`` if not given.
+    k_snow_months : float, optional
+        Snow e-folding residence time [months].  Reads
+        ``cfg.PARAMS['nonglaciated_k_snow_months']`` if not given.
+    k_soil_months : float, optional
+        Soil drainage timescale [months].  Reads
+        ``cfg.PARAMS['nonglaciated_k_soil_months']`` if not given.
+    s_fc_mm : float, optional
+        Field capacity [mm].  Reads
+        ``cfg.PARAMS['nonglaciated_s_fc_mm']`` if not given.
+
+    Returns
+    -------
+    :class:`xarray.Dataset`
+        Variables per sub-basin and timestep:
+        ``Q_ngl_mm``  — runoff depth [mm month-1]
+        ``Q_ngl_m3s`` — volumetric discharge [m3 s-1]
+        ``SWE_mm``    — snow water equivalent [mm]
+        ``S_soil_mm`` — soil moisture [mm]
+        Coordinates: ``time`` (from *climate_ds*), ``HYBAS_ID``.
+
+    Notes
+    -----
+    This function is not an :func:`oggm.utils.entity_task`; it operates on
+    a collection of sub-basins rather than a single glacier directory.
+    Call it once for the whole basin study area.
+    """
+    import xarray as xr
+
+    # Read parameters
+    if temp_threshold is None:
+        temp_threshold = float(
+            cfg.PARAMS.get('nonglaciated_temp_threshold_degC', 0.0))
+    if k_snow_months is None:
+        k_snow_months = float(
+            cfg.PARAMS.get('nonglaciated_k_snow_months', 2.0))
+    if k_soil_months is None:
+        k_soil_months = float(
+            cfg.PARAMS.get('nonglaciated_k_soil_months', 3.0))
+    if s_fc_mm is None:
+        s_fc_mm = float(cfg.PARAMS.get('nonglaciated_s_fc_mm', 150.0))
+
+    # Determine sub-basin IDs and areas
+    hybas_ids = np.asarray(subbasins_gdf['HYBAS_ID'])
+    sub_area_km2 = np.asarray(subbasins_gdf['SUB_AREA'], dtype=float)
+    n_basins = len(hybas_ids)
+
+    # Extract time axis
+    time_arr = climate_ds['time'].values
+
+    # Determine spatial structure of the climate dataset
+    spatial_dims = set(climate_ds['temp'].dims) - {'time'}
+    has_spatial = bool(spatial_dims)
+
+    # Try to identify centroid columns (optional; not required)
+    has_centroids = ('centroid_lon' in subbasins_gdf.columns and
+                     'centroid_lat' in subbasins_gdf.columns)
+
+    # Containers for results
+    n_time = len(time_arr)
+    q_mm_all = np.zeros((n_basins, n_time), dtype=float)
+    swe_all = np.zeros((n_basins, n_time), dtype=float)
+    s_soil_all = np.zeros((n_basins, n_time), dtype=float)
+
+    for i_b in range(n_basins):
+        # Select climate forcing for this sub-basin
+        if has_spatial and has_centroids:
+            lon_c = float(subbasins_gdf['centroid_lon'].iloc[i_b])
+            lat_c = float(subbasins_gdf['centroid_lat'].iloc[i_b])
+            # Nearest neighbour selection
+            t_series = climate_ds['temp'].sel(
+                lat=lat_c, lon=lon_c, method='nearest').values
+            p_series = climate_ds['prcp'].sel(
+                lat=lat_c, lon=lon_c, method='nearest').values
+        else:
+            # Single time series (e.g. from a point forcing)
+            t_series = climate_ds['temp'].values.ravel()
+            p_series = climate_ds['prcp'].values.ravel()
+            if len(t_series) != n_time:
+                raise ValueError(
+                    f'climate_ds temp has {len(t_series)} timesteps but '
+                    f'time coordinate has {n_time}.'
+                )
+
+        q_mm, swe, s_soil = _run_two_bucket_model(
+            t_celsius=t_series,
+            prcp_mm=p_series,
+            temp_threshold=temp_threshold,
+            k_snow_months=k_snow_months,
+            k_soil_months=k_soil_months,
+            s_fc_mm=s_fc_mm,
+            dt_months=1.0,
+        )
+        q_mm_all[i_b] = q_mm
+        swe_all[i_b] = swe
+        s_soil_all[i_b] = s_soil
+
+    # Convert runoff depth [mm month-1] → volumetric discharge [m3 s-1]
+    # Q [m3/s] = depth [m/month] × area [m2] / seconds_per_month
+    area_m2 = sub_area_km2 * 1e6          # km2 → m2
+    # mm month-1 → m month-1 (*1e-3), then / _SEC_PER_MONTH
+    q_m3s_all = (q_mm_all * 1e-3 * area_m2[:, np.newaxis]) / _SEC_PER_MONTH
+
+    ds_out = xr.Dataset(
+        {
+            'Q_ngl_mm':   (['HYBAS_ID', 'time'], q_mm_all),
+            'Q_ngl_m3s':  (['HYBAS_ID', 'time'], q_m3s_all),
+            'SWE_mm':     (['HYBAS_ID', 'time'], swe_all),
+            'S_soil_mm':  (['HYBAS_ID', 'time'], s_soil_all),
+        },
+        coords={
+            'time': time_arr,
+            'HYBAS_ID': hybas_ids,
+        },
+    )
+    ds_out['Q_ngl_mm'].attrs = {
+        'description': 'Non-glaciated area runoff depth',
+        'units': 'mm month-1',
+    }
+    ds_out['Q_ngl_m3s'].attrs = {
+        'description': 'Non-glaciated area volumetric discharge',
+        'units': 'm3 s-1',
+    }
+    ds_out['SWE_mm'].attrs = {
+        'description': 'Snow water equivalent (two-bucket model)',
+        'units': 'mm',
+    }
+    ds_out['S_soil_mm'].attrs = {
+        'description': 'Soil moisture (two-bucket model)',
+        'units': 'mm',
+    }
+    ds_out.attrs = {
+        'temp_threshold': temp_threshold,
+        'k_snow_months': k_snow_months,
+        'k_soil_months': k_soil_months,
+        's_fc_mm': s_fc_mm,
+    }
+
+    log.info('compute_nonglaciated_runoff: %d sub-basins × %d timesteps',
+             n_basins, n_time)
+    return ds_out
+
+
+# ---------------------------------------------------------------------------
+# Combined basin discharge
+# ---------------------------------------------------------------------------
+
+def combine_basin_discharge(gdirs, subbasins_assignment, nonglaciated_ds,
+                             glacier_filesuffix='',
+                             glacier_discharge_var='discharge_m3s'):
+    """Combine glaciated and non-glaciated discharge for a study basin.
+
+    Sums routed glacier discharge over all provided glacier directories and
+    adds the non-glaciated sub-basin runoff from *nonglaciated_ds*.  The
+    two components are aligned on a shared time axis.
+
+    Parameters
+    ----------
+    gdirs : list of :class:`oggm.GlacierDirectory`
+        Glaciers in the basin.  Each must have a ``model_diagnostics`` file
+        with *glacier_discharge_var* present (i.e. a routing task has already
+        been run).
+    subbasins_assignment : :class:`pandas.DataFrame`
+        Output of :func:`oggm.shop.hydrobasins.assign_glaciers_to_subbasins`.
+        Must contain columns ``rgi_id`` and ``HYBAS_ID``.
+    nonglaciated_ds : :class:`xarray.Dataset`
+        Output of :func:`compute_nonglaciated_runoff`.  Must contain variable
+        ``Q_ngl_m3s`` with dimensions ``(HYBAS_ID, time)``.
+    glacier_filesuffix : str
+        Filesuffix for the ``model_diagnostics`` file to read from each gdir.
+    glacier_discharge_var : str
+        Name of the discharge variable in the glacier diagnostics file.
+        Typically ``'discharge_m3s'`` (after routing) or
+        ``'discharge_terrain_m3s'`` (after channel routing).
+
+    Returns
+    -------
+    :class:`xarray.Dataset`
+        Variables on a shared annual time axis:
+        ``Q_glacier_m3s``    — total glaciated discharge [m3 s-1]
+        ``Q_nonglacial_m3s`` — total non-glaciated discharge [m3 s-1]
+        ``Q_total_m3s``      — combined total basin discharge [m3 s-1]
+        Coordinate: ``time``.
+
+    Raises
+    ------
+    RuntimeError
+        If *glacier_discharge_var* is not found in any glacier's file.
+    ValueError
+        If the glaciated and non-glaciated time axes cannot be aligned.
+    """
+    import xarray as xr
+
+    # --- Sum glaciated discharge ---
+    all_q_gl = []
+    time_ref = None
+
+    for gdir in gdirs:
+        fpath = gdir.get_filepath('model_diagnostics',
+                                  filesuffix=glacier_filesuffix)
+        with xr.open_dataset(fpath) as ds:
+            if glacier_discharge_var not in ds:
+                raise RuntimeError(
+                    f'{glacier_discharge_var!r} not found in {fpath}. '
+                    f'Run a routing task first for {gdir.rgi_id}.'
+                )
+            q = ds[glacier_discharge_var].values
+            t = ds['time'].values
+
+        if time_ref is None:
+            time_ref = t
+        elif not np.array_equal(t, time_ref):
+            raise ValueError(
+                f'Time axis mismatch for glacier {gdir.rgi_id}. '
+                'All glaciers must share the same time axis.'
+            )
+        all_q_gl.append(q)
+
+    if not all_q_gl:
+        raise ValueError('gdirs is empty; cannot compute glacier discharge.')
+
+    q_glacier = np.nansum(np.stack(all_q_gl, axis=0), axis=0)
+
+    # --- Sum non-glaciated discharge ---
+    # Aggregate over all sub-basins in nonglaciated_ds
+    q_ngl_total = nonglaciated_ds['Q_ngl_m3s'].sum(dim='HYBAS_ID').values
+    time_ngl = nonglaciated_ds['time'].values
+
+    # --- Align time axes ---
+    # Both time axes are expected to be annual (integer years).
+    # Extract year integers from OGGM's time values (can be float or datetime).
+    def _to_years(t_arr):
+        if np.issubdtype(t_arr.dtype, np.floating):
+            return t_arr.astype(int)
+        if np.issubdtype(t_arr.dtype, np.integer):
+            return t_arr
+        # Try datetime-like
+        try:
+            import pandas as pd
+            return np.array([pd.Timestamp(tt).year for tt in t_arr])
+        except Exception:
+            raise ValueError(
+                'Cannot convert time coordinate to integer years. '
+                'Provide annual-resolution time axes.'
+            )
+
+    yrs_gl = _to_years(time_ref)
+    yrs_ngl = _to_years(time_ngl)
+
+    # Intersection of years present in both datasets
+    common_years = np.intersect1d(yrs_gl, yrs_ngl)
+    if len(common_years) == 0:
+        raise ValueError(
+            'Glacier and non-glaciated time axes have no overlapping years. '
+            f'Glacier years: {yrs_gl.min()}–{yrs_gl.max()}, '
+            f'Non-glaciated years: {yrs_ngl.min()}–{yrs_ngl.max()}.'
+        )
+
+    idx_gl = np.isin(yrs_gl, common_years)
+    idx_ngl = np.isin(yrs_ngl, common_years)
+
+    q_glacier_aligned = q_glacier[idx_gl]
+    q_ngl_aligned = q_ngl_total[idx_ngl]
+
+    # --- Build output dataset ---
+    ds_out = xr.Dataset(
+        {
+            'Q_glacier_m3s':    ('time', q_glacier_aligned),
+            'Q_nonglacial_m3s': ('time', q_ngl_aligned),
+            'Q_total_m3s':      ('time', q_glacier_aligned + q_ngl_aligned),
+        },
+        coords={'time': common_years},
+    )
+    ds_out['Q_glacier_m3s'].attrs = {
+        'description': 'Total glaciated discharge (sum over all glaciers)',
+        'units': 'm3 s-1',
+        'n_glaciers': len(gdirs),
+    }
+    ds_out['Q_nonglacial_m3s'].attrs = {
+        'description': 'Total non-glaciated sub-basin discharge',
+        'units': 'm3 s-1',
+    }
+    ds_out['Q_total_m3s'].attrs = {
+        'description': 'Combined basin discharge (glaciated + non-glaciated)',
+        'units': 'm3 s-1',
+    }
+
+    log.info(
+        'combine_basin_discharge: %d glaciers, %d years, '
+        'Q_glacier mean=%.2f m3/s, Q_ngl mean=%.2f m3/s',
+        len(gdirs), len(common_years),
+        float(np.nanmean(q_glacier_aligned)),
+        float(np.nanmean(q_ngl_aligned)),
+    )
+    return ds_out

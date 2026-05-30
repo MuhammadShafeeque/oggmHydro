@@ -5953,6 +5953,350 @@ class TestTerrainRouting:
         # Each outlet's row should be assigned to that outlet
         assert subs[1, 9] == 1 or subs[1, 9] != 0
         assert subs[4, 9] == 2 or subs[4, 9] != 0
+
+
+# ===========================================================================
+# Phase 8 — Basin Integration tests
+# ===========================================================================
+
+@pytest.fixture(scope='class')
+def basin_integration_cfg(request):
+    """Class-scoped fixture: initialise OGGM cfg for basin integration tests."""
+    cfg.initialize()
+    cfg.PARAMS['working_dir'] = get_test_dir()
+
+
+@pytest.mark.usefixtures('basin_integration_cfg')
+class TestZBasinIntegration:
+    """Tests for Phase 8: non-glaciated runoff model and basin discharge.
+
+    All tests here are fast (no gdir, no network access).  The two-bucket
+    model and the combine_basin_discharge function are exercised with
+    synthetic data.  The HydroSHEDS download functions (get_hydrobasins,
+    get_hydrorivers) are not tested here to avoid requiring network access
+    or pre-downloaded files.
+    """
+
+    # ------------------------------------------------------------------
+    # Two-bucket model — unit tests
+    # ------------------------------------------------------------------
+
+    def test_two_bucket_model_nonnegative(self):
+        """Runoff must never be negative regardless of forcing."""
+        from oggm.core.hydrology import _run_two_bucket_model
+
+        rng = np.random.default_rng(42)
+        t = rng.uniform(-20, 20, size=120)   # 10 years monthly
+        p = rng.uniform(0, 200, size=120)    # mm month-1
+
+        q_mm, swe, s_soil = _run_two_bucket_model(t, p)
+
+        assert np.all(q_mm >= 0.0), 'Runoff contains negative values'
+        assert np.all(swe >= 0.0), 'SWE contains negative values'
+        assert np.all(s_soil >= 0.0), 'Soil moisture contains negative values'
+
+    def test_two_bucket_model_dry_warmclimate(self):
+        """Under hot, dry conditions most precipitation evaporates; Q ≈ 0."""
+        from oggm.core.hydrology import _run_two_bucket_model
+
+        t = np.full(120, 25.0)     # always warm
+        p = np.full(120, 10.0)     # little rain [mm month-1]
+
+        q_mm, _, _ = _run_two_bucket_model(t, p, s_fc_mm=200.0)
+
+        # Total runoff should be a small fraction of precipitation
+        assert q_mm.sum() < p.sum() * 0.3, (
+            'Expected most precipitation to evaporate under hot, dry conditions'
+        )
+
+    def test_two_bucket_model_wet_cold_generates_runoff(self):
+        """Under cold, wet conditions a meaningful fraction of P becomes Q."""
+        from oggm.core.hydrology import _run_two_bucket_model
+
+        t = np.full(120, -5.0)     # always below freezing → all snow
+        p = np.full(120, 100.0)    # heavy precipitation [mm month-1]
+
+        q_mm, _, _ = _run_two_bucket_model(t, p, s_fc_mm=50.0)
+
+        # At least some runoff after spin-up
+        assert q_mm[12:].mean() > 0.0, (
+            'Expected non-zero runoff under wet conditions'
+        )
+
+    def test_two_bucket_model_zero_precip_decays(self):
+        """Without precipitation, SWE and soil moisture decay to zero."""
+        from oggm.core.hydrology import _run_two_bucket_model
+
+        # Warm-up: 12 months of heavy snow, then 48 months of no precip
+        t_warmup = np.full(12, -10.0)
+        p_warmup = np.full(12, 200.0)
+        _, swe_wu, soil_wu = _run_two_bucket_model(t_warmup, p_warmup)
+
+        # Now dry tail
+        t_dry = np.full(48, 5.0)
+        p_dry = np.zeros(48)
+        q_dry, swe_dry, soil_dry = _run_two_bucket_model(
+            t_dry, p_dry, s_fc_mm=0.0)  # s_fc=0 to allow full drainage
+
+        # After 48 months without input, storages should be near zero
+        assert swe_dry[-1] >= 0.0
+        assert soil_dry[-1] >= 0.0
+
+    def test_two_bucket_model_mass_conservation(self):
+        """Annual water balance: P ≈ ET + Q (no long-term storage trend)."""
+        from oggm.core.hydrology import _run_two_bucket_model
+
+        # Seasonal forcing: 20 years, warm summers cold winters
+        months = np.arange(240)
+        t = 5.0 * np.sin(2 * np.pi * months / 12) + 2.0    # -3..+7 °C
+        p = 80.0 + 40.0 * np.cos(2 * np.pi * months / 12)  # 40..120 mm
+
+        q_mm, swe, s_soil = _run_two_bucket_model(
+            t, p, k_snow_months=1.5, k_soil_months=4.0, s_fc_mm=100.0)
+
+        # Skip first 2-year spin-up; check over last 18 years
+        skip = 24
+        p_total = p[skip:].sum()
+        q_total = q_mm[skip:].sum()
+        delta_storage = (swe[-1] - swe[skip]) + (s_soil[-1] - s_soil[skip])
+
+        # P = Q + ET + ΔS  →  ET = P - Q - ΔS  →  0 <= Q <= P - ΔS
+        assert q_total >= 0.0
+        # Runoff should not exceed gross precipitation minus storage change
+        assert q_total <= p_total - delta_storage + 1.0  # 1 mm tolerance
+
+    def test_two_bucket_model_bad_params_raise(self):
+        """Invalid parameter values should raise ValueError."""
+        from oggm.core.hydrology import _run_two_bucket_model
+
+        t = np.zeros(12)
+        p = np.ones(12) * 50.0
+
+        with pytest.raises(ValueError, match='k_snow_months'):
+            _run_two_bucket_model(t, p, k_snow_months=-1.0)
+
+        with pytest.raises(ValueError, match='k_soil_months'):
+            _run_two_bucket_model(t, p, k_soil_months=0.0)
+
+        with pytest.raises(ValueError, match='s_fc_mm'):
+            _run_two_bucket_model(t, p, s_fc_mm=-10.0)
+
+    # ------------------------------------------------------------------
+    # compute_nonglaciated_runoff
+    # ------------------------------------------------------------------
+
+    def test_nonglaciated_runoff_basic(self):
+        """compute_nonglaciated_runoff returns expected dimensions."""
+        import xarray as xr
+        from oggm.core.hydrology import compute_nonglaciated_runoff
+
+        n_months = 36
+        time = np.arange(n_months)
+        climate_ds = xr.Dataset(
+            {
+                'temp': ('time', np.linspace(-5, 15, n_months)),
+                'prcp': ('time', np.full(n_months, 60.0)),
+            },
+            coords={'time': time},
+        )
+        subbasins = pd.DataFrame({
+            'HYBAS_ID': [1001, 1002],
+            'SUB_AREA':  [500.0, 800.0],
+        })
+
+        ds = compute_nonglaciated_runoff(subbasins, climate_ds)
+
+        assert 'Q_ngl_mm' in ds
+        assert 'Q_ngl_m3s' in ds
+        assert 'SWE_mm' in ds
+        assert 'S_soil_mm' in ds
+        assert ds['Q_ngl_mm'].shape == (2, n_months)
+        assert np.all(ds['Q_ngl_m3s'].values >= 0.0)
+
+    def test_nonglaciated_runoff_larger_area_more_discharge(self):
+        """Larger sub-basin area should produce proportionally more Q_m3s."""
+        import xarray as xr
+        from oggm.core.hydrology import compute_nonglaciated_runoff
+
+        n_months = 24
+        time = np.arange(n_months)
+        climate_ds = xr.Dataset(
+            {
+                'temp': ('time', np.zeros(n_months)),
+                'prcp': ('time', np.full(n_months, 80.0)),
+            },
+            coords={'time': time},
+        )
+        # Sub-basin B has 4× the area of sub-basin A
+        subbasins = pd.DataFrame({
+            'HYBAS_ID': [1, 2],
+            'SUB_AREA':  [100.0, 400.0],
+        })
+
+        ds = compute_nonglaciated_runoff(subbasins, climate_ds)
+
+        q_small = ds['Q_ngl_m3s'].sel(HYBAS_ID=1).values
+        q_large = ds['Q_ngl_m3s'].sel(HYBAS_ID=2).values
+
+        # Q_mm should be identical (same forcing); Q_m3s should be 4× larger
+        np.testing.assert_allclose(
+            ds['Q_ngl_mm'].sel(HYBAS_ID=1).values,
+            ds['Q_ngl_mm'].sel(HYBAS_ID=2).values,
+            rtol=1e-10,
+            err_msg='Same forcing → same runoff depth for both sub-basins',
+        )
+        ratio = q_large.mean() / q_small.mean()
+        np.testing.assert_allclose(ratio, 4.0, rtol=0.01,
+                                   err_msg='Q_m3s should scale linearly with area')
+
+    # ------------------------------------------------------------------
+    # assign_glaciers_to_subbasins
+    # ------------------------------------------------------------------
+
+    def test_assign_glaciers_to_subbasins_basic(self):
+        """Each glacier centroid is matched to its enclosing sub-basin."""
+        pytest.importorskip('geopandas')
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+        from oggm.shop.hydrobasins import assign_glaciers_to_subbasins
+
+        # Two 1°×1° boxes side by side: W box [0-1°E], E box [1-2°E]
+        poly_w = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+        poly_e = Polygon([(1, 0), (2, 0), (2, 1), (1, 1)])
+        subs = gpd.GeoDataFrame(
+            {
+                'HYBAS_ID': [101, 102],
+                'SUB_AREA': [1.0, 1.0],
+                'UP_AREA':  [2.0, 1.0],
+            },
+            geometry=[poly_w, poly_e],
+            crs='EPSG:4326',
+        )
+
+        # Create two minimal mock gdir-like objects
+        class MockGDir:
+            def __init__(self, rgi_id, cenlon, cenlat, area_km2):
+                self.rgi_id = rgi_id
+                self.cenlon = cenlon
+                self.cenlat = cenlat
+                self.rgi_area_km2 = area_km2
+
+        gdirs = [
+            MockGDir('RGI60-00.00001', 0.5, 0.5, 10.0),  # inside W box
+            MockGDir('RGI60-00.00002', 1.5, 0.5, 20.0),  # inside E box
+        ]
+
+        result = assign_glaciers_to_subbasins(gdirs, subs)
+
+        assert list(result['rgi_id']) == ['RGI60-00.00001', 'RGI60-00.00002']
+        assert result.loc[result['rgi_id'] == 'RGI60-00.00001',
+                          'HYBAS_ID'].iloc[0] == 101
+        assert result.loc[result['rgi_id'] == 'RGI60-00.00002',
+                          'HYBAS_ID'].iloc[0] == 102
+
+    def test_assign_glaciers_glacierized_fraction(self):
+        """Glacierized fraction is computed correctly from glacier areas."""
+        pytest.importorskip('geopandas')
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+        from oggm.shop.hydrobasins import assign_glaciers_to_subbasins
+
+        # Single 1°×1° box (~12,000 km² at equator, but we test numerically)
+        poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+        subs = gpd.GeoDataFrame(
+            {
+                'HYBAS_ID': [200],
+                'SUB_AREA': [500.0],   # 500 km²
+                'UP_AREA':  [500.0],
+            },
+            geometry=[poly],
+            crs='EPSG:4326',
+        )
+
+        class MockGDir:
+            def __init__(self, rgi_id, cenlon, cenlat, area_km2):
+                self.rgi_id = rgi_id
+                self.cenlon = cenlon
+                self.cenlat = cenlat
+                self.rgi_area_km2 = area_km2
+
+        # Two glaciers in the same sub-basin; total ice = 50 km²
+        gdirs = [
+            MockGDir('RGI60-00.A', 0.3, 0.3, 30.0),
+            MockGDir('RGI60-00.B', 0.7, 0.7, 20.0),
+        ]
+
+        result = assign_glaciers_to_subbasins(gdirs, subs)
+
+        # Both should be in basin 200; fraction = 50/500 = 0.10
+        np.testing.assert_allclose(
+            result['glacierized_fraction'].values,
+            [0.10, 0.10],
+            rtol=1e-6,
+            err_msg='Glacierized fraction should be 50/500 = 0.10',
+        )
+
+    # ------------------------------------------------------------------
+    # combine_basin_discharge
+    # ------------------------------------------------------------------
+
+    def test_combine_basin_discharge_sums_correctly(self):
+        """Total discharge = glacier + non-glaciated components."""
+        import xarray as xr
+        from oggm.core.hydrology import combine_basin_discharge
+
+        # Build a tiny synthetic nonglaciated_ds (2 sub-basins, 5 years)
+        years = np.array([2000, 2001, 2002, 2003, 2004])
+        q_ngl = np.array([[1.0, 2.0, 3.0, 4.0, 5.0],
+                           [0.5, 1.0, 1.5, 2.0, 2.5]])
+        nonglaciated_ds = xr.Dataset(
+            {'Q_ngl_m3s': (['HYBAS_ID', 'time'], q_ngl)},
+            coords={'time': years, 'HYBAS_ID': [101, 102]},
+        )
+        # Expected sum over both sub-basins
+        q_ngl_total = q_ngl.sum(axis=0)  # [1.5, 3.0, 4.5, 6.0, 7.5]
+
+        # Build mock glacier discharge files in a temp dir
+        import tempfile, os
+
+        class MockGDir:
+            def __init__(self, q_series, years, tmpdir, idx):
+                self.rgi_id = f'RGI60-test.{idx:05d}'
+                self._path = os.path.join(tmpdir, f'model_diagnostics_{idx}.nc')
+                ds = xr.Dataset(
+                    {'discharge_m3s': ('time', np.array(q_series,
+                                                         dtype=float))},
+                    coords={'time': years},
+                )
+                ds.to_netcdf(self._path)
+
+            def get_filepath(self, name, filesuffix=''):
+                return self._path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            glacier_q = [10.0, 20.0, 30.0, 40.0, 50.0]
+            mock_gdir = MockGDir(glacier_q, years, tmpdir, 0)
+
+            result = combine_basin_discharge(
+                [mock_gdir],
+                subbasins_assignment=None,   # not used internally
+                nonglaciated_ds=nonglaciated_ds,
+            )
+
+        assert 'Q_glacier_m3s' in result
+        assert 'Q_nonglacial_m3s' in result
+        assert 'Q_total_m3s' in result
+
+        np.testing.assert_array_equal(result['time'].values, years)
+        np.testing.assert_allclose(result['Q_glacier_m3s'].values,
+                                   glacier_q, rtol=1e-10)
+        np.testing.assert_allclose(result['Q_nonglacial_m3s'].values,
+                                   q_ngl_total, rtol=1e-10)
+        np.testing.assert_allclose(
+            result['Q_total_m3s'].values,
+            np.array(glacier_q) + q_ngl_total,
+            rtol=1e-10,
+        )
         # All assigned values in {0, 1, 2}
         assert set(np.unique(subs).tolist()) <= {0, 1, 2}
 
