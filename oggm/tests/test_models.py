@@ -5763,18 +5763,19 @@ class TestTerrainRouting:
             compute_flow_direction, compute_flow_accumulation,
         )
 
-        # Single-column DEM: 10 rows, 3 cols, decreasing S (row increases)
+        # nrows=12, ncols=3, elevation decreasing southward (increasing row)
+        # row 0 = 100 m (headwater), row 11 = 10 m (outlet)
         nrows, ncols = 12, 3
-        dem = np.tile(np.linspace(100.0, 10.0, nrows)[::-1, np.newaxis],
+        dem = np.tile(np.linspace(100.0, 10.0, nrows)[:, np.newaxis],
                       (1, ncols))
         fdir = compute_flow_direction(dem, cellsize_m=100.0,
                                       fill_pits_first=False)
         acc = compute_flow_accumulation(fdir)
 
-        # Centre column: accumulation should increase from row 0 to nrows-1
+        # Centre column: accumulation should increase toward the outlet (row 11)
         centre_acc = acc[:, ncols // 2]
         assert centre_acc[-1] >= centre_acc[0], (
-            'Downstream cell should have higher accumulation'
+            'Outlet row should have higher accumulation than headwater row'
         )
 
     def test_accumulation_each_cell_geq_1(self):
