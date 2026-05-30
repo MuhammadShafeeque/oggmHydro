@@ -5328,6 +5328,116 @@ class TestHydro:
         assert_allclose(odf_ma['runoff'].idxmax(), 8)
 
 
+class TestHydroRouting:
+    """Tests for oggm.core.hydrology routing functions (Phase 1–3)."""
+
+    def test_linear_reservoir_math(self):
+        from oggm.core.hydrology import _linear_reservoir
+
+        rng = np.random.default_rng(42)
+        q_in = np.abs(rng.normal(10.0, 2.0, 100))
+
+        # --- Mass conservation ---
+        q_out = _linear_reservoir(q_in, k=3.0, dt=1.0)
+        # For a finite time series with steady-state IC the routed sum should
+        # be close to the input sum (within ~15 % for typical k)
+        ratio = q_out.sum() / q_in.sum()
+        assert 0.85 < ratio < 1.15, f'Mass conservation ratio {ratio:.3f} out of range'
+
+        # --- k → very small: output ≈ input ---
+        q_out_fast = _linear_reservoir(q_in, k=0.001, dt=1.0)
+        assert_allclose(q_out_fast, q_in, rtol=1e-3)
+
+        # --- k → very large: output ≈ constant mean ---
+        q_out_slow = _linear_reservoir(q_in, k=1e6, dt=1.0)
+        # After initial transient the output should be nearly flat
+        spread = q_out_slow[50:].std() / q_out_slow[50:].mean()
+        assert spread < 0.05, f'Slow routing spread {spread:.4f} not flat enough'
+
+        # --- invalid inputs ---
+        with pytest.raises(ValueError):
+            _linear_reservoir(q_in, k=0.0)
+        with pytest.raises(ValueError):
+            _linear_reservoir(q_in, k=3.0, dt=0.0)
+
+    @pytest.mark.slow
+    def test_route_hydro_output(self, hef_gdir, inversion_params):
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=30,
+                             output_filesuffix='_routing_test')
+
+        tasks.route_hydro_output(gdir, filesuffix='_routing_test',
+                                 k_months=3.0)
+
+        with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                               filesuffix='_routing_test')) as ds:
+            assert 'discharge_m3s' in ds, 'discharge_m3s not written'
+            assert 'runoff_m3s' in ds, 'runoff_m3s not written'
+            q_out = ds['discharge_m3s'].values
+            q_in = ds['runoff_m3s'].values
+
+        # Discharge must be positive
+        assert np.all(q_out >= 0)
+        # Routed sum ≈ input sum (within 15 %)
+        ratio = q_out.sum() / q_in.sum()
+        assert 0.85 < ratio < 1.15
+
+    @pytest.mark.slow
+    def test_route_hydro_output_2c(self, hef_gdir, inversion_params):
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=30,
+                             output_filesuffix='_routing_2c_test')
+
+        tasks.route_hydro_output_2c(gdir, filesuffix='_routing_2c_test',
+                                    k_fast_months=1.0, k_slow_months=6.0)
+
+        with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                               filesuffix='_routing_2c_test')) as ds:
+            assert 'discharge_m3s' in ds
+            assert 'discharge_fast_m3s' in ds
+            assert 'discharge_slow_m3s' in ds
+            q_total = ds['discharge_m3s'].values
+            q_fast = ds['discharge_fast_m3s'].values
+            q_slow = ds['discharge_slow_m3s'].values
+
+        # Total = fast + slow
+        assert_allclose(q_total, q_fast + q_slow, rtol=1e-10)
+        assert np.all(q_total >= 0)
+
+    @pytest.mark.slow
+    def test_output_filesuffix(self, hef_gdir, inversion_params):
+        """output_filesuffix should write to a new file, leaving input intact."""
+        gdir = hef_gdir
+        cfg.PARAMS['store_model_geometry'] = True
+
+        init_present_time_glacier(gdir)
+        tasks.run_with_hydro(gdir, run_task=tasks.run_constant_climate,
+                             y0=1985, nyears=30,
+                             output_filesuffix='_sfx_src')
+
+        tasks.route_hydro_output(gdir, filesuffix='_sfx_src',
+                                 output_filesuffix='_sfx_dst',
+                                 k_months=3.0)
+
+        # Source file must NOT have discharge_m3s (we wrote to a new file)
+        with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                               filesuffix='_sfx_src')) as ds:
+            assert 'discharge_m3s' not in ds
+
+        # Destination file must have it
+        with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                               filesuffix='_sfx_dst')) as ds:
+            assert 'discharge_m3s' in ds
+
+
 class TestMassRedis:
 
     def test_hef_retreat(self, class_case_dir):

@@ -62,6 +62,9 @@ from oggm.core.flowline import run_from_climate_data
 from oggm.core.flowline import run_constant_climate
 from oggm.core.flowline import run_with_hydro
 from oggm.core.flowline import compute_fl_diagnostics_quantiles
+from oggm.core.hydrology import route_hydro_output
+from oggm.core.hydrology import route_hydro_output_2c
+from oggm.core.hydrology import aggregate_basin_discharge
 from oggm.core.dynamic_spinup import run_dynamic_spinup
 from oggm.core.dynamic_spinup import run_dynamic_melt_f_calibration
 from oggm.utils import copy_to_basedir
