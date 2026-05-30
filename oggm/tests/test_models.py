@@ -5953,6 +5953,135 @@ class TestTerrainRouting:
         # Each outlet's row should be assigned to that outlet
         assert subs[1, 9] == 1 or subs[1, 9] != 0
         assert subs[4, 9] == 2 or subs[4, 9] != 0
+        # All assigned values in {0, 1, 2}
+        assert set(np.unique(subs).tolist()) <= {0, 1, 2}
+
+    # ------------------------------------------------------------------
+    # Phase 7 — Muskingum-Cunge
+    # ------------------------------------------------------------------
+
+    def test_muskingum_cunge_mass_conservation(self):
+        """Routed sum should be close to input sum (finite pulse)."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        # Triangular pulse
+        q_in = np.array([0, 1, 3, 5, 4, 3, 2, 1, 0, 0, 0, 0,
+                         0, 0, 0, 0, 0, 0, 0, 0], dtype=float)
+        q_out = muskingum_cunge_route(q_in, K_dt=2.0, X=0.2)
+
+        ratio = q_out.sum() / q_in.sum()
+        assert 0.85 < ratio < 1.15, (
+            f'Mass conservation ratio {ratio:.3f} outside [0.85, 1.15]'
+        )
+
+    def test_muskingum_cunge_non_negative(self):
+        """Output must be non-negative."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        rng = np.random.default_rng(55)
+        q_in = np.abs(rng.normal(5.0, 2.0, 50))
+        q_out = muskingum_cunge_route(q_in, K_dt=1.5, X=0.25)
+        assert np.all(q_out >= 0.0), 'Negative discharge in Muskingum-Cunge'
+
+    def test_muskingum_cunge_attenuation(self):
+        """Higher K_dt → more attenuation (lower peak, later timing)."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        q_in = np.zeros(60)
+        q_in[5:15] = 10.0  # rectangular pulse
+
+        q_short = muskingum_cunge_route(q_in, K_dt=0.5, X=0.2)
+        q_long = muskingum_cunge_route(q_in, K_dt=5.0, X=0.2)
+
+        # Longer travel time → smaller peak
+        assert q_long.max() < q_short.max(), (
+            'Longer K_dt should produce lower peak'
+        )
+
+    def test_muskingum_cunge_invalid_inputs(self):
+        """ValueError on K_dt ≤ 0 or X outside [0, 0.5]."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        q = np.ones(10)
+        with pytest.raises(ValueError):
+            muskingum_cunge_route(q, K_dt=0.0, X=0.25)
+        with pytest.raises(ValueError):
+            muskingum_cunge_route(q, K_dt=1.0, X=-0.1)
+        with pytest.raises(ValueError):
+            muskingum_cunge_route(q, K_dt=1.0, X=0.6)
+
+    def test_muskingum_cunge_kinematic_limit(self):
+        """X = 0.5, K_dt = 0.5 → output is a pure delay (kinematic wave)."""
+        from oggm.core.terrain_routing import muskingum_cunge_route
+
+        q_in = np.array([0, 0, 5, 5, 5, 0, 0, 0, 0, 0], dtype=float)
+        # C2 ≈ 0, so output ≈ C0*q_in + C1*q_in_prev
+        q_out = muskingum_cunge_route(q_in, K_dt=0.5, X=0.5)
+        # Should preserve total volume
+        assert_allclose(q_out.sum(), q_in.sum(), rtol=0.15)
+
+    # ------------------------------------------------------------------
+    # Phase 6 — tile naming utilities (no download)
+    # ------------------------------------------------------------------
+
+    def test_merit_tile_name(self):
+        """Tile naming utility returns correct identifiers."""
+        from oggm.shop.merit_hydro import _tile_name, _tiles_for_bbox
+
+        assert _tile_name(35.1, 70.2) == 'n35e070'
+        assert _tile_name(-5.0, -75.0) == 's05w075'
+        assert _tile_name(0.0, 0.0) == 'n00e000'
+        assert _tile_name(47.5, 10.9) == 'n45e010'
+
+        # Bounding box spanning two tiles
+        tiles = _tiles_for_bbox(68.0, 35.0, 71.0, 37.0)
+        assert 'n35e065' in tiles or 'n35e070' in tiles
+
+    @pytest.mark.slow
+    def test_terrain_routing_on_hef(self, hef_gdir, inversion_params):
+        """End-to-end terrain routing on HEF using the OGGM local DEM."""
+        pytest.importorskip('networkx')
+        from oggm.core.terrain_routing import (
+            compute_flow_direction, compute_flow_accumulation,
+            compute_slope_aspect, delineate_streams,
+            build_stream_network,
+        )
+        import xarray as xr
+
+        gdir = hef_gdir
+
+        # Load gridded DEM from the glacier directory
+        with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+            dem_arr = ds['topo'].values.astype(float)
+
+        cs = gdir.grid.dx  # cell size in metres (~ 50 m for HEF)
+
+        fdir = compute_flow_direction(dem_arr, cellsize_m=cs,
+                                      fill_pits_first=True)
+        acc = compute_flow_accumulation(fdir)
+        slope, aspect = compute_slope_aspect(dem_arr, cellsize_m=cs)
+
+        # Sanity checks
+        valid_codes = {0, 1, 2, 4, 8, 16, 32, 64, 128}
+        assert set(np.unique(fdir).tolist()) <= valid_codes
+        assert np.all(acc >= 1)
+        assert np.nanmin(slope[1:-1, 1:-1]) >= 0.0
+
+        # Delineate streams with a 5-cell threshold (robust across grid sizes)
+        streams = delineate_streams(acc, threshold_cells=5)
+        assert np.any(streams), 'No stream cells found on HEF'
+
+        # Build stream network
+        import networkx as nx
+        G = build_stream_network(streams, fdir, dem_arr, cs, acc)
+        assert G.number_of_nodes() >= 1
+        assert nx.is_directed_acyclic_graph(G)
+
+        # All edges should have positive length
+        for u, v, data in G.edges(data=True):
+            assert data['length_m'] > 0, (
+                f'Edge {u}->{v} has non-positive length'
+            )
 
 
 # ===========================================================================
@@ -6297,135 +6426,6 @@ class TestZBasinIntegration:
             np.array(glacier_q) + q_ngl_total,
             rtol=1e-10,
         )
-        # All assigned values in {0, 1, 2}
-        assert set(np.unique(subs).tolist()) <= {0, 1, 2}
-
-    # ------------------------------------------------------------------
-    # Phase 7 — Muskingum-Cunge
-    # ------------------------------------------------------------------
-
-    def test_muskingum_cunge_mass_conservation(self):
-        """Routed sum should be close to input sum (finite pulse)."""
-        from oggm.core.terrain_routing import muskingum_cunge_route
-
-        # Triangular pulse
-        q_in = np.array([0, 1, 3, 5, 4, 3, 2, 1, 0, 0, 0, 0,
-                         0, 0, 0, 0, 0, 0, 0, 0], dtype=float)
-        q_out = muskingum_cunge_route(q_in, K_dt=2.0, X=0.2)
-
-        ratio = q_out.sum() / q_in.sum()
-        assert 0.85 < ratio < 1.15, (
-            f'Mass conservation ratio {ratio:.3f} outside [0.85, 1.15]'
-        )
-
-    def test_muskingum_cunge_non_negative(self):
-        """Output must be non-negative."""
-        from oggm.core.terrain_routing import muskingum_cunge_route
-
-        rng = np.random.default_rng(55)
-        q_in = np.abs(rng.normal(5.0, 2.0, 50))
-        q_out = muskingum_cunge_route(q_in, K_dt=1.5, X=0.25)
-        assert np.all(q_out >= 0.0), 'Negative discharge in Muskingum-Cunge'
-
-    def test_muskingum_cunge_attenuation(self):
-        """Higher K_dt → more attenuation (lower peak, later timing)."""
-        from oggm.core.terrain_routing import muskingum_cunge_route
-
-        q_in = np.zeros(60)
-        q_in[5:15] = 10.0  # rectangular pulse
-
-        q_short = muskingum_cunge_route(q_in, K_dt=0.5, X=0.2)
-        q_long = muskingum_cunge_route(q_in, K_dt=5.0, X=0.2)
-
-        # Longer travel time → smaller peak
-        assert q_long.max() < q_short.max(), (
-            'Longer K_dt should produce lower peak'
-        )
-
-    def test_muskingum_cunge_invalid_inputs(self):
-        """ValueError on K_dt ≤ 0 or X outside [0, 0.5]."""
-        from oggm.core.terrain_routing import muskingum_cunge_route
-
-        q = np.ones(10)
-        with pytest.raises(ValueError):
-            muskingum_cunge_route(q, K_dt=0.0, X=0.25)
-        with pytest.raises(ValueError):
-            muskingum_cunge_route(q, K_dt=1.0, X=-0.1)
-        with pytest.raises(ValueError):
-            muskingum_cunge_route(q, K_dt=1.0, X=0.6)
-
-    def test_muskingum_cunge_kinematic_limit(self):
-        """X = 0.5, K_dt = 0.5 → output is a pure delay (kinematic wave)."""
-        from oggm.core.terrain_routing import muskingum_cunge_route
-
-        q_in = np.array([0, 0, 5, 5, 5, 0, 0, 0, 0, 0], dtype=float)
-        # C2 ≈ 0, so output ≈ C0*q_in + C1*q_in_prev
-        q_out = muskingum_cunge_route(q_in, K_dt=0.5, X=0.5)
-        # Should preserve total volume
-        assert_allclose(q_out.sum(), q_in.sum(), rtol=0.15)
-
-    # ------------------------------------------------------------------
-    # Phase 6 — tile naming utilities (no download)
-    # ------------------------------------------------------------------
-
-    def test_merit_tile_name(self):
-        """Tile naming utility returns correct identifiers."""
-        from oggm.shop.merit_hydro import _tile_name, _tiles_for_bbox
-
-        assert _tile_name(35.1, 70.2) == 'n35e070'
-        assert _tile_name(-5.0, -75.0) == 's05w075'
-        assert _tile_name(0.0, 0.0) == 'n00e000'
-        assert _tile_name(47.5, 10.9) == 'n45e010'
-
-        # Bounding box spanning two tiles
-        tiles = _tiles_for_bbox(68.0, 35.0, 71.0, 37.0)
-        assert 'n35e065' in tiles or 'n35e070' in tiles
-
-    @pytest.mark.slow
-    def test_terrain_routing_on_hef(self, hef_gdir, inversion_params):
-        """End-to-end terrain routing on HEF using the OGGM local DEM."""
-        pytest.importorskip('networkx')
-        from oggm.core.terrain_routing import (
-            compute_flow_direction, compute_flow_accumulation,
-            compute_slope_aspect, delineate_streams,
-            build_stream_network,
-        )
-        import xarray as xr
-
-        gdir = hef_gdir
-
-        # Load gridded DEM from the glacier directory
-        with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
-            dem_arr = ds['topo'].values.astype(float)
-
-        cs = gdir.grid.dx  # cell size in metres (~ 50 m for HEF)
-
-        fdir = compute_flow_direction(dem_arr, cellsize_m=cs,
-                                      fill_pits_first=True)
-        acc = compute_flow_accumulation(fdir)
-        slope, aspect = compute_slope_aspect(dem_arr, cellsize_m=cs)
-
-        # Sanity checks
-        valid_codes = {0, 1, 2, 4, 8, 16, 32, 64, 128}
-        assert set(np.unique(fdir).tolist()) <= valid_codes
-        assert np.all(acc >= 1)
-        assert np.nanmin(slope[1:-1, 1:-1]) >= 0.0
-
-        # Delineate streams with a 5-cell threshold (robust across grid sizes)
-        streams = delineate_streams(acc, threshold_cells=5)
-        assert np.any(streams), 'No stream cells found on HEF'
-
-        # Build stream network
-        import networkx as nx
-        G = build_stream_network(streams, fdir, dem_arr, cs, acc)
-        assert G.number_of_nodes() >= 1
-        assert nx.is_directed_acyclic_graph(G)
-
-        # All edges should have positive length
-        for u, v, data in G.edges(data=True):
-            assert data['length_m'] > 0, (
-                f'Edge {u}->{v} has non-positive length'
-            )
 
 
 @pytest.fixture(scope='class')
