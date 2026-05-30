@@ -55,12 +55,16 @@ log = logging.getLogger(__name__)
 _DEFAULT_SERVER = 'https://data.hydrosheds.org/file/'
 
 # HydroBASINS: one ZIP per (region, level)
-# URL: <server>/HydroBASINS/standard/hybas_{region}_lev{NN}_v1c.zip
-_HYBAS_PATH = 'HydroBASINS/standard/hybas_{region}_lev{level:02d}_v1c.zip'
+# Standard:            <server>/hydrobasins/standard/hybas_{region}_lev{NN}_v1c.zip
+# Customized (lakes):  <server>/hydrobasins/customized_with_lakes/hybas_lake_{region}_lev{NN}_v1c.zip
+# "Customized with lakes" is preferred for glacierized catchments because it
+# incorporates lake boundaries into sub-basin delineations.
+_HYBAS_PATH_STANDARD = 'hydrobasins/standard/hybas_{region}_lev{level:02d}_v1c.zip'
+_HYBAS_PATH_LAKES    = 'hydrobasins/customized_with_lakes/hybas_lake_{region}_lev{level:02d}_v1c.zip'
 
 # HydroRIVERS: one ZIP per region
-# URL: <server>/HydroRIVERS/HydroRIVERS_v10_{region}_shp.zip
-_HYDRIV_PATH = 'HydroRIVERS/HydroRIVERS_v10_{region}_shp.zip'
+# URL: <server>/hydrorivers/HydroRIVERS_v10_{region}_shp.zip
+_HYDRIV_PATH = 'hydrorivers/HydroRIVERS_v10_{region}_shp.zip'
 
 # Recognised two-letter region codes used by HydroSHEDS
 _REGIONS = ('af', 'ar', 'as', 'au', 'eu', 'gr', 'na', 'sa', 'si')
@@ -135,12 +139,16 @@ def _lon_to_region(lon_deg, lat_deg=0.0):
     return 'as'
 
 
-def _get_hydrobasins_file(region, level, local_dir=''):
+def _get_hydrobasins_file(region, level, local_dir='', use_lakes=True):
     """Return a local path to the HydroBASINS shapefile for *region/level*.
 
     Attempts the following in order:
     1. ``local_dir`` override (pre-downloaded files).
-    2. OGGM download cache via :func:`oggm.utils.file_downloader`.
+       Searches for both the customized-with-lakes filename and the
+       standard filename so users can place either variant in the directory.
+    2. Download via :func:`oggm.utils.file_downloader`.
+       Uses the customized-with-lakes URL by default (``use_lakes=True``),
+       which is preferred for glacierized catchments.
 
     Parameters
     ----------
@@ -150,6 +158,10 @@ def _get_hydrobasins_file(region, level, local_dir=''):
         Pfaffstetter aggregation level 1–12.
     local_dir : str
         Directory to search for pre-downloaded ZIP / SHP files.
+    use_lakes : bool
+        If ``True`` (default), use the "customized with lakes" variant
+        (``hybas_lake_{region}_lev{NN}_v1c.zip``).  Set ``False`` to use
+        the standard variant (``hybas_{region}_lev{NN}_v1c.zip``).
 
     Returns
     -------
@@ -157,14 +169,21 @@ def _get_hydrobasins_file(region, level, local_dir=''):
         Local path to the ZIP archive (may be passed to
         ``gpd.read_file('zip://' + path)``).
     """
-    fname = f'hybas_{region}_lev{level:02d}_v1c.zip'
-    if local_dir:
-        candidate = os.path.join(local_dir, fname)
-        if os.path.isfile(candidate):
-            return candidate
+    fname_lakes    = f'hybas_lake_{region}_lev{level:02d}_v1c.zip'
+    fname_standard = f'hybas_{region}_lev{level:02d}_v1c.zip'
+    # Primary filename depends on variant; fallback to the other if missing
+    fname_primary   = fname_lakes    if use_lakes else fname_standard
+    fname_fallback  = fname_standard if use_lakes else fname_lakes
 
-    url = _hydrosheds_server() + _HYBAS_PATH.format(region=region,
-                                                     level=level)
+    if local_dir:
+        for fname in (fname_primary, fname_fallback):
+            candidate = os.path.join(local_dir, fname)
+            if os.path.isfile(candidate):
+                log.debug('_get_hydrobasins_file: using local file %s', candidate)
+                return candidate
+
+    url_path = (_HYBAS_PATH_LAKES if use_lakes else _HYBAS_PATH_STANDARD)
+    url = _hydrosheds_server() + url_path.format(region=region, level=level)
     local = utils.file_downloader(url)
     if local is None:
         raise FileNotFoundError(
@@ -214,7 +233,7 @@ def _get_hydrorivers_file(region, local_dir=''):
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_hydrobasins(bbox, level=8, region=None):
+def get_hydrobasins(bbox, level=8, region=None, use_lakes=True):
     """Download and return HydroBASINS sub-basin polygons for a bounding box.
 
     Parameters
@@ -223,10 +242,17 @@ def get_hydrobasins(bbox, level=8, region=None):
         ``(lon_min, lat_min, lon_max, lat_max)`` in decimal degrees.
     level : int, optional
         Pfaffstetter aggregation level 1–12.  Level 8 (default) gives
-        typical sub-basin areas of 10²–10³ km².
+        typical sub-basin areas of ~10–200 km², appropriate for attributing
+        individual glaciers to their enclosing sub-basins.
     region : str, optional
         Two-letter HydroSHEDS region code.  Inferred automatically from
         *bbox* if not provided.
+    use_lakes : bool, optional
+        If ``True`` (default), use the HydroBASINS "customized with lakes"
+        variant, which incorporates lake boundaries into sub-basin
+        delineations.  Recommended for glacierized catchments where
+        glacial lakes and reservoirs are present.  Set ``False`` to use the
+        standard variant.
 
     Returns
     -------
@@ -257,15 +283,16 @@ def get_hydrobasins(bbox, level=8, region=None):
         region = _lon_to_region(lon_c, lat_c)
 
     local_dir = _hydrobasins_local_dir()
-    zpath = _get_hydrobasins_file(region, level, local_dir=local_dir)
+    zpath = _get_hydrobasins_file(region, level, local_dir=local_dir,
+                                  use_lakes=use_lakes)
 
     gdf = gpd.read_file('zip://' + zpath)
     # Clip to bounding box (spatial subset)
     gdf = gdf.cx[lon_min:lon_max, lat_min:lat_max].copy()
     gdf = gdf.reset_index(drop=True)
 
-    log.info('get_hydrobasins: %d sub-basins in bbox for region=%s level=%d',
-             len(gdf), region, level)
+    log.info('get_hydrobasins: %d sub-basins in bbox for region=%s level=%d '
+             '(use_lakes=%s)', len(gdf), region, level, use_lakes)
     return gdf
 
 
