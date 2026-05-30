@@ -5380,10 +5380,10 @@ class TestHydroRouting:
             q_out = ds['discharge_m3s'].values
             q_in = ds['runoff_m3s'].values
 
-        # Discharge must be positive
-        assert np.all(q_out >= 0)
+        # Discharge must be positive (ignore trailing NaN from OGGM convention)
+        assert np.nanmin(q_out) >= 0
         # Routed sum ≈ input sum (within 15 %)
-        ratio = q_out.sum() / q_in.sum()
+        ratio = np.nansum(q_out) / np.nansum(q_in)
         assert 0.85 < ratio < 1.15
 
     @pytest.mark.slow
@@ -5408,9 +5408,10 @@ class TestHydroRouting:
             q_fast = ds['discharge_fast_m3s'].values
             q_slow = ds['discharge_slow_m3s'].values
 
-        # Total = fast + slow
-        assert_allclose(q_total, q_fast + q_slow, rtol=1e-10)
-        assert np.all(q_total >= 0)
+        # Total = fast + slow (NaN-safe: compare only finite positions)
+        valid_2c = np.isfinite(q_total)
+        assert_allclose(q_total[valid_2c], (q_fast + q_slow)[valid_2c], rtol=1e-10)
+        assert np.nanmin(q_total) >= 0
 
     @pytest.mark.slow
     def test_output_filesuffix(self, hef_gdir, inversion_params):
