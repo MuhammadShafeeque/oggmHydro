@@ -6084,6 +6084,24 @@ class TestTerrainRouting:
             )
 
 
+@pytest.fixture(scope='class')
+def channel_routing_cfg():
+    """Ensure cfg is fully initialized for the TestChannelRouting class.
+
+    Because TestChannelRouting runs alphabetically before TestTerrainRouting
+    and TestHydroRouting, it is the first class to trigger the module-scoped
+    hef_gdir_base fixture (which calls cfg.initialize()).  However,
+    restore_oggm_class_cfg resets cfg to its pre-class state after every
+    class, which would leave cfg uninitialized for subsequent classes.
+    Calling cfg.initialize() explicitly here re-initialises before this
+    class's tests and the restore machinery keeps things consistent.
+    """
+    cfg.initialize()
+    cfg.PATHS['dem_file'] = get_demo_file('hef_srtm.tif')
+    cfg.PATHS['climate_file'] = get_demo_file('histalp_merged_hef.nc')
+
+
+@pytest.mark.usefixtures('channel_routing_cfg')
 class TestChannelRouting:
     """Tests for Phase 7 — Muskingum-Cunge channel routing entity task.
 
