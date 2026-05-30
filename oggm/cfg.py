@@ -583,7 +583,15 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
            'tidewater_type', 'store_model_geometry',
            'store_diagnostic_variables', 'store_fl_diagnostic_variables',
            'geodetic_mb_period', 'store_fl_diagnostics',
-           'prcp_fac', 'downstream_line_shape', 'keep_multipolygon_outlines']
+           'prcp_fac', 'downstream_line_shape', 'keep_multipolygon_outlines',
+           'terrain_dem_source', 'merit_hydro_tile_dir', 'merit_hydro_server']
+
+    # Phase 6 string params — store before popping from cp
+    PARAMS['terrain_dem_source'] = cp.get('terrain_dem_source', 'merit')
+    PARAMS['merit_hydro_tile_dir'] = cp.get('merit_hydro_tile_dir', '')
+    PARAMS['merit_hydro_server'] = cp.get(
+        'merit_hydro_server',
+        'http://hydro.iis.u-tokyo.ac.jp/~yamadai/MERIT_Hydro/')
     for k in ltr:
         cp.pop(k, None)
 
