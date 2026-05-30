@@ -6102,7 +6102,7 @@ def channel_routing_cfg():
 
 
 @pytest.mark.usefixtures('channel_routing_cfg')
-class TestChannelRouting:
+class TestZChannelRouting:
     """Tests for Phase 7 — Muskingum-Cunge channel routing entity task.
 
     Fast tests use synthetic NetworkX graphs with no gdir required.
