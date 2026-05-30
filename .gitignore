@@ -24,6 +24,7 @@ examples/*checkpoints
 oggm/tests/result_images
 result_images
 .pytest_cache
+.mypy_cache
 
 # Packages
 *.egg
