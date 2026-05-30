@@ -123,7 +123,7 @@ def route_hydro_output(gdir, filesuffix='', k_months=None,
             ds['liq_prcp_off_glacier'].values
         )
 
-    # Drop the trailing NaN year (OGGM convention)
+    # Identify valid (non-NaN) timesteps — OGGM convention: last year is NaN
     valid = ~np.isnan(runoff_kgyr)
     if not valid.any():
         raise RuntimeError(
@@ -131,7 +131,6 @@ def route_hydro_output(gdir, filesuffix='', k_months=None,
             'Did run_with_hydro() complete successfully?'
         )
     runoff_valid = runoff_kgyr[valid]
-    time_valid = time[valid]
 
     # --- Unit conversion: kg yr⁻¹ → m³ s⁻¹ ---
     q_m3s = runoff_valid / _RHO_WATER / _SEC_PER_YEAR
@@ -141,11 +140,19 @@ def route_hydro_output(gdir, filesuffix='', k_months=None,
     k_years = k_months / 12.0
     q_routed = _linear_reservoir(q_m3s, k=k_years, dt=1.0)
 
+    # Pad back to full time-axis length (NaN for invalid positions) so the
+    # 'time' dimension size matches the existing file when appending.
+    n_full = len(time)
+    q_m3s_full = np.full(n_full, np.nan)
+    q_routed_full = np.full(n_full, np.nan)
+    q_m3s_full[valid] = q_m3s
+    q_routed_full[valid] = q_routed
+
     # --- Build output dataset ---
     out_ds = xr.Dataset()
-    out_ds.coords['time'] = time_valid
+    out_ds.coords['time'] = time          # full length, matches existing file
 
-    out_ds['discharge_m3s'] = ('time', q_routed)
+    out_ds['discharge_m3s'] = ('time', q_routed_full)
     out_ds['discharge_m3s'].attrs = {
         'description': 'Routed glacier discharge at outlet',
         'units': 'm3 s-1',
@@ -153,7 +160,7 @@ def route_hydro_output(gdir, filesuffix='', k_months=None,
         'k_months': float(k_months),
     }
 
-    out_ds['runoff_m3s'] = ('time', q_m3s)
+    out_ds['runoff_m3s'] = ('time', q_m3s_full)
     out_ds['runoff_m3s'].attrs = {
         'description': 'Unrouted glacier runoff (instantaneous)',
         'units': 'm3 s-1',
@@ -223,7 +230,7 @@ def route_hydro_output_2c(gdir, filesuffix='',
         melt_kgyr = (ds['melt_on_glacier'].values +
                      ds['melt_off_glacier'].values)
 
-    # Drop trailing NaN year
+    # Identify valid (non-NaN) timesteps
     valid = ~np.isnan(rain_kgyr + melt_kgyr)
     if not valid.any():
         raise RuntimeError(
@@ -232,7 +239,6 @@ def route_hydro_output_2c(gdir, filesuffix='',
         )
     rain_valid = rain_kgyr[valid]
     melt_valid = melt_kgyr[valid]
-    time_valid = time[valid]
 
     # Unit conversion: kg yr⁻¹ → m³ s⁻¹
     rain_m3s = rain_valid / _RHO_WATER / _SEC_PER_YEAR
@@ -243,11 +249,18 @@ def route_hydro_output_2c(gdir, filesuffix='',
     q_slow = _linear_reservoir(melt_m3s, k=k_slow_months / 12.0, dt=1.0)
     q_total = q_fast + q_slow
 
+    # Pad back to full length so 'time' dimension matches the existing file
+    n_full = len(time)
+    def _pad(arr):
+        out = np.full(n_full, np.nan)
+        out[valid] = arr
+        return out
+
     # Build output dataset
     out_ds = xr.Dataset()
-    out_ds.coords['time'] = time_valid
+    out_ds.coords['time'] = time          # full length
 
-    out_ds['discharge_m3s'] = ('time', q_total)
+    out_ds['discharge_m3s'] = ('time', _pad(q_total))
     out_ds['discharge_m3s'].attrs = {
         'description': 'Total routed discharge (fast + slow components)',
         'units': 'm3 s-1',
@@ -255,22 +268,22 @@ def route_hydro_output_2c(gdir, filesuffix='',
         'k_fast_months': float(k_fast_months),
         'k_slow_months': float(k_slow_months),
     }
-    out_ds['discharge_fast_m3s'] = ('time', q_fast)
+    out_ds['discharge_fast_m3s'] = ('time', _pad(q_fast))
     out_ds['discharge_fast_m3s'].attrs = {
         'description': 'Routed rain (fast) component',
         'units': 'm3 s-1',
     }
-    out_ds['discharge_slow_m3s'] = ('time', q_slow)
+    out_ds['discharge_slow_m3s'] = ('time', _pad(q_slow))
     out_ds['discharge_slow_m3s'].attrs = {
         'description': 'Routed melt (slow) component',
         'units': 'm3 s-1',
     }
-    out_ds['rain_m3s'] = ('time', rain_m3s)
+    out_ds['rain_m3s'] = ('time', _pad(rain_m3s))
     out_ds['rain_m3s'].attrs = {
         'description': 'Unrouted rain runoff',
         'units': 'm3 s-1',
     }
-    out_ds['melt_m3s'] = ('time', melt_m3s)
+    out_ds['melt_m3s'] = ('time', _pad(melt_m3s))
     out_ds['melt_m3s'].attrs = {
         'description': 'Unrouted melt runoff',
         'units': 'm3 s-1',
