@@ -432,11 +432,12 @@ def _extract_model_years(time_values):
     """
     years = []
     for t in time_values:
-        if hasattr(t, 'year'):                      # cftime.datetime, pandas Timestamp
+        if hasattr(t, 'year'):                                # cftime / pandas Timestamp
             years.append(int(t.year))
-        elif isinstance(t, (int, np.integer)):      # OGGM stores annual time as integer years
-            years.append(int(t))
-        else:                                       # numpy datetime64
+        elif isinstance(t, (int, float, np.integer, np.floating)):
+            # OGGM stores annual time as bare numeric year (int or float like 1985.0)
+            years.append(int(round(float(t))))
+        else:                                                 # numpy datetime64
             import pandas as pd
             years.append(int(pd.Timestamp(t).year))
     return np.array(years, dtype=int)
