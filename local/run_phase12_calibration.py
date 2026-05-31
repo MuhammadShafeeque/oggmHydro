@@ -452,21 +452,34 @@ def main():
     else:
         if args.grdc_file:
             log.warning('GRDC file not found: %s', args.grdc_file)
-        # Compute the *actual* model total discharge at default parameters so
-        # the synthetic obs are centred on what the model really produces.
-        # This avoids any hand-tuned scaling factor.
-        log.info('Computing model-scale discharge at default params for synthetic obs ...')
+        # Generate synthetic obs from the model's own annual time series at
+        # default parameters + 5% noise.  This gives temporal correlation
+        # r ≈ 1 at the true parameters, so the KGE objective is well-posed
+        # and calibration can recover physically meaningful parameters.
+        log.info('Computing model time series at default params for synthetic obs ...')
         from oggm.core.hydrology import (
             extract_subbasin_climate as _esc,
             compute_nonglaciated_runoff as _cnr,
+            _linear_reservoir as _lr,
         )
         import oggm.cfg as _cfg
 
-        # --- glacier component (pre-cached) ---
+        # --- Annual glacier cache ---
         _cache = _cache_basin_runoff_components(
             gdirs, filesuffix=args.filesuffix, ys=args.ys, ye=args.ye)
-        q_gl_mean = float(np.mean(
-            _cache['rain_m3s'] + _cache['snow_m3s'] + _cache['ice_m3s']))
+        _years_all = _cache['years']
+        _sel_yr = (_years_all >= args.ys) & (_years_all <= args.ye)
+        _years_calib = _years_all[_sel_yr]
+
+        # --- Glacier routing at default k values ---
+        _k_rain_gl = float(_cfg.PARAMS.get('routing_k_rain_months', 0.5))
+        _k_snow_gl = float(_cfg.PARAMS.get('routing_k_snow_months', 2.0))
+        _k_ice_gl  = float(_cfg.PARAMS.get('routing_k_ice_months', 8.0))
+        _q_gl_annual = (
+            _lr(_cache['rain_m3s'][_sel_yr], k=_k_rain_gl / 12.0, dt=1.0) +
+            _lr(_cache['snow_m3s'][_sel_yr], k=_k_snow_gl / 12.0, dt=1.0) +
+            _lr(_cache['ice_m3s'][_sel_yr],  k=_k_ice_gl  / 12.0, dt=1.0)
+        )
 
         # --- NGL component at default params with corrected area ---
         _total_km2 = float(subbasins['SUB_AREA'].sum())
@@ -476,35 +489,46 @@ def main():
             int(r['HYBAS_ID']): float(r['SUB_AREA']) * _ngl_frac
             for _, r in subbasins.iterrows()
         }
-        _k_snow_def = float(_cfg.PARAMS.get('nonglaciated_k_snow_months', 2.0))
-        _k_soil_def = float(_cfg.PARAMS.get('nonglaciated_k_soil_months', 3.0))
-        _s_fc_def   = float(_cfg.PARAMS.get('nonglaciated_s_fc_mm', 150.0))
+        _k_snow_ngl = float(_cfg.PARAMS.get('nonglaciated_k_snow_months', 2.0))
+        _k_soil     = float(_cfg.PARAMS.get('nonglaciated_k_soil_months', 3.0))
+        _s_fc       = float(_cfg.PARAMS.get('nonglaciated_s_fc_mm', 150.0))
 
         _per_basin_clim = _esc(gdirs, subbasins, ys=args.ys, ye=args.ye)
         _ngl_ds = _cnr(
             subbasins, _per_basin_clim,
-            k_snow_months=_k_snow_def,
-            k_soil_months=_k_soil_def,
-            s_fc_mm=_s_fc_def,
+            k_snow_months=_k_snow_ngl,
+            k_soil_months=_k_soil,
+            s_fc_mm=_s_fc,
             nonglaciated_area_km2=_ngl_area_per_sub,
         )
-        # Annual mean NGL: sum over sub-basins, average over time
+
+        # --- Annual NGL time series (monthly → annual mean) ---
         _q_ngl_monthly = _ngl_ds['Q_ngl_m3s'].sum('HYBAS_ID').values
         _time_vals = _ngl_ds['time'].values
         try:
-            _yrs = np.array([pd.Timestamp(t).year for t in _time_vals])
+            _ngl_yrs_m = np.array([pd.Timestamp(t).year for t in _time_vals])
         except Exception:
-            _yrs = np.array([int(t) for t in _time_vals])
-        _sel = (_yrs >= args.ys) & (_yrs <= args.ye)
-        q_ngl_mean = float(np.mean(_q_ngl_monthly[_sel])) if _sel.any() else 0.0
+            _ngl_yrs_m = np.array([int(t) for t in _time_vals])
+        _q_ngl_annual = np.array(
+            [_q_ngl_monthly[_ngl_yrs_m == yr].mean()
+             if (_ngl_yrs_m == yr).any() else 0.0
+             for yr in _years_calib], dtype=float)
 
-        q_mean_est = max(q_gl_mean + q_ngl_mean, 50.0)
-        log.info(
-            '  q_gl_mean=%.1f m³/s  q_ngl_mean=%.1f m³/s  '
-            '→ synthetic q_mean=%.1f m³/s  (ngl_frac=%.0f%%)',
-            q_gl_mean, q_ngl_mean, q_mean_est, _ngl_frac * 100)
-        obs_df = _make_synthetic_obs(args.ys, args.ye,
-                                     seed=args.seed, q_mean=q_mean_est)
+        # --- Truth time series + 5% noise → obs ---
+        q_truth = _q_gl_annual + _q_ngl_annual
+        q_mean_est = float(q_truth.mean())
+        rng = np.random.default_rng(args.seed)
+        noise = rng.normal(0, 0.05 * q_mean_est, len(_years_calib))
+        obs_df = pd.DataFrame({
+            'year': _years_calib,
+            'q_m3s': np.maximum(q_truth + noise, 10.0),
+        })
+        log.warning(
+            'No GRDC file — SYNTHETIC obs from model truth + 5%% noise. '
+            'q_gl_mean=%.1f  q_ngl_mean=%.1f  q_total_mean=%.1f m³/s  '
+            '(ngl_frac=%.0f%%).  Do NOT use for publication.',
+            float(_q_gl_annual.mean()), float(_q_ngl_annual.mean()),
+            q_mean_est, _ngl_frac * 100)
 
     # ---- Calibrate ----
     log.info('Starting calibrate_basin_water_balance() ...')
