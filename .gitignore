@@ -47,3 +47,5 @@ docs/.doctrees
 oggm/version.py
 oggm/ignore
 local/
+run_phase12_calibration.py
+run_phase13_mb_calib.py

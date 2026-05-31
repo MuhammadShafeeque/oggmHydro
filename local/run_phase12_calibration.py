@@ -62,6 +62,52 @@ _HUNZA_BBOX         = (73.5, 35.5, 76.5, 37.5)  # lon_min lat_min lon_max lat_ma
 
 
 # =============================================================================
+# Lightweight gdir proxy (no shapefile reads)
+# =============================================================================
+
+class _FastGdir:
+    """Minimal GlacierDirectory substitute built from glacier_list.csv.
+
+    Avoids the per-glacier outlines.tar.gz reads that make GlacierDirectory
+    construction very slow (~14 ms per glacier × 6551 glaciers = ~90 s).
+    Implements only the interface used by calibrate_basin_water_balance(),
+    _cache_basin_runoff_components(), and extract_subbasin_climate():
+
+        rgi_id, cenlon, cenlat, rgi_area_km2, get_filepath(), has_file()
+    """
+    __slots__ = ('rgi_id', 'cenlon', 'cenlat', 'rgi_area_km2', 'dir')
+
+    def __init__(self, rgi_id, cenlon, cenlat, rgi_area_km2, base_dir):
+        self.rgi_id = rgi_id
+        self.cenlon = float(cenlon)
+        self.cenlat = float(cenlat)
+        self.rgi_area_km2 = float(rgi_area_km2)
+        # OGGM directory layout: base_dir/O1/O1.O2/O1.O2.xxxxx/
+        self.dir = os.path.join(base_dir, rgi_id[:-6], rgi_id[:-3], rgi_id)
+
+    @property
+    def rgi_area_m2(self):
+        return self.rgi_area_km2 * 1e6
+
+    def get_filepath(self, filename, filesuffix='', delete=False, **kwargs):
+        from oggm import cfg
+        fname = cfg.BASENAMES[filename]
+        if filesuffix:
+            parts = fname.rsplit('.', 1)
+            fname = f'{parts[0]}{filesuffix}.{parts[1]}'
+        out = os.path.join(self.dir, fname)
+        if delete and os.path.isfile(out):
+            os.remove(out)
+        return out
+
+    def has_file(self, filename, filesuffix='', **kwargs):
+        return os.path.isfile(self.get_filepath(filename, filesuffix=filesuffix))
+
+    def __repr__(self):
+        return f'<_FastGdir {self.rgi_id}>'
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -120,17 +166,21 @@ def _setup_logging(output_dir):
 
 
 def _load_gdirs(workdir, output_dir, filesuffix=''):
-    """Load GlacierDirectory objects from Phase 10 working directory."""
-    import oggm
+    """Build fast _FastGdir proxies from glacier_list.csv (no shapefile reads).
+
+    Reads glacier metadata (cenlon, cenlat, area_km2) from glacier_list.csv
+    and checks for model_diagnostics NC files via os.path.isfile().  This
+    avoids the per-glacier outlines.tar.gz reads that make vanilla
+    GlacierDirectory construction very slow (~90 s for 6551 glaciers).
+    """
     from oggm import cfg
 
     cfg.initialize(logging_level='WARNING')
     cfg.PATHS['working_dir'] = workdir
 
-    # rgi_ids.npy is written by run_hunza_preprocess.py into output_dir
+    # --- locate rgi_ids.npy ---
     rgi_file = os.path.join(output_dir, 'rgi_ids.npy')
     if not os.path.exists(rgi_file):
-        # Also try directly in workdir's parent
         alt = os.path.join(os.path.dirname(workdir), 'rgi_ids.npy')
         if os.path.exists(alt):
             rgi_file = alt
@@ -139,36 +189,55 @@ def _load_gdirs(workdir, output_dir, filesuffix=''):
                 f'rgi_ids.npy not found at {rgi_file} or {alt}. '
                 'Run run_hunza_preprocess.py first.'
             )
-
     rgi_ids = np.load(rgi_file, allow_pickle=True).tolist()
     log.info('rgi_ids.npy: %d RGI IDs', len(rgi_ids))
 
-    # Phase 10 stores gdirs under workdir/per_glacier/
+    # --- locate glacier_list.csv (cenlon, cenlat, area_km2) ---
+    # Phase 10 writes glacier_list.csv to its output_dir (parent of workdir)
+    csv_candidates = [
+        os.path.join(output_dir, 'glacier_list.csv'),
+        os.path.join(os.path.dirname(workdir), 'glacier_list.csv'),
+    ]
+    csv_file = next((p for p in csv_candidates if os.path.exists(p)), None)
+    if csv_file is None:
+        raise FileNotFoundError(
+            f'glacier_list.csv not found in {csv_candidates}. '
+            'Run run_hunza_preprocess.py first.'
+        )
+    meta_df = pd.read_csv(csv_file, index_col='rgi_id')
+    log.info('glacier_list.csv: %d rows (%s)', len(meta_df), csv_file)
+
+    # --- base_dir: Phase 10 stores gdirs under workdir/per_glacier/ ---
     per_glacier_dir = os.path.join(workdir, 'per_glacier')
     base_dir = per_glacier_dir if os.path.isdir(per_glacier_dir) else workdir
     log.info('Using base_dir: %s', base_dir)
 
+    # --- build _FastGdir objects; check NC file via os.path.isfile (fast) ---
+    nc_name = f'model_diagnostics{filesuffix}.nc'
     gdirs = []
     missing = 0
     for rgi_id in rgi_ids:
-        try:
-            gdir = oggm.GlacierDirectory(rgi_id, base_dir=base_dir)
-            # Check for model_diagnostics with the actual filesuffix used in Phase 10
-            has_diag = (gdir.has_file('model_diagnostics', filesuffix=filesuffix)
-                        if filesuffix
-                        else gdir.has_file('model_diagnostics'))
-            if has_diag:
-                gdirs.append(gdir)
-            else:
-                missing += 1
-        except Exception:
+        if rgi_id not in meta_df.index:
+            missing += 1
+            continue
+        row = meta_df.loc[rgi_id]
+        gdir = _FastGdir(
+            rgi_id=rgi_id,
+            cenlon=row['lon'],
+            cenlat=row['lat'],
+            rgi_area_km2=row['area_km2'],
+            base_dir=base_dir,
+        )
+        if os.path.isfile(os.path.join(gdir.dir, nc_name)):
+            gdirs.append(gdir)
+        else:
             missing += 1
 
-    log.info('Loaded %d gdirs with model_diagnostics%s (%d missing/skipped)',
-             len(gdirs), filesuffix, missing)
+    log.info('Built %d fast gdirs with %s (%d missing/skipped)',
+             len(gdirs), nc_name, missing)
     if not gdirs:
         raise RuntimeError(
-            'No glacier directories with model_diagnostics.nc found. '
+            f'No glacier directories with {nc_name} found. '
             'Ensure the Phase 10 SLURM array completed successfully.'
         )
     return gdirs

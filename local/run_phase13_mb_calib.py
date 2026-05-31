@@ -154,13 +154,29 @@ def _setup_logging(output_dir):
     return log_path
 
 
-def _load_gdirs(workdir, output_dir, filesuffix=''):
+def _load_gdirs(workdir, output_dir, filesuffix='', representative_frac=0.85):
+    """Load proper GlacierDirectory objects for representative large glaciers.
+
+    Phase 13 requires proper GlacierDirectory objects (needs read_json,
+    write_json, etc. for mb_calibration_from_runoff).  To avoid the
+    ~90-second penalty of constructing 6551 gdirs (each reads outlines.tar.gz),
+    we:
+      1. Read glacier_list.csv for fast metadata (cenlon, cenlat, area_km2)
+      2. Check for model_diagnostics NC via os.path.isfile() — no tar reads
+      3. Sort by area, keep only top-N glaciers covering representative_frac
+         of total glacier area (typically ~50 glaciers for Hunza)
+      4. Construct proper GlacierDirectory only for those N glaciers
+
+    The mb_calibration_basin_from_discharge() function is then called with
+    use_representative_glaciers=False since we already pre-filtered.
+    """
     import oggm
     from oggm import cfg
 
     cfg.initialize(logging_level='WARNING')
     cfg.PATHS['working_dir'] = workdir
 
+    # --- locate rgi_ids.npy ---
     rgi_file = os.path.join(output_dir, 'rgi_ids.npy')
     if not os.path.exists(rgi_file):
         alt = os.path.join(os.path.dirname(workdir), 'rgi_ids.npy')
@@ -171,34 +187,81 @@ def _load_gdirs(workdir, output_dir, filesuffix=''):
                 f'rgi_ids.npy not found at {rgi_file}. '
                 'Run run_hunza_preprocess.py first.'
             )
-
     rgi_ids = np.load(rgi_file, allow_pickle=True).tolist()
     log.info('rgi_ids.npy: %d RGI IDs', len(rgi_ids))
 
-    # Phase 10 stores gdirs under workdir/per_glacier/
+    # --- locate glacier_list.csv ---
+    csv_candidates = [
+        os.path.join(output_dir, 'glacier_list.csv'),
+        os.path.join(os.path.dirname(workdir), 'glacier_list.csv'),
+    ]
+    csv_file = next((p for p in csv_candidates if os.path.exists(p)), None)
+    if csv_file is None:
+        raise FileNotFoundError(
+            f'glacier_list.csv not found in {csv_candidates}. '
+            'Run run_hunza_preprocess.py first.'
+        )
+    meta_df = pd.read_csv(csv_file, index_col='rgi_id')
+    log.info('glacier_list.csv: %d rows (%s)', len(meta_df), csv_file)
+
+    # --- base_dir: Phase 10 stores gdirs under workdir/per_glacier/ ---
     per_glacier_dir = os.path.join(workdir, 'per_glacier')
     base_dir = per_glacier_dir if os.path.isdir(per_glacier_dir) else workdir
     log.info('Using base_dir: %s', base_dir)
 
-    gdirs, missing = [], 0
+    # --- fast file check: find matching glaciers + their areas ---
+    # Phase 10 always uses filesuffix=_hunza for model_diagnostics
+    nc_name = 'model_diagnostics_hunza.nc'
+    matching = []   # list of (rgi_id, area_km2)
+    missing = 0
     for rgi_id in rgi_ids:
-        try:
-            gdir = oggm.GlacierDirectory(rgi_id, base_dir=base_dir)
-            has_diag = (gdir.has_file('model_diagnostics', filesuffix=filesuffix)
-                        if filesuffix
-                        else gdir.has_file('model_diagnostics'))
-            if has_diag:
-                gdirs.append(gdir)
-            else:
-                missing += 1
-        except Exception:
+        if rgi_id not in meta_df.index:
+            missing += 1
+            continue
+        row = meta_df.loc[rgi_id]
+        gdir_dir = os.path.join(base_dir, rgi_id[:-6], rgi_id[:-3], rgi_id)
+        nc_path = os.path.join(gdir_dir, nc_name)
+        if os.path.isfile(nc_path):
+            matching.append((rgi_id, float(row['area_km2'])))
+        else:
             missing += 1
 
-    log.info('Loaded %d gdirs with model_diagnostics%s (%d missing)',
-             len(gdirs), filesuffix, missing)
+    log.info('Found %d glaciers with %s (%d without)',
+             len(matching), nc_name, missing)
+
+    # --- pre-filter to representative glaciers by area ---
+    matching.sort(key=lambda x: x[1], reverse=True)
+    total_area = sum(a for _, a in matching)
+    cum_area = 0.0
+    n_rep = 0
+    for _, area in matching:
+        cum_area += area
+        n_rep += 1
+        if cum_area / total_area >= representative_frac:
+            break
+    rep_ids = [rid for rid, _ in matching[:n_rep]]
+    log.info(
+        'Pre-filtered to %d representative glaciers covering %.0f%% '
+        'of total glacier area (%.0f km² of %.0f km²)',
+        n_rep,
+        cum_area / total_area * 100,
+        cum_area,
+        total_area,
+    )
+
+    # --- construct proper GlacierDirectory only for the N rep glaciers ---
+    gdirs = []
+    for rgi_id in rep_ids:
+        try:
+            gdir = oggm.GlacierDirectory(rgi_id, base_dir=base_dir)
+            gdirs.append(gdir)
+        except Exception as exc:
+            log.warning('Could not open gdir %s: %s', rgi_id, exc)
+
+    log.info('Loaded %d proper GlacierDirectory objects', len(gdirs))
     if not gdirs:
         raise RuntimeError(
-            'No gdirs with model_diagnostics.nc found. '
+            'No representative glacier directories found. '
             'Ensure Phase 10 array completed successfully.'
         )
     return gdirs
