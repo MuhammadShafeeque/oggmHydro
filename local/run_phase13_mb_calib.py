@@ -132,6 +132,11 @@ def parse_args():
                    help='Parallel OGGM processes for per-glacier calibration')
     p.add_argument('--filesuffix', default='',
                    help='Suffix for mb_calib output files in each gdir')
+    p.add_argument('--model_filesuffix', default='_hunza',
+                   help='model_diagnostics filesuffix from Phase 10 (default _hunza)')
+    p.add_argument('--outlet_lon', type=float, default=74.46)
+    p.add_argument('--outlet_lat', type=float, default=35.90)
+    p.add_argument('--no_delineate', action='store_true')
     return p.parse_args()
 
 
@@ -210,8 +215,7 @@ def _load_gdirs(workdir, output_dir, filesuffix='', representative_frac=0.85):
     log.info('Using base_dir: %s', base_dir)
 
     # --- fast file check: find matching glaciers + their areas ---
-    # Phase 10 always uses filesuffix=_hunza for model_diagnostics
-    nc_name = 'model_diagnostics_hunza.nc'
+    nc_name = f'model_diagnostics{filesuffix}.nc'
     matching = []   # list of (rgi_id, area_km2)
     missing = 0
     for rgi_id in rgi_ids:
@@ -272,21 +276,79 @@ def _load_grdc_annual(grdc_file, ys, ye):
     return read_grdc_data(grdc_file, freq='annual', ys=ys, ye=ye)
 
 
-def _make_synthetic_total_obs(ys, ye, seed=0):
-    log.warning(
-        'No GRDC file provided — using SYNTHETIC total discharge. '
-        'Do NOT use for publication.'
+def _make_synthetic_total_obs_from_model(gdirs, subbasins, ys, ye, seed=0):
+    """Generate synthetic total obs identical to Phase 12 run 10.
+
+    Routes annual glacier cache through linear reservoirs at default k values
+    and adds NGL at default params + 5% noise.  This ensures Phase 13 uses
+    the same obs as Phase 12, giving a coherent self-consistency test.
+    """
+    from oggm.core.hydrology import (
+        _cache_basin_runoff_components,
+        extract_subbasin_climate as _esc,
+        compute_nonglaciated_runoff as _cnr,
+        _linear_reservoir as _lr,
     )
+    import oggm.cfg as _cfg
+
+    log.warning(
+        'No GRDC file provided — using SYNTHETIC total discharge from model '
+        'truth + 5%% noise (same as Phase 12). Do NOT use for publication.'
+    )
+
+    cache = _cache_basin_runoff_components(
+        gdirs, filesuffix='_hunza', ys=ys, ye=ye)
+    years_all = cache['years']
+    sel = (years_all >= ys) & (years_all <= ye)
+    years_calib = years_all[sel]
+
+    k_rain = float(_cfg.PARAMS.get('routing_k_rain_months', 0.5))
+    k_snow = float(_cfg.PARAMS.get('routing_k_snow_months', 2.0))
+    k_ice  = float(_cfg.PARAMS.get('routing_k_ice_months', 8.0))
+    q_gl = (
+        _lr(cache['rain_m3s'][sel], k=k_rain / 12.0, dt=1.0) +
+        _lr(cache['snow_m3s'][sel], k=k_snow / 12.0, dt=1.0) +
+        _lr(cache['ice_m3s'][sel],  k=k_ice  / 12.0, dt=1.0)
+    )
+
+    _total_km2 = float(subbasins['SUB_AREA'].sum())
+    _gl_km2 = float(sum(g.rgi_area_km2 for g in gdirs))
+    _ngl_frac = max(0.0, min(1.0, 1.0 - _gl_km2 / max(_total_km2, 1.0)))
+    ngl_area = {int(r['HYBAS_ID']): float(r['SUB_AREA']) * _ngl_frac
+                for _, r in subbasins.iterrows()}
+    per_basin_clim = _esc(gdirs, subbasins, ys=ys, ye=ye)
+    ngl_ds = _cnr(
+        subbasins, per_basin_clim,
+        k_snow_months=float(_cfg.PARAMS.get('nonglaciated_k_snow_months', 2.0)),
+        k_soil_months=float(_cfg.PARAMS.get('nonglaciated_k_soil_months', 3.0)),
+        s_fc_mm=float(_cfg.PARAMS.get('nonglaciated_s_fc_mm', 150.0)),
+        nonglaciated_area_km2=ngl_area,
+    )
+    q_ngl_m = ngl_ds['Q_ngl_m3s'].sum('HYBAS_ID').values
+    time_vals = ngl_ds['time'].values
+    try:
+        ngl_yrs = np.array([pd.Timestamp(t).year for t in time_vals])
+    except Exception:
+        ngl_yrs = np.array([int(t) for t in time_vals])
+    q_ngl = np.array([q_ngl_m[ngl_yrs == yr].mean()
+                      if (ngl_yrs == yr).any() else 0.0
+                      for yr in years_calib], dtype=float)
+
+    q_truth = q_gl + q_ngl
     rng = np.random.default_rng(seed)
-    years = np.arange(ys, ye + 1)
-    q = 420.0 + 0.5 * (years - years.mean()) + rng.normal(0, 80, len(years))
-    return pd.DataFrame({'year': years, 'q_m3s': np.maximum(q, 50.0)})
+    noise = rng.normal(0, 0.05 * float(q_truth.mean()), len(years_calib))
+    log.info('Synthetic obs: mean=%.1f m³/s  (gl=%.1f, ngl=%.1f)',
+             float(q_truth.mean()), float(q_gl.mean()), float(q_ngl.mean()))
+    return pd.DataFrame({'year': years_calib,
+                         'q_m3s': np.maximum(q_truth + noise, 10.0)})
 
 
-def _estimate_glacier_discharge(total_obs_df, glacier_frac, phase12_json=None):
+def _estimate_glacier_discharge(total_obs_df, glacier_frac,
+                                phase12_json=None,
+                                gdirs=None, subbasins=None):
     """Estimate glacier-only annual discharge.
 
-    Option 2 (residual): if phase12_json has Q_ngl_m3s.
+    Option 2 (residual): recompute Q_ngl at Phase 12 calibrated params.
     Option 3 (fraction): multiply total by glacier_frac.
 
     Returns
@@ -297,22 +359,55 @@ def _estimate_glacier_discharge(total_obs_df, glacier_frac, phase12_json=None):
     """
     years = total_obs_df['year'].values.astype(int)
     q_total = total_obs_df['q_m3s'].values.astype(float)
+    ys, ye = int(years.min()), int(years.max())
 
-    if phase12_json and os.path.exists(phase12_json):
+    if phase12_json and os.path.exists(phase12_json) and gdirs and subbasins is not None:
         with open(phase12_json) as fh:
             p12 = json.load(fh)
-        if 'Q_ngl_m3s' in p12 and 'calib_years' in p12:
-            p12_years = np.asarray(p12['calib_years'], dtype=int)
-            q_ngl = np.asarray(p12['Q_ngl_m3s'], dtype=float)
-            mask = np.isin(years, p12_years)
-            if mask.sum() >= 3:
-                q_gl = q_total[mask] - q_ngl[np.isin(p12_years, years[mask])]
-                q_gl = np.maximum(q_gl, 0.0)
-                log.info(
-                    'Glacier discharge: residual method (Option 2), '
-                    '%d years, mean=%.1f m3/s', mask.sum(), q_gl.mean()
-                )
-                return years[mask], q_gl, 'residual (Phase 12)'
+        # Recompute Q_ngl at Phase 12 calibrated routing params
+        try:
+            from oggm.core.hydrology import (
+                extract_subbasin_climate as _esc,
+                compute_nonglaciated_runoff as _cnr,
+            )
+            import oggm.cfg as _cfg
+            _total_km2 = float(subbasins['SUB_AREA'].sum())
+            _gl_km2 = float(sum(g.rgi_area_km2 for g in gdirs))
+            _ngl_frac = max(0.0, min(1.0, 1.0 - _gl_km2 / max(_total_km2, 1.0)))
+            ngl_area = {int(r['HYBAS_ID']): float(r['SUB_AREA']) * _ngl_frac
+                        for _, r in subbasins.iterrows()}
+            pf = float(p12.get('basin_prcp_fac', 1.0))
+            per_basin_clim = _esc(gdirs, subbasins, ys=ys, ye=ye)
+            if pf != 1.0:
+                per_basin_clim = {
+                    hid: clim.assign({'prcp': clim['prcp'] * pf})
+                    for hid, clim in per_basin_clim.items()
+                }
+            ngl_ds = _cnr(
+                subbasins, per_basin_clim,
+                k_snow_months=float(p12.get('k_snow_ngl', 2.0)),
+                k_soil_months=float(p12.get('k_soil_months', 3.0)),
+                s_fc_mm=float(p12.get('s_fc_mm', 150.0)),
+                nonglaciated_area_km2=ngl_area,
+            )
+            q_ngl_m = ngl_ds['Q_ngl_m3s'].sum('HYBAS_ID').values
+            time_vals = ngl_ds['time'].values
+            try:
+                ngl_yrs = np.array([pd.Timestamp(t).year for t in time_vals])
+            except Exception:
+                ngl_yrs = np.array([int(t) for t in time_vals])
+            q_ngl_ann = np.array([q_ngl_m[ngl_yrs == yr].mean()
+                                   if (ngl_yrs == yr).any() else 0.0
+                                   for yr in years], dtype=float)
+            q_gl = np.maximum(q_total - q_ngl_ann, 1.0)
+            log.info(
+                'Glacier discharge: residual method (Option 2, Phase 12 params), '
+                '%d years, mean=%.1f m3/s  (NGL mean=%.1f)',
+                len(years), q_gl.mean(), q_ngl_ann.mean()
+            )
+            return years, q_gl, 'residual (Phase 12 params)'
+        except Exception as exc:
+            log.warning('Residual method failed (%s); falling back to fraction.', exc)
 
     q_gl = glacier_frac * q_total
     log.info(
@@ -397,8 +492,43 @@ def main():
     from oggm.core.hydrology import mb_calibration_basin_from_discharge
 
     # ---- Load glacier dirs ----
-    # Phase 10 uses filesuffix _hunza; pass it so has_file check succeeds
-    gdirs = _load_gdirs(args.workdir, args.output_dir, filesuffix='_hunza')
+    # Phase 13 reads from Phase 10 workdir; rgi_ids.npy may be in Phase 12 output dir
+    phase12_dir = os.path.dirname(args.phase12_json) if args.phase12_json else args.output_dir
+    gdirs = _load_gdirs(args.workdir, phase12_dir, filesuffix=args.model_filesuffix)
+
+    # ---- Load subbasins (needed for residual method and synthetic obs) ----
+    from oggm import cfg
+    from oggm.shop.hydrobasins import get_hydrobasins
+    cfg.PARAMS['hydrobasins_local_dir'] = os.path.expanduser('~/oggm_dev_project')
+    subbasins = get_hydrobasins(tuple(_HUNZA_BBOX), level=8, region='as', use_lakes=True)
+    if not args.no_delineate:
+        # Upstream delineation (same as Phase 12)
+        from shapely.geometry import Point
+        gauge_pt = Point(args.outlet_lon, args.outlet_lat)
+        outlet_rows = subbasins[subbasins.geometry.contains(gauge_pt)]
+        if len(outlet_rows) > 0:
+            outlet_id = int(outlet_rows.iloc[0]['HYBAS_ID'])
+            next_down = {int(r['HYBAS_ID']): int(r['NEXT_DOWN'])
+                         for _, r in subbasins.iterrows()}
+            upstream = set()
+            q = {outlet_id}
+            while q:
+                c = q.pop()
+                upstream.add(c)
+                for hid, nd in next_down.items():
+                    if nd == c and hid not in upstream:
+                        q.add(hid)
+            subbasins = subbasins[subbasins['HYBAS_ID'].isin(upstream)].copy()
+            # Filter gdirs to basin
+            try:
+                bu = subbasins.geometry.union_all()
+            except AttributeError:
+                bu = subbasins.geometry.unary_union
+            gdirs = [g for g in gdirs
+                     if bu.contains(Point(g.cenlat, g.cenlon)) or
+                        bu.contains(Point(g.cenlon, g.cenlat))]
+        log.info('Basin: %d sub-basins, %.0f km², %d gdirs',
+                 len(subbasins), subbasins['SUB_AREA'].sum(), len(gdirs))
 
     # ---- Observed total discharge ----
     if args.grdc_file and os.path.exists(args.grdc_file):
@@ -407,11 +537,13 @@ def main():
     else:
         if args.grdc_file:
             log.warning('GRDC file not found: %s', args.grdc_file)
-        total_obs = _make_synthetic_total_obs(args.ys, args.ye)
+        total_obs = _make_synthetic_total_obs_from_model(
+            gdirs, subbasins, args.ys, args.ye, seed=42)
 
     # ---- Estimate glacier-only discharge ----
     obs_years, q_gl_m3s, method = _estimate_glacier_discharge(
-        total_obs, args.glacier_frac, args.phase12_json)
+        total_obs, args.glacier_frac, args.phase12_json,
+        gdirs=gdirs, subbasins=subbasins)
     log.info('Glacier Q method: %s', method)
     log.info('  %d years, mean=%.1f m3/s, range=[%.1f, %.1f]',
              len(obs_years), q_gl_m3s.mean(), q_gl_m3s.min(), q_gl_m3s.max())

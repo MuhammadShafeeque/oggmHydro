@@ -2715,8 +2715,18 @@ def compute_mb_runoff_fixed_geometry(
     * ``ice_melt = max(0, melt - SWE)``
     * ``snow_melt = melt - ice_melt``
     """
-    # Load fixed inversion flowlines
-    fls = gdir.read_pickle('inversion_flowlines')
+    # Load fixed inversion flowlines; fall back to model_flowlines if absent
+    try:
+        fls = gdir.read_pickle('inversion_flowlines')
+    except FileNotFoundError:
+        try:
+            fls = gdir.read_pickle('model_flowlines')
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f'({gdir.rgi_id}) Neither inversion_flowlines.pkl nor '
+                'model_flowlines.pkl found. '
+                'Run centerlines + inversion steps first.'
+            )
 
     # Instantiate MB model with specified parameters at fixed geometry
     mbm = mb_model_class(
