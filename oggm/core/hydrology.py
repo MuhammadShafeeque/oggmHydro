@@ -2372,11 +2372,7 @@ def calibrate_basin_water_balance(
         # Aggregate Q_ngl to annual
         q_ngl_monthly = ngl_ds['Q_ngl_m3s'].sum(dim='HYBAS_ID').values
         time_ngl = ngl_ds['time'].values
-        import pandas as _pd2
-        ngl_years = np.array([
-            _pd2.Timestamp(t).year if hasattr(t, 'year') else int(t)
-            for t in time_ngl
-        ], dtype=int)
+        ngl_years = _extract_model_years(time_ngl)
         yr_unique = np.unique(ngl_years)
         q_ngl_ann = np.array(
             [q_ngl_monthly[ngl_years == yr].mean() for yr in yr_unique],
