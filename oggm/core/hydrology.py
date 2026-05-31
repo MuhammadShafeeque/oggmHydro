@@ -1087,6 +1087,110 @@ def compute_channel_routing(gdir, filesuffix='',
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
+# Spatial climate extraction — per-sub-basin W5E5 forcing
+# ---------------------------------------------------------------------------
+
+def extract_subbasin_climate(gdirs, subbasins_gdf, ys=None, ye=None):
+    """Extract per-sub-basin monthly climate from the nearest glacier's file.
+
+    Each glacier's ``climate_historical.nc`` stores the W5E5 grid cell
+    closest to the glacier centroid.  For every HydroBASINS sub-basin we
+    select the glacier whose centroid is nearest (Euclidean distance in
+    lon/lat space) and use its climate as the sub-basin forcing.  Optionally
+    the time series is sliced to [*ys*, *ye*].
+
+    Parameters
+    ----------
+    gdirs : list of :class:`oggm.GlacierDirectory`
+        Glacier directories.  All must have a ``climate_historical.nc`` file.
+    subbasins_gdf : :class:`geopandas.GeoDataFrame` or :class:`pandas.DataFrame`
+        Sub-basin metadata.  Must contain ``HYBAS_ID``.  If ``geometry`` is
+        present, the centroid is used; otherwise ``centroid_lon`` /
+        ``centroid_lat`` columns are required.
+    ys : int, optional
+        Start year for the time slice (inclusive).
+    ye : int, optional
+        End year for the time slice (inclusive).
+
+    Returns
+    -------
+    dict
+        ``{HYBAS_ID: xarray.Dataset}`` — each value is an xr.Dataset with
+        variables ``temp`` [°C] and ``prcp`` [mm month⁻¹] on a ``time``
+        coordinate, taken from the nearest glacier's climate file.
+    """
+    import xarray as xr
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        raise ImportError(
+            'scipy is required for extract_subbasin_climate(). '
+            'Install it with: conda install scipy'
+        )
+
+    # Glacier centroid array
+    gl_lons = np.array([g.cenlon for g in gdirs], dtype=float)
+    gl_lats = np.array([g.cenlat for g in gdirs], dtype=float)
+    tree = cKDTree(np.column_stack([gl_lons, gl_lats]))
+
+    # Sub-basin centroids
+    import pandas as _pd
+    try:
+        import geopandas as _gpd
+        has_gpd = True
+    except ImportError:
+        has_gpd = False
+
+    if has_gpd and hasattr(subbasins_gdf, 'geometry') and (
+            subbasins_gdf.geometry is not None):
+        ctr = subbasins_gdf.geometry.centroid
+        sub_lons = ctr.x.values
+        sub_lats = ctr.y.values
+    elif ('centroid_lon' in subbasins_gdf.columns and
+          'centroid_lat' in subbasins_gdf.columns):
+        sub_lons = np.asarray(subbasins_gdf['centroid_lon'], dtype=float)
+        sub_lats = np.asarray(subbasins_gdf['centroid_lat'], dtype=float)
+    else:
+        raise ValueError(
+            'subbasins_gdf must have a geometry column or '
+            '"centroid_lon"/"centroid_lat" columns.'
+        )
+    hybas_ids = np.asarray(subbasins_gdf['HYBAS_ID'])
+
+    # Nearest glacier for each sub-basin
+    _, nearest_idx = tree.query(np.column_stack([sub_lons, sub_lats]))
+
+    # Load unique climate files (cache by glacier index)
+    unique_idx = np.unique(nearest_idx)
+    climate_cache: dict = {}
+    for idx in unique_idx:
+        gdir = gdirs[int(idx)]
+        fpath = gdir.get_filepath('climate_historical')
+        with xr.open_dataset(fpath) as ds:
+            clim = ds[['temp', 'prcp']].load()
+        if ys is not None and ye is not None:
+            try:
+                sliced = clim.sel(time=slice(str(ys), str(ye)))
+                if len(sliced['time']) > 0:
+                    clim = sliced
+            except Exception:
+                pass
+        climate_cache[int(idx)] = clim
+
+    # Build per-subbasin dict
+    per_subbasin: dict = {}
+    for hybas_id, gl_idx in zip(hybas_ids, nearest_idx):
+        per_subbasin[int(hybas_id)] = climate_cache[int(gl_idx)]
+
+    log.info(
+        'extract_subbasin_climate: %d sub-basins assigned from %d unique '
+        'glacier climate files',
+        len(per_subbasin), len(unique_idx),
+    )
+    return per_subbasin
+
+
+# ---------------------------------------------------------------------------
 # Two-bucket snowmelt / soil-moisture runoff model
 # ---------------------------------------------------------------------------
 
@@ -1219,7 +1323,8 @@ def _run_two_bucket_model(t_celsius, prcp_mm, temp_threshold=0.0,
 
 def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
                                 temp_threshold=None, k_snow_months=None,
-                                k_soil_months=None, s_fc_mm=None):
+                                k_soil_months=None, s_fc_mm=None,
+                                nonglaciated_area_km2=None):
     """Compute non-glaciated area runoff for a set of HydroBASINS sub-basins.
 
     Applies the two-bucket snowmelt/soil model to each sub-basin independently,
@@ -1233,12 +1338,18 @@ def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
         ``HYBAS_ID``, ``SUB_AREA`` (km²), and—if lapse-rate correction is
         desired—``centroid_lon``, ``centroid_lat``, ``centroid_elev_m``.
         A plain DataFrame (no geometry) is also accepted.
-    climate_ds : :class:`xarray.Dataset`
-        Climate forcing with coordinates ``time`` (monthly) and variables:
-        ``temp`` [°C] and ``prcp`` [mm month-1].  If the dataset has spatial
-        dimensions (``lat``, ``lon``), the nearest grid point to each
-        sub-basin centroid is extracted.  Otherwise (single time series),
-        the same forcing is applied to all sub-basins.
+    climate_ds : :class:`xarray.Dataset` or dict
+        Climate forcing.  Two forms are accepted:
+
+        * **Single xr.Dataset** — variables ``temp`` [°C] and
+          ``prcp`` [mm month⁻¹] on a ``time`` coordinate.  If the dataset
+          has spatial dimensions (``lat``, ``lon``), the nearest grid point
+          to each sub-basin centroid is extracted.  Otherwise (single time
+          series), the same forcing is applied to all sub-basins.
+        * **dict {HYBAS_ID → xr.Dataset}** — per-sub-basin climate datasets
+          as returned by :func:`extract_subbasin_climate`.  Each entry must
+          have the same variables and time axis.  This is the preferred form
+          when spatial climate variability is important.
     temp_threshold : float, optional
         Rain/snow temperature threshold [°C].  Reads
         ``cfg.PARAMS['nonglaciated_temp_threshold_degC']`` if not given.
@@ -1251,6 +1362,13 @@ def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
     s_fc_mm : float, optional
         Field capacity [mm].  Reads
         ``cfg.PARAMS['nonglaciated_s_fc_mm']`` if not given.
+    nonglaciated_area_km2 : dict or :class:`pandas.Series`, optional
+        Actual non-glaciated area per sub-basin {HYBAS_ID → km²}.
+        When provided, this replaces ``SUB_AREA`` for the conversion from
+        runoff depth to volumetric discharge, so that the glacier-covered
+        fraction is excluded from the non-glaciated runoff estimate.
+        If *None*, ``SUB_AREA`` is used (legacy behaviour, overestimates
+        non-glaciated runoff in heavily glacierized sub-basins).
 
     Returns
     -------
@@ -1288,16 +1406,37 @@ def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
     sub_area_km2 = np.asarray(subbasins_gdf['SUB_AREA'], dtype=float)
     n_basins = len(hybas_ids)
 
-    # Extract time axis
-    time_arr = climate_ds['time'].values
+    # Build non-glaciated area array: use provided values if available,
+    # otherwise fall back to total SUB_AREA (legacy behaviour)
+    if nonglaciated_area_km2 is not None:
+        ngl_area_km2 = np.array([
+            float(nonglaciated_area_km2.get(int(hid), sa))
+            for hid, sa in zip(hybas_ids, sub_area_km2)
+        ], dtype=float)
+        # Clamp to non-negative
+        ngl_area_km2 = np.maximum(ngl_area_km2, 0.0)
+    else:
+        ngl_area_km2 = sub_area_km2.copy()
 
-    # Determine spatial structure of the climate dataset
-    spatial_dims = set(climate_ds['temp'].dims) - {'time'}
-    has_spatial = bool(spatial_dims)
+    # Detect per-subbasin climate dict vs single dataset
+    _is_dict_climate = isinstance(climate_ds, dict)
 
-    # Try to identify centroid columns (optional; not required)
-    has_centroids = ('centroid_lon' in subbasins_gdf.columns and
-                     'centroid_lat' in subbasins_gdf.columns)
+    if _is_dict_climate:
+        # Use the first entry's time axis as reference
+        first_key = next(iter(climate_ds))
+        time_arr = climate_ds[first_key]['time'].values
+    else:
+        time_arr = climate_ds['time'].values
+
+    # Determine spatial structure of the climate dataset (single-DS mode)
+    if not _is_dict_climate:
+        spatial_dims = set(climate_ds['temp'].dims) - {'time'}
+        has_spatial = bool(spatial_dims)
+        has_centroids = ('centroid_lon' in subbasins_gdf.columns and
+                         'centroid_lat' in subbasins_gdf.columns)
+    else:
+        has_spatial = False
+        has_centroids = False
 
     # Containers for results
     n_time = len(time_arr)
@@ -1306,11 +1445,19 @@ def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
     s_soil_all = np.zeros((n_basins, n_time), dtype=float)
 
     for i_b in range(n_basins):
-        # Select climate forcing for this sub-basin
-        if has_spatial and has_centroids:
+        hid = int(hybas_ids[i_b])
+
+        if _is_dict_climate:
+            # Per-subbasin climate dict — preferred spatial mode
+            clim_b = climate_ds.get(hid)
+            if clim_b is None:
+                # Fall back to first available entry for missing sub-basins
+                clim_b = climate_ds[first_key]
+            t_series = clim_b['temp'].values.ravel()
+            p_series = clim_b['prcp'].values.ravel()
+        elif has_spatial and has_centroids:
             lon_c = float(subbasins_gdf['centroid_lon'].iloc[i_b])
             lat_c = float(subbasins_gdf['centroid_lat'].iloc[i_b])
-            # Nearest neighbour selection
             t_series = climate_ds['temp'].sel(
                 lat=lat_c, lon=lon_c, method='nearest').values
             p_series = climate_ds['prcp'].sel(
@@ -1339,9 +1486,9 @@ def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
         s_soil_all[i_b] = s_soil
 
     # Convert runoff depth [mm month-1] → volumetric discharge [m3 s-1]
-    # Q [m3/s] = depth [m/month] × area [m2] / seconds_per_month
-    area_m2 = sub_area_km2 * 1e6          # km2 → m2
-    # mm month-1 → m month-1 (*1e-3), then / _SEC_PER_MONTH
+    # Use non-glaciated area (not total SUB_AREA) so glacier-covered fraction
+    # is excluded from this term.
+    area_m2 = ngl_area_km2 * 1e6          # km2 → m2
     q_m3s_all = (q_mm_all * 1e-3 * area_m2[:, np.newaxis]) / _SEC_PER_MONTH
 
     ds_out = xr.Dataset(
@@ -1387,6 +1534,92 @@ def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
 # ---------------------------------------------------------------------------
 # Combined basin discharge
 # ---------------------------------------------------------------------------
+
+def aggregate_glacier_discharge_to_subbasins(gdirs, polygon_assignment,
+                                              filesuffix,
+                                              discharge_var='discharge_2c_m3s'):
+    """Sum per-glacier routed discharge to HydroBASINS sub-basins.
+
+    For each glacier, loads its annual discharge time series and distributes
+    it to each sub-basin in proportion to the glacier's area fraction in that
+    sub-basin (from :func:`oggm.shop.hydrobasins.assign_glaciers_to_subbasins_polygon`).
+
+    Parameters
+    ----------
+    gdirs : list of :class:`oggm.GlacierDirectory`
+    polygon_assignment : :class:`pandas.DataFrame`
+        Output of ``assign_glaciers_to_subbasins_polygon``.  Must contain
+        columns ``rgi_id``, ``HYBAS_ID``, ``area_fraction``.
+    filesuffix : str
+        Filesuffix of the ``model_diagnostics`` file to read.
+    discharge_var : str
+        Variable name for discharge [m³ s⁻¹].
+
+    Returns
+    -------
+    tuple of (numpy.ndarray, numpy.ndarray, numpy.ndarray, dict)
+        * ``q_total``    — total glacier discharge [m³ s⁻¹], shape (n_years,)
+        * ``time_ref``   — year array, shape (n_years,)
+        * ``hybas_ids``  — array of HYBAS_IDs with assigned glaciers
+        * ``q_by_subbasin`` — dict {HYBAS_ID: np.array shape (n_years,)}
+    """
+    import xarray as xr
+
+    # Build a lookup: rgi_id → [(HYBAS_ID, area_fraction), ...]
+    assignment_map: dict = {}
+    for _, row in polygon_assignment.iterrows():
+        rgi_id = row['rgi_id']
+        hybas = int(row['HYBAS_ID'])
+        frac = float(row['area_fraction'])
+        if hybas < 0:
+            continue
+        assignment_map.setdefault(rgi_id, []).append((hybas, frac))
+
+    gdir_map = {g.rgi_id: g for g in gdirs}
+
+    # Accumulate discharge per subbasin
+    q_by_subbasin: dict = {}
+    time_ref = None
+    q_total = None
+
+    for rgi_id, allocations in assignment_map.items():
+        gdir = gdir_map.get(rgi_id)
+        if gdir is None:
+            continue
+        try:
+            fpath = gdir.get_filepath('model_diagnostics', filesuffix=filesuffix)
+            with xr.open_dataset(fpath) as ds:
+                if discharge_var not in ds:
+                    # Try fallbacks
+                    for v in ('discharge_2c_m3s', 'discharge_m3s',
+                              'discharge_terrain_m3s'):
+                        if v in ds:
+                            discharge_var = v
+                            break
+                    else:
+                        continue
+                q = ds[discharge_var].values.astype(float)
+                t = ds['time'].values
+        except Exception:
+            continue
+
+        if time_ref is None:
+            time_ref = t
+            q_total = np.zeros(len(t), dtype=float)
+
+        q_total += q
+
+        for hybas, frac in allocations:
+            if hybas not in q_by_subbasin:
+                q_by_subbasin[hybas] = np.zeros(len(t), dtype=float)
+            q_by_subbasin[hybas] += q * frac
+
+    if time_ref is None:
+        raise ValueError('No valid glacier discharge files found.')
+
+    hybas_ids_arr = np.array(sorted(q_by_subbasin.keys()), dtype=int)
+    return q_total, time_ref, hybas_ids_arr, q_by_subbasin
+
 
 def combine_basin_discharge(gdirs, subbasins_assignment, nonglaciated_ds,
                              glacier_filesuffix='',

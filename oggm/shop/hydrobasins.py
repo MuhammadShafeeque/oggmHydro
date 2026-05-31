@@ -484,3 +484,178 @@ def assign_glaciers_to_subbasins(gdirs, subbasins_gdf):
     log.info('assign_glaciers_to_subbasins: %d glaciers → %d unique sub-basins',
              len(out), out['HYBAS_ID'].nunique())
     return out
+
+
+def assign_glaciers_to_subbasins_polygon(rgi_gdf, subbasins_gdf):
+    """Polygon-overlay glacier-to-subbasin assignment.
+
+    Intersects RGI glacier outline polygons with HydroBASINS sub-basin
+    polygons so that:
+
+    * A glacier straddling two sub-basins contributes discharge to *both*,
+      weighted by the fraction of its area in each sub-basin.
+    * Per-sub-basin glacierized fraction is computed from actual polygon
+      overlap area, not from centroid containment.
+
+    Parameters
+    ----------
+    rgi_gdf : :class:`geopandas.GeoDataFrame`
+        RGI glacier outlines with at minimum columns ``RGIId`` (or ``rgi_id``)
+        and a polygon ``geometry`` column in any geographic CRS.  An ``Area``
+        (km²) column is used if present; otherwise it is computed from the
+        geometry.
+    subbasins_gdf : :class:`geopandas.GeoDataFrame`
+        HydroBASINS polygons as returned by :func:`get_hydrobasins`.
+        Must contain ``HYBAS_ID``, ``SUB_AREA``, ``UP_AREA``, ``geometry``.
+
+    Returns
+    -------
+    :class:`pandas.DataFrame`
+        One row per *(glacier, sub-basin)* intersection pair.  Columns:
+
+        ``rgi_id``
+            RGI glacier identifier.
+        ``HYBAS_ID``
+            HydroBASINS sub-basin identifier (−1 for glaciers outside all
+            sub-basins).
+        ``SUB_AREA_km2``
+            Total area of the sub-basin [km²].
+        ``UP_AREA_km2``
+            Upstream drainage area of the sub-basin [km²].
+        ``area_in_subbasin_km2``
+            Area of the glacier–sub-basin intersection [km²].
+        ``area_fraction``
+            Fraction of the glacier's total area that falls in this
+            sub-basin [0–1].  Sums to 1.0 for a given ``rgi_id`` when all
+            of its area is within the bbox sub-basins.
+        ``glacier_area_km2``
+            Total glacier area [km²].
+        ``glacierized_fraction``
+            ``area_in_subbasin_km2 / SUB_AREA_km2`` — fraction of the
+            sub-basin covered by this glacier's portion.
+
+    Notes
+    -----
+    Area calculations are performed in the World Equal-Area Cylindrical
+    projection (EPSG:6933) to minimise distortion at mid-to-high latitudes.
+    Glaciers whose centroid (or any part) falls outside all sub-basin
+    polygons are assigned ``HYBAS_ID = −1`` with ``area_fraction = 1.0``.
+
+    Raises
+    ------
+    ImportError
+        If *geopandas* is not installed.
+    ValueError
+        If *rgi_gdf* or *subbasins_gdf* is missing required columns.
+    """
+    if not HAS_GEOPANDAS:
+        raise ImportError(
+            'geopandas is required for assign_glaciers_to_subbasins_polygon(). '
+            'Install it with: conda install geopandas'
+        )
+
+    required_subs = {'HYBAS_ID', 'SUB_AREA', 'UP_AREA', 'geometry'}
+    missing = required_subs - set(subbasins_gdf.columns)
+    if missing:
+        raise ValueError(
+            f'subbasins_gdf is missing required columns: {missing}.'
+        )
+
+    # Normalise RGI column name
+    rgi_col = 'RGIId' if 'RGIId' in rgi_gdf.columns else 'rgi_id'
+    if rgi_col not in rgi_gdf.columns:
+        raise ValueError(
+            'rgi_gdf must contain an "RGIId" or "rgi_id" column.'
+        )
+
+    # Equal-area projection for robust area calculations
+    _EA_CRS = 'EPSG:6933'
+
+    # Prepare glaciers
+    gl = rgi_gdf[[rgi_col, 'geometry']].copy().rename(
+        columns={rgi_col: 'rgi_id'})
+    if gl.crs is None:
+        gl = gl.set_crs('EPSG:4326')
+    else:
+        gl = gl.to_crs('EPSG:4326')
+
+    # Compute total glacier area from geometry (authoritative)
+    gl_ea = gl.to_crs(_EA_CRS)
+    gl['glacier_area_km2'] = gl_ea.geometry.area / 1e6
+
+    # Prepare sub-basins
+    subs = subbasins_gdf[['HYBAS_ID', 'SUB_AREA', 'UP_AREA',
+                           'geometry']].copy()
+    if subs.crs is None:
+        subs = subs.set_crs('EPSG:4326')
+    else:
+        subs = subs.to_crs('EPSG:4326')
+
+    # Polygon intersection
+    intersected = gpd.overlay(gl, subs, how='intersection', keep_geom_type=False)
+
+    # Drop degenerate geometries (slivers from shared boundaries)
+    intersected = intersected[~intersected.geometry.is_empty].copy()
+
+    # Compute intersection area in equal-area projection
+    isct_ea = intersected.to_crs(_EA_CRS)
+    intersected['area_in_subbasin_km2'] = isct_ea.geometry.area / 1e6
+
+    # Drop tiny slivers (< 0.001 km² numerical noise from shared edges)
+    intersected = intersected[
+        intersected['area_in_subbasin_km2'] > 0.001].copy()
+
+    # Compute area fraction for each glacier
+    total_area_per_glacier = (intersected
+                              .groupby('rgi_id')['area_in_subbasin_km2']
+                              .sum())
+    intersected['area_fraction'] = (
+        intersected['area_in_subbasin_km2']
+        / intersected['rgi_id'].map(total_area_per_glacier)
+    )
+
+    # Glacierized fraction of each sub-basin (this intersection piece only)
+    intersected['glacierized_fraction'] = (
+        intersected['area_in_subbasin_km2']
+        / intersected['SUB_AREA'].clip(lower=0.001)
+    )
+
+    # Glaciers completely outside all sub-basins
+    assigned_rgi = set(intersected['rgi_id'])
+    all_rgi = set(gl['rgi_id'])
+    outside = all_rgi - assigned_rgi
+    if outside:
+        outside_rows = []
+        ga_map = dict(zip(gl['rgi_id'], gl['glacier_area_km2']))
+        for rgi_id in outside:
+            outside_rows.append({
+                'rgi_id': rgi_id,
+                'HYBAS_ID': -1,
+                'SUB_AREA': 0.0,
+                'UP_AREA': 0.0,
+                'area_in_subbasin_km2': ga_map.get(rgi_id, 0.0),
+                'area_fraction': 1.0,
+                'glacier_area_km2': ga_map.get(rgi_id, 0.0),
+                'glacierized_fraction': 0.0,
+            })
+        intersected = pd.concat(
+            [intersected, pd.DataFrame(outside_rows)], ignore_index=True)
+
+    out = intersected[['rgi_id', 'HYBAS_ID', 'SUB_AREA', 'UP_AREA',
+                        'area_in_subbasin_km2', 'area_fraction',
+                        'glacier_area_km2', 'glacierized_fraction']].copy()
+    out = out.rename(columns={'SUB_AREA': 'SUB_AREA_km2',
+                               'UP_AREA': 'UP_AREA_km2'})
+    out = out.reset_index(drop=True)
+
+    n_pairs = len(out[out['HYBAS_ID'] > 0])
+    n_glaciers = out[out['HYBAS_ID'] > 0]['rgi_id'].nunique()
+    n_outside = len(outside)
+    log.info(
+        'assign_glaciers_to_subbasins_polygon: %d glaciers → '
+        '%d (glacier, subbasin) pairs across %d sub-basins; '
+        '%d glaciers outside bbox',
+        len(all_rgi), n_pairs, out[out['HYBAS_ID'] > 0]['HYBAS_ID'].nunique(),
+        n_outside,
+    )
+    return out
