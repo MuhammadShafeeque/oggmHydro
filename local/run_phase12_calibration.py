@@ -143,6 +143,14 @@ def parse_args():
                    help='Hold out last 25%% of years for validation')
     p.add_argument('--basin_prcp_fac', action='store_true',
                    help='Also calibrate a basin-wide precipitation factor')
+    p.add_argument('--outlet-lon', type=float, default=74.46,
+                   help='Longitude of basin outlet gauge [°E] '
+                        '(default 74.46 = Dainyor bridge)')
+    p.add_argument('--outlet-lat', type=float, default=35.90,
+                   help='Latitude of basin outlet gauge [°N] '
+                        '(default 35.90 = Dainyor bridge)')
+    p.add_argument('--no-delineate', action='store_true',
+                   help='Skip upstream delineation (use full bbox sub-basins)')
     return p.parse_args()
 
 
@@ -251,9 +259,94 @@ def _load_subbasins(hydrobasins_dir, level, bbox):
     cfg.PARAMS['hydrobasins_local_dir'] = hydrobasins_dir
     subbasins = get_hydrobasins(tuple(bbox), level=level,
                                 region='as', use_lakes=True)
-    log.info('Loaded %d sub-basins, total area = %.0f km²',
+    log.info('Loaded %d sub-basins (bbox), total area = %.0f km²',
              len(subbasins), subbasins['SUB_AREA'].sum())
     return subbasins
+
+
+def _delineate_upstream_basin(subs_gdf, outlet_lon, outlet_lat):
+    """Return only sub-basins that drain upstream of the gauge point.
+
+    Uses the HydroBASINS ``NEXT_DOWN`` field to trace the drainage network
+    upstream from the sub-basin containing ``(outlet_lon, outlet_lat)``.
+
+    Parameters
+    ----------
+    subs_gdf : GeoDataFrame
+        All candidate sub-basins (loaded from bbox).
+    outlet_lon, outlet_lat : float
+        WGS-84 coordinates of the gauge / basin outlet.
+
+    Returns
+    -------
+    GeoDataFrame
+        Subset of ``subs_gdf`` containing only the outlet sub-basin and all
+        sub-basins draining into it.
+    """
+    from shapely.geometry import Point
+
+    gauge_pt = Point(outlet_lon, outlet_lat)
+    outlet_rows = subs_gdf[subs_gdf.geometry.contains(gauge_pt)]
+
+    if len(outlet_rows) == 0:
+        log.warning(
+            'Outlet point (%.3f°E, %.3f°N) not found in any sub-basin; '
+            'using all %d bbox sub-basins.',
+            outlet_lon, outlet_lat, len(subs_gdf))
+        return subs_gdf
+
+    outlet_id = int(outlet_rows.iloc[0]['HYBAS_ID'])
+    log.info('Outlet sub-basin HYBAS_ID: %d  (contains %.3f°E, %.3f°N)',
+             outlet_id, outlet_lon, outlet_lat)
+
+    # BFS upstream via NEXT_DOWN
+    next_down_map = {
+        int(r['HYBAS_ID']): int(r['NEXT_DOWN'])
+        for _, r in subs_gdf.iterrows()
+    }
+    upstream_ids: set = set()
+    queue: set = {outlet_id}
+    while queue:
+        current = queue.pop()
+        upstream_ids.add(current)
+        for hid, nd in next_down_map.items():
+            if nd == current and hid not in upstream_ids:
+                queue.add(hid)
+
+    upstream_subs = subs_gdf[subs_gdf['HYBAS_ID'].isin(upstream_ids)].copy()
+    log.info(
+        'Upstream delineation: %d sub-basins, total area = %.0f km²  '
+        '(was %d sub-basins, %.0f km²)',
+        len(upstream_subs), upstream_subs['SUB_AREA'].sum(),
+        len(subs_gdf), subs_gdf['SUB_AREA'].sum())
+    return upstream_subs
+
+
+def _filter_gdirs_to_basin(gdirs, basin_gdf):
+    """Keep only glaciers whose centroid lies within the delineated basin."""
+    from shapely.geometry import Point
+
+    try:
+        basin_union = basin_gdf.geometry.union_all()
+    except AttributeError:  # geopandas < 0.14
+        basin_union = basin_gdf.geometry.unary_union
+
+    filtered = [
+        gd for gd in gdirs
+        if basin_union.contains(Point(gd.cenlon, gd.cenlat))
+    ]
+
+    area_all = sum(g.rgi_area_km2 for g in gdirs)
+    area_filt = sum(g.rgi_area_km2 for g in filtered)
+    log.info(
+        'Glaciers in basin: %d / %d  (%.0f / %.0f km²)',
+        len(filtered), len(gdirs), area_filt, area_all)
+
+    if len(filtered) == 0:
+        raise RuntimeError(
+            'No glacier directories found within the delineated basin. '
+            'Check --outlet-lat/--outlet-lon or pass --no-delineate.')
+    return filtered
 
 
 def _make_synthetic_obs(ys, ye, seed=0, q_mean=420.0):
@@ -341,6 +434,15 @@ def main():
     subbasins = _load_subbasins(args.hydrobasins_dir,
                                 args.hydrobasins_level,
                                 args.bbox)
+
+    # ---- Delineate upstream basin + filter gdirs ----
+    if not args.no_delineate:
+        subbasins = _delineate_upstream_basin(
+            subbasins, args.outlet_lon, args.outlet_lat)
+        gdirs = _filter_gdirs_to_basin(gdirs, subbasins)
+    else:
+        log.info('--no-delineate: using all %d bbox sub-basins and all %d gdirs',
+                 len(subbasins), len(gdirs))
 
     if args.grdc_file and os.path.exists(args.grdc_file):
         log.info('Reading GRDC data from %s', args.grdc_file)
