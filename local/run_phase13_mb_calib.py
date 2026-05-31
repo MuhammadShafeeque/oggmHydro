@@ -283,7 +283,9 @@ def _load_gdirs(workdir, output_dir, filesuffix='', representative_frac=0.85):
             'No representative glacier directories found. '
             'Ensure Phase 10 array completed successfully.'
         )
-    return gdirs
+    # total_area is the sum of ALL matched glaciers (with NC file), not just
+    # the representative subset — used for area-fraction weighting of basin Q.
+    return gdirs, total_area
 
 
 def _load_grdc_annual(grdc_file, ys, ye):
@@ -509,8 +511,11 @@ def main():
     # ---- Load glacier dirs ----
     # Phase 13 reads from Phase 10 workdir; rgi_ids.npy may be in Phase 12 output dir
     phase12_dir = os.path.dirname(args.phase12_json) if args.phase12_json else args.output_dir
-    gdirs = _load_gdirs(args.workdir, phase12_dir, filesuffix=args.model_filesuffix,
-                        representative_frac=args.representative_frac)
+    gdirs, total_gl_area_km2 = _load_gdirs(
+        args.workdir, phase12_dir, filesuffix=args.model_filesuffix,
+        representative_frac=args.representative_frac)
+    total_glacier_area_m2 = total_gl_area_km2 * 1e6
+    log.info('Total basin glacier area (for Q scaling): %.0f km²', total_gl_area_km2)
 
     # ---- Load subbasins (needed for residual method and synthetic obs) ----
     from oggm import cfg
@@ -587,6 +592,7 @@ def main():
         representative_frac=args.representative_frac,
         nprocesses=args.nprocesses,
         filesuffix=args.filesuffix,
+        total_glacier_area_m2=total_glacier_area_m2,
     )
 
     log.info('Calibrated %d glaciers', len(results))

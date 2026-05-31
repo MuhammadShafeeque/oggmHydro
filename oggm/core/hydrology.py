@@ -2610,11 +2610,18 @@ def mb_calibration_basin_from_discharge(
     representative_frac=0.8,
     nprocesses=1,
     filesuffix='',
+    total_glacier_area_m2=None,
 ):
     """Apply per-glacier discharge-constrained MB calibration to a basin.
 
     Wraps :func:`~oggm.core.massbalance.mb_calibration_from_runoff` and
     applies it to all (or a representative subset of) glaciers in a basin.
+
+    The observed basin-total glacier discharge (*obs_glacier_discharge_m3s*)
+    is divided by each glacier's area fraction before being passed to the
+    per-glacier calibration.  This ensures that the optimiser sees a
+    per-glacier target instead of the full-basin total (which no single
+    glacier can reproduce).
 
     When *use_representative_glaciers* is ``True``, only the largest glaciers
     that together cover *representative_frac* of total glacier area are
@@ -2626,7 +2633,8 @@ def mb_calibration_basin_from_discharge(
     ----------
     gdirs : list of :class:`oggm.GlacierDirectory`
     obs_glacier_discharge_m3s : array-like
-        Observed glacier-only annual discharge [m³ s⁻¹].
+        Observed glacier-only annual **basin-total** discharge [m³ s⁻¹].
+        Scaled by each glacier's area fraction internally.
     obs_years : array-like of int
         Years corresponding to *obs_glacier_discharge_m3s*.
     ref_mb_df : dict or pd.DataFrame, optional
@@ -2647,6 +2655,12 @@ def mb_calibration_basin_from_discharge(
         Number of parallel processes (1 = sequential).
     filesuffix : str
         Filesuffix for ``mb_calib.json``.
+    total_glacier_area_m2 : float, optional
+        Total glacierised area [m²] of the entire basin (including glaciers
+        not in *gdirs*).  Used as the denominator when computing each
+        glacier's area fraction.  If ``None``, the sum of ``rgi_area_m2``
+        over all glaciers in *gdirs* is used — this underestimates the
+        denominator if *gdirs* is a pre-filtered representative subset.
 
     Returns
     -------
@@ -2658,6 +2672,14 @@ def mb_calibration_basin_from_discharge(
     obs_glacier_discharge_m3s = np.asarray(obs_glacier_discharge_m3s,
                                             dtype=float)
     obs_years = np.asarray(obs_years, dtype=int)
+
+    # Total glacier area for area-fraction weighting
+    if total_glacier_area_m2 is not None:
+        basin_total_area_m2 = float(total_glacier_area_m2)
+    else:
+        basin_total_area_m2 = float(sum(g.rgi_area_m2 for g in gdirs))
+    if basin_total_area_m2 <= 0:
+        raise ValueError('total_glacier_area_m2 must be positive.')
 
     # Sub-sample to representative glaciers by area
     if use_representative_glaciers and len(gdirs) > 1:
@@ -2674,6 +2696,11 @@ def mb_calibration_basin_from_discharge(
         )
     else:
         rep_gdirs = gdirs
+
+    def _per_glacier_obs(gdir):
+        """Scale basin-total obs by this glacier's area fraction."""
+        frac = gdir.rgi_area_m2 / basin_total_area_m2
+        return obs_glacier_discharge_m3s * frac
 
     def _get_geodetic(gdir):
         """Extract geodetic MB for a glacier from ref_mb_df."""
@@ -2701,10 +2728,15 @@ def mb_calibration_basin_from_discharge(
     results = {}
     for gdir in rep_gdirs:
         ref_mb_v, ref_mb_err_v = _get_geodetic(gdir)
+        q_gl_this = _per_glacier_obs(gdir)
+        log.debug('(%s) area=%.2f km2  frac=%.4f  mean_Q=%.2f m3/s',
+                  gdir.rgi_id, gdir.rgi_area_km2,
+                  gdir.rgi_area_m2 / basin_total_area_m2,
+                  float(q_gl_this.mean()))
         try:
             res = mb_calibration_from_runoff(
                 gdir,
-                obs_glacier_discharge_m3s=obs_glacier_discharge_m3s,
+                obs_glacier_discharge_m3s=q_gl_this,
                 obs_years=obs_years,
                 ref_mb=ref_mb_v,
                 ref_mb_err=ref_mb_err_v,
@@ -2725,10 +2757,11 @@ def mb_calibration_basin_from_discharge(
         remaining = [g for g in gdirs if g.rgi_id not in rep_ids]
         for gdir in remaining:
             ref_mb_v, ref_mb_err_v = _get_geodetic(gdir)
+            q_gl_this = _per_glacier_obs(gdir)
             try:
                 mb_calibration_from_runoff(
                     gdir,
-                    obs_glacier_discharge_m3s=obs_glacier_discharge_m3s,
+                    obs_glacier_discharge_m3s=q_gl_this,
                     obs_years=obs_years,
                     ref_mb=ref_mb_v,
                     ref_mb_err=ref_mb_err_v,
