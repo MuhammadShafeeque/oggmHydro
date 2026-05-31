@@ -256,16 +256,26 @@ def _load_subbasins(hydrobasins_dir, level, bbox):
     return subbasins
 
 
-def _make_synthetic_obs(ys, ye, seed=0):
-    """Synthetic annual discharge for dry-run testing only."""
+def _make_synthetic_obs(ys, ye, seed=0, q_mean=420.0):
+    """Synthetic annual discharge for dry-run testing only.
+
+    Parameters
+    ----------
+    q_mean : float
+        Mean annual discharge [m³ s⁻¹].  Pass a model-derived estimate so
+        that the synthetic obs are at the right scale for the optimizer to
+        converge.  Default 420 m³ s⁻¹ (realistic for small basins only).
+    """
     log.warning(
         'No GRDC file provided — using SYNTHETIC discharge. '
         'Do NOT use for publication.'
     )
     rng = np.random.default_rng(seed)
     years = np.arange(ys, ye + 1)
-    q = 420.0 + 0.5 * (years - years.mean()) + rng.normal(0, 80, len(years))
-    q = np.maximum(q, 50.0)
+    trend = 0.005 * q_mean * (years - years.mean())
+    noise = rng.normal(0, 0.1 * q_mean, len(years))
+    q = q_mean + trend + noise
+    q = np.maximum(q, 10.0)
     return pd.DataFrame({'year': years, 'q_m3s': q})
 
 
@@ -323,6 +333,7 @@ def main():
     from oggm.core.hydrology import (
         calibrate_basin_water_balance,
         read_grdc_data,
+        _cache_basin_runoff_components,
     )
 
     # ---- Load data ----
@@ -339,7 +350,22 @@ def main():
     else:
         if args.grdc_file:
             log.warning('GRDC file not found: %s', args.grdc_file)
-        obs_df = _make_synthetic_obs(args.ys, args.ye, seed=args.seed)
+        # Estimate model-scale mean discharge so synthetic obs are realistic.
+        # We cache glacier runoff once here (calibrate_basin_water_balance()
+        # will cache it again internally — cheap given disk I/O dominates).
+        log.info('Estimating model-scale discharge for synthetic obs ...')
+        _cache = _cache_basin_runoff_components(
+            gdirs, filesuffix=args.filesuffix,
+            ys=args.ys, ye=args.ye)
+        # Glacier total: rain + snow + ice melt [m³ s⁻¹]
+        q_gl_mean = float(np.mean(
+            _cache['rain_m3s'] + _cache['snow_m3s'] + _cache['ice_m3s']))
+        # NGL contributes roughly 20-50%; use 1.3× as conservative estimate
+        q_mean_est = max(q_gl_mean * 1.3, 50.0)
+        log.info('  q_gl_mean=%.1f m³/s  → synthetic q_mean=%.1f m³/s',
+                 q_gl_mean, q_mean_est)
+        obs_df = _make_synthetic_obs(args.ys, args.ye,
+                                     seed=args.seed, q_mean=q_mean_est)
 
     # ---- Calibrate ----
     log.info('Starting calibrate_basin_water_balance() ...')
