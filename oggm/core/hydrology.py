@@ -2333,13 +2333,15 @@ def calibrate_basin_water_balance(
         for name, val in zip(params_to_calib, params_vec):
             p[name] = float(val)
 
-        k_rain = p['k_rain_months']
-        k_snow = p['k_snow_months']
-        k_ice = p['k_ice_months']
-        k_snow_ngl = p['k_snow_ngl']
-        k_soil = p['k_soil_months']
-        s_fc = p['s_fc_mm']
-        pf = p['basin_prcp_fac']
+        # Clamp to physically valid range — Nelder-Mead polish can wander
+        # outside the DE bounds, so guard here rather than relying on bounds.
+        k_rain = max(1e-4, p['k_rain_months'])
+        k_snow = max(1e-4, p['k_snow_months'])
+        k_ice = max(1e-4, p['k_ice_months'])
+        k_snow_ngl = max(1e-4, p['k_snow_ngl'])
+        k_soil = max(1e-4, p['k_soil_months'])
+        s_fc = max(0.0, p['s_fc_mm'])
+        pf = max(1e-4, p['basin_prcp_fac'])
 
         # Glacier routing (pre-cached arrays, O(N_years) ops)
         idx_gl = np.isin(model_years, eval_years)
@@ -2426,6 +2428,7 @@ def calibrate_basin_water_balance(
             lambda x: _cost(x, calib_years),
             result_de.x,
             method='Nelder-Mead',
+            bounds=bounds_list,
             options={'xatol': 0.01, 'fatol': 1e-3, 'maxiter': 500},
         )
         final_x = result_nm.x if result_nm.fun <= result_de.fun else result_de.x
