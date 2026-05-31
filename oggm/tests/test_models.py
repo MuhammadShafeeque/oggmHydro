@@ -7421,3 +7421,195 @@ class TestDistribute2D:
             ds_merged_monthly = ds
 
         assert len(ds_merged_monthly.time) == 25
+
+
+class TestBasinWaterBalanceCalibration:
+    """Tests for Phase 12 — calibrate_basin_water_balance() and helpers."""
+
+    def test_nse_and_pbias_metrics(self):
+        """Check _nash_sutcliffe_efficiency and _percent_bias values."""
+        from oggm.core.hydrology import (_nash_sutcliffe_efficiency,
+                                          _percent_bias)
+        # Perfect forecast
+        q = np.array([1.0, 2.0, 3.0, 4.0])
+        assert _nash_sutcliffe_efficiency(q, q) == pytest.approx(1.0)
+        assert _percent_bias(q, q) == pytest.approx(0.0)
+
+        # Mean forecast (NSE = 0 by definition)
+        q_mean = np.full_like(q, q.mean())
+        nse_mean = _nash_sutcliffe_efficiency(q_mean, q)
+        assert nse_mean == pytest.approx(0.0, abs=1e-10)
+
+        # Positive PBIAS: model underestimates
+        q_sim_low = q * 0.8
+        pbias_low = _percent_bias(q_sim_low, q)
+        assert pbias_low > 0
+
+        # NaN handling
+        assert _nash_sutcliffe_efficiency([np.nan], [1.0]) == -np.inf
+        assert np.isnan(_percent_bias([np.nan], [1.0]))
+
+    def test_grdc_reader_passthrough_dataframe(self):
+        """Passing a DataFrame returns it standardised."""
+        from oggm.core.hydrology import read_grdc_data
+        import pandas as _pd
+        df = _pd.DataFrame({'year': [2000, 2001, 2002],
+                            'q_m3s': [10.0, 20.0, 30.0]})
+        out = read_grdc_data(df, freq='annual')
+        assert list(out.columns) == ['year', 'q_m3s']
+        assert len(out) == 3
+        assert_allclose(out['q_m3s'].values, [10.0, 20.0, 30.0])
+
+    def test_grdc_reader_year_filter(self):
+        """Year slicing works correctly."""
+        from oggm.core.hydrology import read_grdc_data
+        import pandas as _pd
+        df = _pd.DataFrame({'year': list(range(2000, 2010)),
+                            'q_m3s': np.ones(10) * 5.0})
+        out = read_grdc_data(df, freq='annual', ys=2003, ye=2006)
+        assert out['year'].min() == 2003
+        assert out['year'].max() == 2006
+        assert len(out) == 4
+
+    def test_grdc_reader_column_synonyms(self):
+        """Common discharge column name synonyms are accepted."""
+        from oggm.core.hydrology import read_grdc_data
+        import pandas as _pd
+        df = _pd.DataFrame({'year': [2000, 2001],
+                            'discharge': [5.0, 6.0]})
+        out = read_grdc_data(df, freq='annual')
+        assert 'q_m3s' in out.columns
+
+    def test_linear_reservoir_routing(self):
+        """_linear_reservoir preserves mass in steady state."""
+        from oggm.core.hydrology import _linear_reservoir
+        q_in = np.ones(50) * 10.0
+        k = 2.0
+        q_out = _linear_reservoir(q_in, k=k, dt=1.0)
+        # After many steps, output should converge to input
+        assert_allclose(q_out[-1], q_in[-1], rtol=0.01)
+
+    def test_nse_perfect_fit(self):
+        """NSE = 1 when simulation equals observation."""
+        from oggm.core.hydrology import _nash_sutcliffe_efficiency
+        rng = np.random.default_rng(0)
+        q = rng.uniform(1, 100, 30)
+        assert _nash_sutcliffe_efficiency(q, q) == pytest.approx(1.0)
+
+    def test_kge_improves_with_calibrated_k(self):
+        """KGE with calibrated k should exceed KGE with default k."""
+        from oggm.core.hydrology import (_linear_reservoir,
+                                          _kling_gupta_efficiency)
+        rng = np.random.default_rng(1)
+        # True signal: routed with k=3
+        q_in = rng.uniform(5, 20, 40)
+        q_true = _linear_reservoir(q_in, k=3.0, dt=1.0)
+        # KGE with wrong k
+        q_wrong = _linear_reservoir(q_in, k=10.0, dt=1.0)
+        kge_wrong = _kling_gupta_efficiency(q_wrong, q_true)
+        # KGE with true k
+        kge_true = _kling_gupta_efficiency(q_true, q_true)
+        assert kge_true > kge_wrong
+
+
+class TestMBCalibrationFromRunoff:
+    """Tests for Phase 13 — compute_mb_runoff_fixed_geometry() and helpers."""
+
+    def test_linear_discharge_emulator_reference(self):
+        """Emulator returns reference discharge at reference parameters."""
+        from oggm.core.massbalance import _linear_discharge_emulator
+        rain = np.array([1.0, 2.0, 3.0])
+        snow = np.array([2.0, 3.0, 4.0])
+        ice = np.array([5.0, 6.0, 7.0])
+        melt_f_ref = 5.0
+        prcp_fac_ref = 2.5
+        q = _linear_discharge_emulator(
+            rain, snow, ice,
+            melt_f=melt_f_ref, melt_f_ref=melt_f_ref,
+            prcp_fac=prcp_fac_ref, prcp_fac_ref=prcp_fac_ref,
+            temp_bias_delta=0.0,
+        )
+        assert_allclose(q, rain + snow + ice)
+
+    def test_linear_discharge_emulator_melt_f_scaling(self):
+        """Doubling melt_f doubles ice component."""
+        from oggm.core.massbalance import _linear_discharge_emulator
+        rain = np.array([1.0])
+        snow = np.array([0.0])
+        ice = np.array([4.0])
+        q1 = _linear_discharge_emulator(
+            rain, snow, ice,
+            melt_f=5.0, melt_f_ref=5.0,
+            prcp_fac=2.5, prcp_fac_ref=2.5,
+        )
+        q2 = _linear_discharge_emulator(
+            rain, snow, ice,
+            melt_f=10.0, melt_f_ref=5.0,
+            prcp_fac=2.5, prcp_fac_ref=2.5,
+        )
+        # Ice component should double; rain unchanged
+        assert q2[0] > q1[0]
+        assert_allclose(q2[0] - q1[0], 4.0, rtol=0.01)  # ice doubles
+
+    def test_linear_discharge_emulator_prcp_fac_scaling(self):
+        """Doubling prcp_fac increases rain component proportionally."""
+        from oggm.core.massbalance import _linear_discharge_emulator
+        rain = np.array([2.0])
+        snow = np.array([0.0])
+        ice = np.array([0.0])
+        q1 = _linear_discharge_emulator(
+            rain, snow, ice,
+            melt_f=5.0, melt_f_ref=5.0,
+            prcp_fac=2.5, prcp_fac_ref=2.5,
+        )
+        q2 = _linear_discharge_emulator(
+            rain, snow, ice,
+            melt_f=5.0, melt_f_ref=5.0,
+            prcp_fac=5.0, prcp_fac_ref=2.5,
+        )
+        assert_allclose(q2[0], q1[0] * 2.0, rtol=0.01)
+
+    def test_compute_mb_runoff_fixed_geometry_hef(self, hef_gdir,
+                                                   inversion_params):
+        """Discharge from fixed geometry is positive and finite for HEF."""
+        from oggm.core.massbalance import (compute_mb_runoff_fixed_geometry,
+                                            MonthlyTIModel)
+        result = compute_mb_runoff_fixed_geometry(
+            hef_gdir,
+            melt_f=5.0,
+            prcp_fac=2.5,
+            temp_bias=0.0,
+            ys=1990,
+            ye=2000,
+            mb_model_class=MonthlyTIModel,
+        )
+        assert 'years' in result
+        assert len(result['years']) == 11
+        # At least some finite values
+        finite_q = np.isfinite(result['Q_total_m3s'])
+        assert finite_q.any()
+        # Discharge must be non-negative
+        assert np.all(result['Q_total_m3s'][finite_q] >= 0)
+        # Rain + snow + ice ≈ total (within numerical tolerance)
+        q_comp = (result['Q_rain_m3s'] + result['Q_snow_m3s'] +
+                  result['Q_ice_m3s'])
+        assert_allclose(q_comp[finite_q],
+                        result['Q_total_m3s'][finite_q], rtol=0.01)
+
+    def test_compute_mb_runoff_higher_melt_f_increases_discharge(
+            self, hef_gdir, inversion_params):
+        """Higher melt_f gives higher total runoff (all else equal)."""
+        from oggm.core.massbalance import (compute_mb_runoff_fixed_geometry,
+                                            MonthlyTIModel)
+        r_low = compute_mb_runoff_fixed_geometry(
+            hef_gdir, melt_f=3.0, prcp_fac=2.5, temp_bias=0.0,
+            ys=1995, ye=2005, mb_model_class=MonthlyTIModel)
+        r_high = compute_mb_runoff_fixed_geometry(
+            hef_gdir, melt_f=10.0, prcp_fac=2.5, temp_bias=0.0,
+            ys=1995, ye=2005, mb_model_class=MonthlyTIModel)
+        finite = np.isfinite(r_low['Q_total_m3s']) & np.isfinite(
+            r_high['Q_total_m3s'])
+        assert finite.any()
+        # Higher melt_f -> higher total discharge on average
+        assert np.nanmean(r_high['Q_total_m3s']) > np.nanmean(
+            r_low['Q_total_m3s'])

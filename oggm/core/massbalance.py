@@ -2658,3 +2658,488 @@ def compute_ela(gdir, ys=None, ye=None, years=None, climate_filename='climate_hi
 
     odf = pd.Series(data=ela, index=years)
     return odf
+
+
+# ===========================================================================
+# Phase 13 — Mass Balance Calibration from Discharge
+# ===========================================================================
+
+def compute_mb_runoff_fixed_geometry(
+    gdir,
+    melt_f,
+    prcp_fac,
+    temp_bias,
+    ys,
+    ye,
+    mb_model_class=MonthlyTIModel,
+):
+    """Compute annual glacier runoff from the MB model with fixed geometry.
+
+    Uses the *inversion_flowlines* (no ice dynamics) to evaluate annual
+    runoff for each year in [*ys*, *ye*].  This is approximately valid when
+    volume change over the calibration period is small (< 5 %).
+
+    Parameters
+    ----------
+    gdir : :class:`oggm.GlacierDirectory`
+    melt_f : float
+        Melt factor [kg m⁻² day⁻¹ K⁻¹].
+    prcp_fac : float
+        Precipitation correction factor (> 0).
+    temp_bias : float
+        Additive temperature bias [°C].
+    ys : int
+        First calibration year (inclusive).
+    ye : int
+        Last calibration year (inclusive).
+    mb_model_class : class
+        MB model class to use (default: :class:`MonthlyTIModel`).
+
+    Returns
+    -------
+    dict
+        Keys: ``'years'``, ``'Q_total_m3s'``, ``'Q_ice_m3s'``,
+        ``'Q_snow_m3s'``, ``'Q_rain_m3s'``, ``'B_specific_mm_yr'``.
+
+    Notes
+    -----
+    Runoff per elevation band is computed as::
+
+        runoff = melt + liquid_rain
+        melt   = monthly_melt_f * sum_months(T_above_melt)
+        rain   = sum_months(prcp_total - prcp_solid)
+
+    Melt is split into snowmelt vs ice melt by comparing annual melt to the
+    annual solid precipitation (a rough SWE proxy):
+
+    * ``ice_melt = max(0, melt - SWE)``
+    * ``snow_melt = melt - ice_melt``
+    """
+    # Load fixed inversion flowlines
+    fls = gdir.read_pickle('inversion_flowlines')
+
+    # Instantiate MB model with specified parameters at fixed geometry
+    mbm = mb_model_class(
+        gdir,
+        melt_f=melt_f,
+        prcp_fac=prcp_fac,
+        temp_bias=temp_bias,
+        check_calib_params=False,
+        ys=ys, ye=ye,
+    )
+
+    _SEC_IN_YEAR = SEC_IN_YEAR
+
+    # Concatenate heights and areas from all flowlines
+    all_heights = np.concatenate([fl.surface_h for fl in fls])
+    all_areas = np.concatenate(
+        [fl.widths_m * fl.dx_meter for fl in fls])   # m2
+    total_area_m2 = all_areas.sum()
+    if total_area_m2 <= 0:
+        raise ValueError(
+            f'({gdir.rgi_id}) Inversion flowlines have zero area.'
+        )
+
+    years = np.arange(int(ys), int(ye) + 1)
+    n = len(years)
+    Q_total = np.full(n, np.nan)
+    Q_rain = np.full(n, np.nan)
+    Q_snow = np.full(n, np.nan)
+    Q_ice = np.full(n, np.nan)
+    B_spec = np.full(n, np.nan)
+
+    rho_water = 1000.0  # kg m-3
+
+    for i_yr, yr in enumerate(years):
+        try:
+            # _get_2d_annual_climate returns shape (n_heights, 12)
+            _, t2dformelt, prcp2d, prcpsol2d = mbm._get_2d_annual_climate(
+                all_heights, float(yr))
+        except ValueError:
+            continue  # year outside valid climate range
+
+        # Annual sums per elevation band [kg m-2 yr-1]
+        accum_band = prcpsol2d.sum(axis=1)                       # solid precip
+        melt_band = mbm.monthly_melt_f * t2dformelt.sum(axis=1)  # total melt
+        rain_band = np.maximum((prcp2d - prcpsol2d).sum(axis=1), 0.0)  # rain
+
+        # Approximate ice/snow melt split
+        swe_band = np.maximum(accum_band, 0.0)
+        ice_melt_band = np.maximum(melt_band - swe_band, 0.0)
+        snow_melt_band = melt_band - ice_melt_band
+
+        # Total runoff per band [kg m-2 yr-1] x area [m2] -> [kg yr-1]
+        def _band_to_m3s(rate_band):
+            return (rate_band * all_areas).sum() / rho_water / _SEC_IN_YEAR
+
+        Q_total[i_yr] = _band_to_m3s(melt_band + rain_band)
+        Q_rain[i_yr] = _band_to_m3s(rain_band)
+        Q_snow[i_yr] = _band_to_m3s(snow_melt_band)
+        Q_ice[i_yr] = _band_to_m3s(ice_melt_band)
+
+        # Specific MB [kg m-2 yr-1]
+        net_mb_band = (accum_band - melt_band) * all_areas  # [kg yr-1]
+        B_spec[i_yr] = net_mb_band.sum() / total_area_m2    # [kg m-2 yr-1]
+
+    return {
+        'years': years,
+        'Q_total_m3s': Q_total,
+        'Q_ice_m3s': Q_ice,
+        'Q_snow_m3s': Q_snow,
+        'Q_rain_m3s': Q_rain,
+        'B_specific_mm_yr': B_spec,
+    }
+
+
+def _linear_discharge_emulator(rain_ref, snow_ref, ice_ref,
+                                melt_f, melt_f_ref,
+                                prcp_fac, prcp_fac_ref,
+                                temp_bias_delta=0.0):
+    """Fast analytical discharge approximation for parameter-space screening.
+
+    Approximates how glacier discharge changes relative to a reference run
+    (from Phase 10) when MB parameters are perturbed.  Uses first-order
+    Taylor expansions:
+
+    * Rain scales linearly with *prcp_fac*.
+    * Ice melt scales linearly with *melt_f*.
+    * Snow melt uses a first-order approximation in *prcp_fac* and
+      *temp_bias_delta*.
+
+    Parameters
+    ----------
+    rain_ref : array-like
+        Reference annual rain discharge [m³ s⁻¹].
+    snow_ref : array-like
+        Reference annual snowmelt discharge [m³ s⁻¹].
+    ice_ref : array-like
+        Reference annual ice-melt discharge [m³ s⁻¹].
+    melt_f : float
+        New melt factor.
+    melt_f_ref : float
+        Reference melt factor used for *ice_ref*.
+    prcp_fac : float
+        New precipitation factor.
+    prcp_fac_ref : float
+        Reference precipitation factor used for *rain_ref* and *snow_ref*.
+    temp_bias_delta : float
+        Change in temperature bias relative to the reference run [°C].
+
+    Returns
+    -------
+    np.ndarray
+        Estimated total glacier discharge [m³ s⁻¹] for each time step.
+    """
+    rain_ref = np.asarray(rain_ref, dtype=float)
+    snow_ref = np.asarray(snow_ref, dtype=float)
+    ice_ref = np.asarray(ice_ref, dtype=float)
+
+    Q_rain = (prcp_fac / prcp_fac_ref) * rain_ref
+    Q_ice = (melt_f / melt_f_ref) * ice_ref
+    # Snow: responds to both prcp_fac (via SWE) and temp_bias (via melt)
+    Q_snow = snow_ref * (
+        1.0
+        + 0.5 * (prcp_fac / prcp_fac_ref - 1.0)
+        - 0.3 * temp_bias_delta
+    )
+    Q_snow = np.maximum(Q_snow, 0.0)
+    return Q_rain + Q_snow + Q_ice
+
+
+@entity_task(log, writes=['mb_calib'])
+def mb_calibration_from_runoff(
+    gdir,
+    obs_glacier_discharge_m3s,
+    obs_years,
+    ref_mb=None,
+    ref_mb_err=None,
+    ref_mb_period=None,
+    w_mb=0.6,
+    w_Q=0.4,
+    calibrate_params=('prcp_fac', 'melt_f'),
+    melt_f=None, melt_f_min=None, melt_f_max=None,
+    prcp_fac=None, prcp_fac_min=None, prcp_fac_max=None,
+    temp_bias=None, temp_bias_min=None, temp_bias_max=None,
+    use_fixed_geometry=True,
+    mb_model_class=MonthlyTIModel,
+    filesuffix='',
+    overwrite_gdir=False,
+):
+    """Calibrate MB parameters against both geodetic MB and glacier discharge.
+
+    Extends the standard geodetic calibration by adding observed glacier
+    discharge as a second constraint.  This is particularly useful in
+    heavily glacierized basins (e.g. Karakoram) where *prcp_fac* and
+    *melt_f* are poorly constrained by geodetic MB alone.
+
+    Requires :func:`mb_calibration_from_geodetic_mb` to have been run first
+    (reads the existing ``mb_calib.json`` as a starting point).
+
+    Parameters
+    ----------
+    gdir : :class:`oggm.GlacierDirectory`
+    obs_glacier_discharge_m3s : array-like
+        Observed glacier-only annual discharge [m³ s⁻¹].
+    obs_years : array-like of int
+        Calendar years for *obs_glacier_discharge_m3s*.
+    ref_mb : float, optional
+        Geodetic mass balance constraint [kg m⁻² yr⁻¹].  If *None*, the
+        value from Hugonnet et al. 2021 is used automatically.
+    ref_mb_err : float, optional
+        Uncertainty on *ref_mb* [kg m⁻² yr⁻¹].
+    ref_mb_period : str, optional
+        Geodetic MB reference period (e.g. ``'2000-01-01_2020-01-01'``).
+    w_mb : float
+        Weight for the geodetic MB term in the joint cost function (default: 0.6).
+    w_Q : float
+        Weight for the discharge KGE term (default: 0.4).
+    calibrate_params : tuple of str
+        Which MB parameters to vary.  Any subset of
+        ``('melt_f', 'prcp_fac', 'temp_bias')``.
+    melt_f, prcp_fac, temp_bias : float, optional
+        Fixed values (when not in *calibrate_params*).  Defaults to the
+        previously calibrated values.
+    melt_f_min/max, prcp_fac_min/max, temp_bias_min/max : float, optional
+        Override parameter bounds.
+    use_fixed_geometry : bool
+        Use inversion flowlines (fast) rather than ``run_with_hydro``
+        (default: ``True``).
+    mb_model_class : class
+        MB model class (default: :class:`MonthlyTIModel`).
+    filesuffix : str
+        Filesuffix for ``mb_calib.json``.
+    overwrite_gdir : bool
+        If ``False`` (default), skip if already discharge-calibrated.
+
+    Returns
+    -------
+    dict
+        Updated MB calibration parameters written to ``mb_calib.json``.
+
+    Raises
+    ------
+    :class:`oggm.exceptions.InvalidWorkflowError`
+        If no ``mb_calib.json`` exists (geodetic calibration must run first).
+    ImportError
+        If :mod:`scipy` is not installed.
+    """
+    try:
+        from scipy.optimize import differential_evolution, minimize
+    except ImportError as exc:
+        raise ImportError(
+            'scipy is required for mb_calibration_from_runoff(). '
+            'Install with: conda install scipy'
+        ) from exc
+    from oggm.utils import get_geodetic_mb_dataframe
+
+    obs_glacier_discharge_m3s = np.asarray(obs_glacier_discharge_m3s,
+                                            dtype=float)
+    obs_years = np.asarray(obs_years, dtype=int)
+    ys = int(obs_years.min())
+    ye = int(obs_years.max())
+
+    # Skip if already calibrated and overwrite not requested
+    if not overwrite_gdir:
+        try:
+            existing = gdir.read_json('mb_calib', filesuffix=filesuffix)
+            if existing.get('discharge_calibrated', False):
+                log.info(
+                    '(%s) mb_calibration_from_runoff: already calibrated '
+                    '(overwrite_gdir=False)', gdir.rgi_id)
+                return existing
+        except FileNotFoundError:
+            pass
+
+    # Load previously calibrated parameters as starting point
+    try:
+        calib_params = gdir.read_json('mb_calib', filesuffix=filesuffix)
+    except FileNotFoundError:
+        raise InvalidWorkflowError(
+            f'({gdir.rgi_id}) mb_calib.json not found. '
+            'Run mb_calibration_from_geodetic_mb() first.'
+        )
+
+    melt_f_ref = float(calib_params.get('melt_f',
+                                         cfg.PARAMS.get('melt_f', 5.0)))
+    prcp_fac_ref = float(calib_params.get('prcp_fac',
+                                           cfg.PARAMS.get('prcp_fac', 2.5)))
+    temp_bias_ref = float(calib_params.get('temp_bias', 0.0))
+
+    # Auto-fetch geodetic MB constraint if not provided
+    if ref_mb is None:
+        if ref_mb_period is None:
+            ref_mb_period = cfg.PARAMS.get('geodetic_mb_period',
+                                            '2000-01-01_2020-01-01')
+        try:
+            gdf = get_geodetic_mb_dataframe().loc[gdir.rgi_id]
+            gdf = gdf.loc[gdf['period'] == ref_mb_period]
+            ref_mb = float(gdf['dmdtda'].iloc[0] * 1000)
+            ref_mb_err = float(gdf['err_dmdtda'].iloc[0] * 1000)
+        except (KeyError, IndexError):
+            ref_mb = None
+            ref_mb_err = None
+
+    # Parameter bounds
+    mf_min = float(melt_f_min if melt_f_min is not None
+                   else cfg.PARAMS.get('melt_f_min', 1.0))
+    mf_max = float(melt_f_max if melt_f_max is not None
+                   else cfg.PARAMS.get('melt_f_max', 1000.0))
+    pf_min = float(prcp_fac_min if prcp_fac_min is not None
+                   else cfg.PARAMS.get('prcp_fac_min', 0.1))
+    pf_max = float(prcp_fac_max if prcp_fac_max is not None
+                   else cfg.PARAMS.get('prcp_fac_max', 10.0))
+    tb_min = float(temp_bias_min if temp_bias_min is not None else -5.0)
+    tb_max = float(temp_bias_max if temp_bias_max is not None else 5.0)
+
+    bounds_map = {
+        'melt_f': (mf_min, mf_max),
+        'prcp_fac': (pf_min, pf_max),
+        'temp_bias': (tb_min, tb_max),
+    }
+    fixed_params = {
+        'melt_f': float(melt_f if melt_f is not None else melt_f_ref),
+        'prcp_fac': float(prcp_fac if prcp_fac is not None else prcp_fac_ref),
+        'temp_bias': float(temp_bias if temp_bias is not None else temp_bias_ref),
+    }
+
+    params_to_calib = [p for p in calibrate_params if p in bounds_map]
+    bounds_list = [bounds_map[p] for p in params_to_calib]
+
+    # Import KGE from hydrology module
+    from oggm.core.hydrology import _kling_gupta_efficiency as _kge_fn
+
+    def _compute_cost(params_vec):
+        p = dict(fixed_params)
+        for name, val in zip(params_to_calib, params_vec):
+            p[name] = float(val)
+
+        try:
+            runoff_dict = compute_mb_runoff_fixed_geometry(
+                gdir,
+                melt_f=p['melt_f'],
+                prcp_fac=p['prcp_fac'],
+                temp_bias=p['temp_bias'],
+                ys=ys, ye=ye,
+                mb_model_class=mb_model_class,
+            )
+        except Exception:
+            return 2.0
+
+        sim_years = runoff_dict['years']
+        q_sim = runoff_dict['Q_total_m3s']
+        B_sim = runoff_dict['B_specific_mm_yr']
+
+        # Align with observations
+        common = np.intersect1d(obs_years, sim_years)
+        if len(common) < 2:
+            return 2.0
+        obs_mask = np.isin(obs_years, common)
+        sim_mask = np.isin(sim_years, common)
+        q_obs_al = obs_glacier_discharge_m3s[obs_mask]
+        q_sim_al = q_sim[sim_mask]
+        finite = np.isfinite(q_obs_al) & np.isfinite(q_sim_al)
+        if finite.sum() < 2:
+            return 2.0
+
+        kge_q = _kge_fn(q_sim_al[finite], q_obs_al[finite])
+        J_q = w_Q * (1.0 - kge_q)
+
+        # MB term
+        J_mb = 0.0
+        if ref_mb is not None and np.isfinite(ref_mb):
+            b_sim_mean = float(np.nanmean(B_sim[sim_mask]))
+            sigma_b = (float(ref_mb_err)
+                       if (ref_mb_err is not None and np.isfinite(ref_mb_err))
+                       else abs(float(ref_mb)) * 0.3)
+            if sigma_b > 0:
+                J_mb = w_mb * ((b_sim_mean - float(ref_mb)) / sigma_b) ** 2
+
+        return J_q + J_mb
+
+    # Optimise
+    x0 = np.array([fixed_params[p] for p in params_to_calib])
+    max_iter = int(cfg.PARAMS.get('mbc_max_iter', 1000))
+
+    if len(params_to_calib) > 0:
+        res_de = differential_evolution(
+            _compute_cost,
+            bounds=bounds_list,
+            seed=42,
+            maxiter=max(1, max_iter // 10),
+            tol=1e-3,
+            mutation=(0.5, 1.5),
+            recombination=0.7,
+            popsize=8,
+            workers=1,
+        )
+        res_nm = minimize(
+            _compute_cost,
+            res_de.x,
+            method='Nelder-Mead',
+            options={'xatol': 0.01, 'fatol': 1e-4,
+                     'maxiter': max_iter},
+        )
+        final_x = res_nm.x if res_nm.fun <= res_de.fun else res_de.x
+        converged = bool(res_nm.success)
+    else:
+        final_x = x0
+        converged = True
+
+    # Build final params
+    final_p = dict(fixed_params)
+    for name, val in zip(params_to_calib, final_x):
+        final_p[name] = float(np.clip(val, *bounds_map[name]))
+
+    # Evaluate final metrics
+    try:
+        rf = compute_mb_runoff_fixed_geometry(
+            gdir,
+            melt_f=final_p['melt_f'],
+            prcp_fac=final_p['prcp_fac'],
+            temp_bias=final_p['temp_bias'],
+            ys=ys, ye=ye,
+            mb_model_class=mb_model_class,
+        )
+        common = np.intersect1d(obs_years, rf['years'])
+        obs_mask = np.isin(obs_years, common)
+        sim_mask = np.isin(rf['years'], common)
+        q_obs_f = obs_glacier_discharge_m3s[obs_mask]
+        q_sim_f = rf['Q_total_m3s'][sim_mask]
+        finite_f = np.isfinite(q_obs_f) & np.isfinite(q_sim_f)
+        kge_final = (float(_kge_fn(q_sim_f[finite_f], q_obs_f[finite_f]))
+                     if finite_f.sum() >= 2 else np.nan)
+        b_sim_mean = float(np.nanmean(rf['B_specific_mm_yr'][sim_mask]))
+    except Exception:
+        kge_final = np.nan
+        b_sim_mean = np.nan
+
+    # Update and write calibrated params
+    updated = dict(calib_params)
+    updated['melt_f'] = final_p['melt_f']
+    updated['prcp_fac'] = final_p['prcp_fac']
+    updated['temp_bias'] = final_p['temp_bias']
+    updated['discharge_calibrated'] = True
+    updated['melt_f_ref'] = melt_f_ref
+    updated['prcp_fac_ref'] = prcp_fac_ref
+    updated['temp_bias_ref'] = temp_bias_ref
+    updated['melt_f_delta'] = final_p['melt_f'] - melt_f_ref
+    updated['prcp_fac_delta'] = final_p['prcp_fac'] - prcp_fac_ref
+    updated['kge_discharge'] = kge_final
+    updated['B_sim_mean_mm_yr'] = b_sim_mean
+    updated['B_obs_mm_yr'] = float(ref_mb) if ref_mb is not None else None
+    updated['w_mb'] = float(w_mb)
+    updated['w_Q'] = float(w_Q)
+    updated['discharge_calib_params'] = list(params_to_calib)
+    updated['discharge_calib_converged'] = converged
+
+    gdir.write_json(updated, 'mb_calib', filesuffix=filesuffix)
+
+    log.info(
+        '(%s) mb_calibration_from_runoff: KGE=%.3f  '
+        'melt_f %.2f->%.2f  prcp_fac %.2f->%.2f  temp_bias %.2f->%.2f',
+        gdir.rgi_id, kge_final,
+        melt_f_ref, final_p['melt_f'],
+        prcp_fac_ref, final_p['prcp_fac'],
+        temp_bias_ref, final_p['temp_bias'],
+    )
+    return updated
