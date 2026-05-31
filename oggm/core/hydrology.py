@@ -1143,7 +1143,8 @@ def extract_subbasin_climate(gdirs, subbasins_gdf, ys=None, ye=None):
 
     if has_gpd and hasattr(subbasins_gdf, 'geometry') and (
             subbasins_gdf.geometry is not None):
-        ctr = subbasins_gdf.geometry.centroid
+        ctr = subbasins_gdf.geometry.to_crs('EPSG:6933').centroid.to_crs(
+            subbasins_gdf.crs)
         sub_lons = ctr.x.values
         sub_lats = ctr.y.values
     elif ('centroid_lon' in subbasins_gdf.columns and
