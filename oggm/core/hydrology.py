@@ -1318,6 +1318,64 @@ def _run_two_bucket_model(t_celsius, prcp_mm, temp_threshold=0.0,
     return q_mm, swe, s_soil
 
 
+def _run_two_bucket_model_batch(T, P, temp_threshold=0.0,
+                                k_snow_months=2.0, k_soil_months=3.0,
+                                s_fc_mm=150.0, dt_months=1.0):
+    """Vectorized two-bucket model for all sub-basins simultaneously.
+
+    Equivalent to calling _run_two_bucket_model per row of T/P, but runs
+    the time loop once over all basins using NumPy array operations.
+    ~100× faster than the per-basin Python loop for the optimizer hot path.
+
+    Parameters
+    ----------
+    T : np.ndarray, shape (n_basins, n_time)
+        Monthly mean temperature [°C] per sub-basin.
+    P : np.ndarray, shape (n_basins, n_time)
+        Monthly precipitation [mm] per sub-basin.
+    Other params: same as _run_two_bucket_model.
+
+    Returns
+    -------
+    q_mm : np.ndarray, shape (n_basins, n_time)
+    swe  : np.ndarray, shape (n_basins, n_time)
+    s_soil : np.ndarray, shape (n_basins, n_time)
+    """
+    n_basins, n_time = T.shape
+
+    f_rain = 1.0 / (1.0 + np.exp(-4.0 * (T - temp_threshold)))
+    p_rain = P * f_rain
+    p_snow = P * (1.0 - f_rain)
+    pet_all = np.maximum(0.0, 0.55 * (T - temp_threshold))
+
+    alpha_snow = np.exp(-dt_months / k_snow_months)
+    k_eff_soil = 1.0 - np.exp(-dt_months / k_soil_months)
+
+    q_mm = np.zeros((n_basins, n_time), dtype=float)
+    swe_out = np.zeros((n_basins, n_time), dtype=float)
+    s_soil_out = np.zeros((n_basins, n_time), dtype=float)
+
+    swe_state = np.zeros(n_basins, dtype=float)
+    soil_state = np.full(n_basins, s_fc_mm, dtype=float)
+
+    for i in range(n_time):
+        melt = swe_state * (1.0 - alpha_snow)
+        swe_state = np.maximum(0.0, swe_state * alpha_snow + p_snow[:, i])
+
+        inflow = p_rain[:, i] + melt
+        avail = soil_state + inflow
+        et = np.minimum(pet_all[:, i], avail)
+        soil_pre = avail - et
+        q_i = np.maximum(0.0, k_eff_soil * (soil_pre - s_fc_mm))
+        soil_state = np.maximum(0.0, soil_pre - q_i)
+
+        swe_out[:, i] = swe_state
+        s_soil_out[:, i] = soil_state
+        q_mm[:, i] = q_i
+
+    return q_mm, swe_out, s_soil_out
+
+
 # ---------------------------------------------------------------------------
 # Non-glaciated runoff — per-subbasin function (not an entity_task)
 # ---------------------------------------------------------------------------
@@ -1445,46 +1503,53 @@ def compute_nonglaciated_runoff(subbasins_gdf, climate_ds,
     swe_all = np.zeros((n_basins, n_time), dtype=float)
     s_soil_all = np.zeros((n_basins, n_time), dtype=float)
 
-    for i_b in range(n_basins):
-        hid = int(hybas_ids[i_b])
-
-        if _is_dict_climate:
-            # Per-subbasin climate dict — preferred spatial mode
-            clim_b = climate_ds.get(hid)
-            if clim_b is None:
-                # Fall back to first available entry for missing sub-basins
-                clim_b = climate_ds[first_key]
-            t_series = clim_b['temp'].values.ravel()
-            p_series = clim_b['prcp'].values.ravel()
-        elif has_spatial and has_centroids:
-            lon_c = float(subbasins_gdf['centroid_lon'].iloc[i_b])
-            lat_c = float(subbasins_gdf['centroid_lat'].iloc[i_b])
-            t_series = climate_ds['temp'].sel(
-                lat=lat_c, lon=lon_c, method='nearest').values
-            p_series = climate_ds['prcp'].sel(
-                lat=lat_c, lon=lon_c, method='nearest').values
-        else:
-            # Single time series (e.g. from a point forcing)
-            t_series = climate_ds['temp'].values.ravel()
-            p_series = climate_ds['prcp'].values.ravel()
-            if len(t_series) != n_time:
-                raise ValueError(
-                    f'climate_ds temp has {len(t_series)} timesteps but '
-                    f'time coordinate has {n_time}.'
-                )
-
-        q_mm, swe, s_soil = _run_two_bucket_model(
-            t_celsius=t_series,
-            prcp_mm=p_series,
+    if _is_dict_climate:
+        # Fast vectorised path: stack all sub-basin climate into (n_basins, n_time)
+        # matrices and run the time loop once for all basins simultaneously.
+        T_mat = np.zeros((n_basins, n_time), dtype=float)
+        P_mat = np.zeros((n_basins, n_time), dtype=float)
+        for i_b in range(n_basins):
+            hid = int(hybas_ids[i_b])
+            clim_b = climate_ds.get(hid, climate_ds[first_key])
+            T_mat[i_b] = clim_b['temp'].values.ravel()
+            P_mat[i_b] = clim_b['prcp'].values.ravel()
+        q_mm_all, swe_all, s_soil_all = _run_two_bucket_model_batch(
+            T_mat, P_mat,
             temp_threshold=temp_threshold,
             k_snow_months=k_snow_months,
             k_soil_months=k_soil_months,
             s_fc_mm=s_fc_mm,
             dt_months=1.0,
         )
-        q_mm_all[i_b] = q_mm
-        swe_all[i_b] = swe
-        s_soil_all[i_b] = s_soil
+    else:
+        for i_b in range(n_basins):
+            if has_spatial and has_centroids:
+                lon_c = float(subbasins_gdf['centroid_lon'].iloc[i_b])
+                lat_c = float(subbasins_gdf['centroid_lat'].iloc[i_b])
+                t_series = climate_ds['temp'].sel(
+                    lat=lat_c, lon=lon_c, method='nearest').values
+                p_series = climate_ds['prcp'].sel(
+                    lat=lat_c, lon=lon_c, method='nearest').values
+            else:
+                t_series = climate_ds['temp'].values.ravel()
+                p_series = climate_ds['prcp'].values.ravel()
+                if len(t_series) != n_time:
+                    raise ValueError(
+                        f'climate_ds temp has {len(t_series)} timesteps but '
+                        f'time coordinate has {n_time}.'
+                    )
+            q_mm, swe, s_soil = _run_two_bucket_model(
+                t_celsius=t_series,
+                prcp_mm=p_series,
+                temp_threshold=temp_threshold,
+                k_snow_months=k_snow_months,
+                k_soil_months=k_soil_months,
+                s_fc_mm=s_fc_mm,
+                dt_months=1.0,
+            )
+            q_mm_all[i_b] = q_mm
+            swe_all[i_b] = swe
+            s_soil_all[i_b] = s_soil
 
     # Convert runoff depth [mm month-1] → volumetric discharge [m3 s-1]
     # Use non-glaciated area (not total SUB_AREA) so glacier-covered fraction
