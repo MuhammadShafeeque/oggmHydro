@@ -2055,7 +2055,8 @@ def read_grdc_data(filepath_or_df, station_id=None, freq='annual',
     return df
 
 
-def _cache_basin_runoff_components(gdirs, filesuffix='', ys=None, ye=None):
+def _cache_basin_runoff_components(gdirs, filesuffix='', ys=None, ye=None,
+                                   n_workers=8):
     """Pre-compute basin-level annual runoff component sums from model output.
 
     Reads rain, snowmelt, and ice-melt annual timeseries from each glacier's
@@ -2071,6 +2072,9 @@ def _cache_basin_runoff_components(gdirs, filesuffix='', ys=None, ye=None):
         Start year for the cache period (inclusive).
     ye : int or None
         End year for the cache period (inclusive).
+    n_workers : int
+        Number of parallel threads for reading NC files (default: 8).
+        Set to 1 to disable threading (useful for debugging).
 
     Returns
     -------
@@ -2080,34 +2084,27 @@ def _cache_basin_runoff_components(gdirs, filesuffix='', ys=None, ye=None):
         ``'snow_m3s'`` — np.ndarray [m³ s⁻¹] basin-total snowmelt
         ``'ice_m3s'``  — np.ndarray [m³ s⁻¹] basin-total ice melt
     """
-    rain_total = None
-    snow_total = None
-    ice_total = None
-    years_ref = None
+    from concurrent.futures import ThreadPoolExecutor
 
-    for gdir in gdirs:
+    def _read_one(gdir):
         try:
             fpath = gdir.get_filepath('model_diagnostics', filesuffix=filesuffix)
         except Exception:
-            continue
+            return None
         if not os.path.isfile(fpath):
-            continue
-
+            return None
         try:
             with xr.open_dataset(fpath) as ds:
                 time_vals = ds['time'].values
                 years_arr = _extract_model_years(time_vals)
-
                 if ('icemelt_on_glacier' in ds and
                         'snowmelt_on_glacier' in ds):
-                    # Phase 5+ variables available
                     rain_kgyr = (ds['liq_prcp_on_glacier'].values +
                                  ds['liq_prcp_off_glacier'].values)
                     snow_kgyr = (ds['snowmelt_on_glacier'].values +
                                  ds['melt_off_glacier'].values)
                     ice_kgyr = ds['icemelt_on_glacier'].values
                 else:
-                    # Legacy: only total melt
                     rain_kgyr = (ds['liq_prcp_on_glacier'].values +
                                  ds['liq_prcp_off_glacier'].values)
                     melt_kgyr = (ds['melt_on_glacier'].values +
@@ -2117,31 +2114,44 @@ def _cache_basin_runoff_components(gdirs, filesuffix='', ys=None, ye=None):
         except Exception as e:
             log.warning('_cache_basin_runoff_components: skipping %s: %s',
                         gdir.rgi_id, e)
-            continue
+            return None
 
         valid = ~np.isnan(rain_kgyr + snow_kgyr + ice_kgyr)
         yr_valid = years_arr[valid]
-
-        # Apply year filter
         mask = np.ones(len(yr_valid), dtype=bool)
         if ys is not None:
             mask &= yr_valid >= int(ys)
         if ye is not None:
             mask &= yr_valid <= int(ye)
-        yr_filtered = yr_valid[mask]
-
-        # Unit conversion: kg yr-1 → m3 s-1
+        yr_f = yr_valid[mask]
         rain_m3s = rain_kgyr[valid][mask] / _RHO_WATER / _SEC_PER_YEAR
         snow_m3s = snow_kgyr[valid][mask] / _RHO_WATER / _SEC_PER_YEAR
         ice_m3s = ice_kgyr[valid][mask] / _RHO_WATER / _SEC_PER_YEAR
+        return (yr_f, rain_m3s, snow_m3s, ice_m3s)
 
+    # --- parallel read ---
+    actual_workers = min(n_workers, len(gdirs)) if n_workers > 1 else 1
+    if actual_workers > 1:
+        with ThreadPoolExecutor(max_workers=actual_workers) as pool:
+            results = list(pool.map(_read_one, gdirs))
+    else:
+        results = [_read_one(g) for g in gdirs]
+
+    # --- sequential accumulation ---
+    rain_total = None
+    snow_total = None
+    ice_total = None
+    years_ref = None
+
+    for res in results:
+        if res is None:
+            continue
+        yr_filtered, rain_m3s, snow_m3s, ice_m3s = res
         if years_ref is None:
             years_ref = yr_filtered
             rain_total = np.zeros_like(rain_m3s)
             snow_total = np.zeros_like(snow_m3s)
             ice_total = np.zeros_like(ice_m3s)
-
-        # Accumulate over common years
         common = np.intersect1d(years_ref, yr_filtered)
         if len(common) == 0:
             continue

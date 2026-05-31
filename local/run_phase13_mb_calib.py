@@ -147,14 +147,29 @@ def parse_args():
 def _setup_logging(output_dir):
     os.makedirs(output_dir, exist_ok=True)
     log_path = os.path.join(output_dir, 'phase13_mb_calib.log')
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s %(levelname)s %(name)s  %(message)s',
+    # Attach handlers directly to the __main__ logger (not root) so that
+    # cfg.initialize(logging_level='WARNING') cannot suppress our INFO messages.
+    fmt = logging.Formatter(
+        '%(asctime)s %(levelname)s %(name)s  %(message)s',
         datefmt='%H:%M:%S',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_path, mode='w'),
-        ],
+    )
+    h_stream = logging.StreamHandler(sys.stdout)
+    h_stream.setFormatter(fmt)
+    h_file = logging.FileHandler(log_path, mode='w')
+    h_file.setFormatter(fmt)
+
+    main_log = logging.getLogger(__name__)
+    main_log.setLevel(logging.INFO)
+    main_log.addHandler(h_stream)
+    main_log.addHandler(h_file)
+    main_log.propagate = False  # Don't let root-logger level changes suppress us
+
+    # Also configure the root logger so OGGM's own messages appear in stdout.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s: %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        stream=sys.stdout,
     )
     return log_path
 
@@ -494,7 +509,8 @@ def main():
     # ---- Load glacier dirs ----
     # Phase 13 reads from Phase 10 workdir; rgi_ids.npy may be in Phase 12 output dir
     phase12_dir = os.path.dirname(args.phase12_json) if args.phase12_json else args.output_dir
-    gdirs = _load_gdirs(args.workdir, phase12_dir, filesuffix=args.model_filesuffix)
+    gdirs = _load_gdirs(args.workdir, phase12_dir, filesuffix=args.model_filesuffix,
+                        representative_frac=args.representative_frac)
 
     # ---- Load subbasins (needed for residual method and synthetic obs) ----
     from oggm import cfg
