@@ -360,10 +360,21 @@ def main():
         # Glacier total: rain + snow + ice melt [m³ s⁻¹]
         q_gl_mean = float(np.mean(
             _cache['rain_m3s'] + _cache['snow_m3s'] + _cache['ice_m3s']))
-        # NGL contributes roughly 20-50%; use 1.3× as conservative estimate
-        q_mean_est = max(q_gl_mean * 1.3, 50.0)
-        log.info('  q_gl_mean=%.1f m³/s  → synthetic q_mean=%.1f m³/s',
-                 q_gl_mean, q_mean_est)
+        # Estimate NGL fraction of total basin area (for area correction)
+        # so synthetic obs match the corrected model total, not raw model total
+        from oggm.shop.hydrobasins import get_hydrobasins as _ghb
+        _subs = subbasins  # already loaded
+        _total_km2 = float(_subs['SUB_AREA'].sum())
+        _gl_km2 = float(sum(g.rgi_area_km2 for g in gdirs))
+        _ngl_frac = max(0.0, min(1.0, 1.0 - _gl_km2 / max(_total_km2, 1.0)))
+        # NGL contribution estimated from two-bucket model capacity.
+        # Use conservative 200 mm/yr × non-glaciated area as NGL term.
+        _ngl_mean = 200e-3 * _ngl_frac * _total_km2 * 1e6 / (365.25 * 24 * 3600)
+        q_mean_est = max(q_gl_mean + _ngl_mean, 50.0)
+        log.info(
+            '  q_gl_mean=%.1f m³/s  q_ngl_est=%.1f m³/s  '
+            '→ synthetic q_mean=%.1f m³/s  (NGL_frac=%.0f%%)',
+            q_gl_mean, _ngl_mean, q_mean_est, _ngl_frac * 100)
         obs_df = _make_synthetic_obs(args.ys, args.ye,
                                      seed=args.seed, q_mean=q_mean_est)
 

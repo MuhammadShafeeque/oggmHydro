@@ -2380,6 +2380,26 @@ def calibrate_basin_water_balance(
         'basin_prcp_fac': 1.0,
     }
 
+    # ---- Non-glaciated area per sub-basin ----
+    # The NGL two-bucket model must use only the non-glaciated fraction of
+    # each sub-basin.  Using total SUB_AREA would double-count the rain that
+    # already appears in model_diagnostics.nc (liq_prcp_on/off_glacier).
+    # We approximate by distributing total glacier area proportionally across
+    # sub-basins (exact spatial join is expensive and not needed here).
+    _total_basin_km2 = float(subbasins_gdf['SUB_AREA'].sum())
+    _total_glacier_km2 = float(sum(gd.rgi_area_km2 for gd in gdirs))
+    _ngl_frac = max(0.0, min(1.0,
+                              1.0 - _total_glacier_km2 / max(_total_basin_km2, 1.0)))
+    _ngl_area_per_sub = {
+        int(row['HYBAS_ID']): float(row['SUB_AREA']) * _ngl_frac
+        for _, row in subbasins_gdf.iterrows()
+    }
+    log.info(
+        'calibrate_basin_water_balance: total basin %.0f km², glaciers %.0f km², '
+        'NGL fraction %.1f%%',
+        _total_basin_km2, _total_glacier_km2, _ngl_frac * 100,
+    )
+
     # ---- Metric evaluation ----
     def _eval_metric(q_sim, q_obs):
         if metric == 'KGE':
@@ -2434,6 +2454,7 @@ def calibrate_basin_water_balance(
             k_snow_months=k_snow_ngl,
             k_soil_months=k_soil,
             s_fc_mm=s_fc,
+            nonglaciated_area_km2=_ngl_area_per_sub,
         )
 
         # Aggregate Q_ngl to annual
