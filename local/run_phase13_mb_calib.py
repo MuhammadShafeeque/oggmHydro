@@ -154,7 +154,7 @@ def _setup_logging(output_dir):
     return log_path
 
 
-def _load_gdirs(workdir, output_dir):
+def _load_gdirs(workdir, output_dir, filesuffix=''):
     import oggm
     from oggm import cfg
 
@@ -175,19 +175,27 @@ def _load_gdirs(workdir, output_dir):
     rgi_ids = np.load(rgi_file, allow_pickle=True).tolist()
     log.info('rgi_ids.npy: %d RGI IDs', len(rgi_ids))
 
+    # Phase 10 stores gdirs under workdir/per_glacier/
+    per_glacier_dir = os.path.join(workdir, 'per_glacier')
+    base_dir = per_glacier_dir if os.path.isdir(per_glacier_dir) else workdir
+    log.info('Using base_dir: %s', base_dir)
+
     gdirs, missing = [], 0
     for rgi_id in rgi_ids:
         try:
-            gdir = oggm.GlacierDirectory(rgi_id, base_dir=workdir)
-            if gdir.has_file('model_diagnostics'):
+            gdir = oggm.GlacierDirectory(rgi_id, base_dir=base_dir)
+            has_diag = (gdir.has_file('model_diagnostics', filesuffix=filesuffix)
+                        if filesuffix
+                        else gdir.has_file('model_diagnostics'))
+            if has_diag:
                 gdirs.append(gdir)
             else:
                 missing += 1
         except Exception:
             missing += 1
 
-    log.info('Loaded %d gdirs with model_diagnostics (%d missing)',
-             len(gdirs), missing)
+    log.info('Loaded %d gdirs with model_diagnostics%s (%d missing)',
+             len(gdirs), filesuffix, missing)
     if not gdirs:
         raise RuntimeError(
             'No gdirs with model_diagnostics.nc found. '
@@ -326,7 +334,8 @@ def main():
     from oggm.core.hydrology import mb_calibration_basin_from_discharge
 
     # ---- Load glacier dirs ----
-    gdirs = _load_gdirs(args.workdir, args.output_dir)
+    # Phase 10 uses filesuffix _hunza; pass it so has_file check succeeds
+    gdirs = _load_gdirs(args.workdir, args.output_dir, filesuffix='_hunza')
 
     # ---- Observed total discharge ----
     if args.grdc_file and os.path.exists(args.grdc_file):

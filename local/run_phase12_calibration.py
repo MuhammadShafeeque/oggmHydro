@@ -119,7 +119,7 @@ def _setup_logging(output_dir):
     return log_path
 
 
-def _load_gdirs(workdir, output_dir):
+def _load_gdirs(workdir, output_dir, filesuffix=''):
     """Load GlacierDirectory objects from Phase 10 working directory."""
     import oggm
     from oggm import cfg
@@ -143,21 +143,29 @@ def _load_gdirs(workdir, output_dir):
     rgi_ids = np.load(rgi_file, allow_pickle=True).tolist()
     log.info('rgi_ids.npy: %d RGI IDs', len(rgi_ids))
 
+    # Phase 10 stores gdirs under workdir/per_glacier/
+    per_glacier_dir = os.path.join(workdir, 'per_glacier')
+    base_dir = per_glacier_dir if os.path.isdir(per_glacier_dir) else workdir
+    log.info('Using base_dir: %s', base_dir)
+
     gdirs = []
     missing = 0
     for rgi_id in rgi_ids:
         try:
-            gdir = oggm.GlacierDirectory(rgi_id, base_dir=workdir)
-            # Only include if model_diagnostics.nc exists
-            if gdir.has_file('model_diagnostics'):
+            gdir = oggm.GlacierDirectory(rgi_id, base_dir=base_dir)
+            # Check for model_diagnostics with the actual filesuffix used in Phase 10
+            has_diag = (gdir.has_file('model_diagnostics', filesuffix=filesuffix)
+                        if filesuffix
+                        else gdir.has_file('model_diagnostics'))
+            if has_diag:
                 gdirs.append(gdir)
             else:
                 missing += 1
         except Exception:
             missing += 1
 
-    log.info('Loaded %d gdirs with model_diagnostics (%d missing/skipped)',
-             len(gdirs), missing)
+    log.info('Loaded %d gdirs with model_diagnostics%s (%d missing/skipped)',
+             len(gdirs), filesuffix, missing)
     if not gdirs:
         raise RuntimeError(
             'No glacier directories with model_diagnostics.nc found. '
@@ -249,7 +257,7 @@ def main():
     )
 
     # ---- Load data ----
-    gdirs = _load_gdirs(args.workdir, args.output_dir)
+    gdirs = _load_gdirs(args.workdir, args.output_dir, filesuffix=args.filesuffix)
     subbasins = _load_subbasins(args.hydrobasins_dir,
                                 args.hydrobasins_level,
                                 args.bbox)
