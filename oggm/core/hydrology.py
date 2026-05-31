@@ -2743,6 +2743,7 @@ def mb_calibration_basin_from_discharge(
                 w_mb=w_mb,
                 w_Q=w_Q,
                 filesuffix=filesuffix,
+                overwrite_gdir=True,
             )
             results[gdir.rgi_id] = res
         except Exception as exc:
@@ -2768,6 +2769,7 @@ def mb_calibration_basin_from_discharge(
                     w_mb=w_mb,
                     w_Q=w_Q,
                     filesuffix=filesuffix,
+                    overwrite_gdir=True,
                 )
             except Exception as exc:
                 log.warning(
