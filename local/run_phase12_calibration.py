@@ -350,31 +350,57 @@ def main():
     else:
         if args.grdc_file:
             log.warning('GRDC file not found: %s', args.grdc_file)
-        # Estimate model-scale mean discharge so synthetic obs are realistic.
-        # We cache glacier runoff once here (calibrate_basin_water_balance()
-        # will cache it again internally — cheap given disk I/O dominates).
-        log.info('Estimating model-scale discharge for synthetic obs ...')
+        # Compute the *actual* model total discharge at default parameters so
+        # the synthetic obs are centred on what the model really produces.
+        # This avoids any hand-tuned scaling factor.
+        log.info('Computing model-scale discharge at default params for synthetic obs ...')
+        from oggm.core.hydrology import (
+            extract_subbasin_climate as _esc,
+            compute_nonglaciated_runoff as _cnr,
+        )
+        import oggm.cfg as _cfg
+
+        # --- glacier component (pre-cached) ---
         _cache = _cache_basin_runoff_components(
-            gdirs, filesuffix=args.filesuffix,
-            ys=args.ys, ye=args.ye)
-        # Glacier total: rain + snow + ice melt [m³ s⁻¹]
+            gdirs, filesuffix=args.filesuffix, ys=args.ys, ye=args.ye)
         q_gl_mean = float(np.mean(
             _cache['rain_m3s'] + _cache['snow_m3s'] + _cache['ice_m3s']))
-        # Estimate NGL fraction of total basin area (for area correction)
-        # so synthetic obs match the corrected model total, not raw model total
-        from oggm.shop.hydrobasins import get_hydrobasins as _ghb
-        _subs = subbasins  # already loaded
-        _total_km2 = float(_subs['SUB_AREA'].sum())
+
+        # --- NGL component at default params with corrected area ---
+        _total_km2 = float(subbasins['SUB_AREA'].sum())
         _gl_km2 = float(sum(g.rgi_area_km2 for g in gdirs))
         _ngl_frac = max(0.0, min(1.0, 1.0 - _gl_km2 / max(_total_km2, 1.0)))
-        # NGL contribution estimated from two-bucket model capacity.
-        # Use conservative 200 mm/yr × non-glaciated area as NGL term.
-        _ngl_mean = 200e-3 * _ngl_frac * _total_km2 * 1e6 / (365.25 * 24 * 3600)
-        q_mean_est = max(q_gl_mean + _ngl_mean, 50.0)
+        _ngl_area_per_sub = {
+            int(r['HYBAS_ID']): float(r['SUB_AREA']) * _ngl_frac
+            for _, r in subbasins.iterrows()
+        }
+        _k_snow_def = float(_cfg.PARAMS.get('nonglaciated_k_snow_months', 2.0))
+        _k_soil_def = float(_cfg.PARAMS.get('nonglaciated_k_soil_months', 3.0))
+        _s_fc_def   = float(_cfg.PARAMS.get('nonglaciated_s_fc_mm', 150.0))
+
+        _per_basin_clim = _esc(gdirs, subbasins, ys=args.ys, ye=args.ye)
+        _ngl_ds = _cnr(
+            subbasins, _per_basin_clim,
+            k_snow_months=_k_snow_def,
+            k_soil_months=_k_soil_def,
+            s_fc_mm=_s_fc_def,
+            nonglaciated_area_km2=_ngl_area_per_sub,
+        )
+        # Annual mean NGL: sum over sub-basins, average over time
+        _q_ngl_monthly = _ngl_ds['Q_ngl_m3s'].sum('HYBAS_ID').values
+        _time_vals = _ngl_ds['time'].values
+        try:
+            _yrs = np.array([pd.Timestamp(t).year for t in _time_vals])
+        except Exception:
+            _yrs = np.array([int(t) for t in _time_vals])
+        _sel = (_yrs >= args.ys) & (_yrs <= args.ye)
+        q_ngl_mean = float(np.mean(_q_ngl_monthly[_sel])) if _sel.any() else 0.0
+
+        q_mean_est = max(q_gl_mean + q_ngl_mean, 50.0)
         log.info(
-            '  q_gl_mean=%.1f m³/s  q_ngl_est=%.1f m³/s  '
-            '→ synthetic q_mean=%.1f m³/s  (NGL_frac=%.0f%%)',
-            q_gl_mean, _ngl_mean, q_mean_est, _ngl_frac * 100)
+            '  q_gl_mean=%.1f m³/s  q_ngl_mean=%.1f m³/s  '
+            '→ synthetic q_mean=%.1f m³/s  (ngl_frac=%.0f%%)',
+            q_gl_mean, q_ngl_mean, q_mean_est, _ngl_frac * 100)
         obs_df = _make_synthetic_obs(args.ys, args.ye,
                                      seed=args.seed, q_mean=q_mean_est)
 
