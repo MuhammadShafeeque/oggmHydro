@@ -260,12 +260,13 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
 
 def _band_names(ds):
     """Band names, whether they are a coordinate or the char variable we write."""
-    if 'band_name' in ds:
-        raw = ds['band_name'].values
-        if raw.ndim == 2:  # char array
-            return [b''.join(r).decode().strip('\x00') for r in raw]
-        return [str(r) for r in raw]
-    return [str(b) for b in ds['band'].values]
+    if 'band_name' not in ds:
+        return [str(b) for b in ds['band'].values]
+    raw = np.asarray(ds['band_name'].values)
+    if raw.ndim == 2:  # netCDF char array, if xarray did not join it for us
+        raw = [b''.join(r) for r in raw]
+    return [(r.decode() if isinstance(r, bytes) else str(r)).strip('\x00')
+            for r in raw]
 
 
 @entity_task(log)
