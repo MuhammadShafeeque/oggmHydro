@@ -256,3 +256,96 @@ def test_ocean_param_falls_back_to_defaults():
     assert ocean_param('calving_tf_exponent') == DEFAULTS['calving_tf_exponent']
     with pytest.raises(InvalidParamsError):
         ocean_param('not_an_ocean_param')
+
+
+# --- the file round trip -------------------------------------------------------
+
+class FakeGdir:
+    """Only the GlacierDirectory API the ocean file writer and reader touch."""
+
+    rgi_id = 'RGI60-05.10315'
+    is_tidewater = True
+    cenlon, cenlat = -17.0, 81.3
+
+    def __init__(self, path):
+        self.dir = path
+
+    def get_filepath(self, name, filesuffix='', delete=False):
+        fp = self.dir / (cfg.BASENAMES[name][0].replace('.nc', f'{filesuffix}.nc'))
+        if delete and fp.exists():
+            fp.unlink()
+        return str(fp)
+
+    def has_file(self, name, filesuffix=''):
+        from pathlib import Path
+        return Path(self.get_filepath(name, filesuffix=filesuffix)).exists()
+
+    def add_to_diagnostics(self, key, value):
+        pass
+
+
+@pytest.fixture
+def ocean_file(tmp_path):
+    """An ocean_data.nc with a rising thermal forcing and a shrinking ice season."""
+    from oggm.shop.ocean import _write_ocean_file
+    import pandas as pd
+
+    gdir = FakeGdir(tmp_path)
+    time = pd.date_range('2000-01-01', '2021-12-01', freq='MS')
+    n = len(time)
+    tf = np.stack([np.linspace(0.2, 0.6, n),
+                   np.linspace(1.0, 2.0, n),
+                   np.linspace(0.5, 1.2, n)], axis=1)
+    _write_ocean_file(gdir, time.values, ['terminus', 'ismip6', 'moller'],
+                      [0., 200., 0.], [60., 500., 700.],
+                      ['uniform', 'uniform', 'depth_weighted'],
+                      tf, tf + 1.0, np.full_like(tf, 34.8),
+                      siconc=np.linspace(0.9, 0.2, n),
+                      open_water=open_water_fraction(np.linspace(0.9, 0.2, n)),
+                      lon=-17.0, lat=81.3, terminus_depth=60.,
+                      source='test', ocean_model='fake')
+    return gdir
+
+
+def test_ocean_file_round_trip(ocean_file):
+    with xr.open_dataset(ocean_file.get_filepath('ocean_data')) as ds:
+        assert ds.dims['band'] == 3
+        assert ds.dims['time'] == 264
+        assert list(ds['band_top'].values) == [0., 200., 0.]
+        assert ds.attrs['yr_0'] == 2000 and ds.attrs['yr_1'] == 2021
+        assert ds.attrs['ref_bathymetry_m'] == 60.
+        assert ds.attrs['tf_method'] == 'linear_lambda_jenkins2011'
+        assert str(ds['time'].values[0])[:7] == '2000-01'
+
+    from oggm.core.ocean_calving import _band_names
+    with xr.open_dataset(ocean_file.get_filepath('ocean_data')) as ds:
+        assert _band_names(ds) == ['terminus', 'ismip6', 'moller']
+
+
+def test_law_from_file_reads_the_named_band(ocean_file, state):
+    from oggm.core.ocean_calving import ocean_calving_law
+    model, fl, i = state
+    q = {}
+    for band in ('terminus', 'ismip6'):
+        law = ocean_calving_law(ocean_file, calving_law='tf_power', band=band,
+                                tf_ref=1.0, k0=0.6)
+        q[band] = law(model, fl, i)
+    # the ismip6 band is the warmer one in this file, so it must calve more
+    assert q['ismip6'] > q['terminus']
+
+    with pytest.raises(InvalidParamsError, match='band'):
+        ocean_calving_law(ocean_file, calving_law='tf_power', band='not_a_band')
+
+
+def test_law_from_file_is_time_varying(ocean_file, state):
+    from oggm.core.ocean_calving import ocean_calving_law
+    _, fl, i = state
+    law = ocean_calving_law(ocean_file, calving_law='tf_power', band='terminus',
+                            tf_ref=0.2, k0=0.6)
+    assert law(FakeModel(yr=2020.5), fl, i) > law(FakeModel(yr=2000.5), fl, i)
+
+
+def test_missing_ocean_file_raises(tmp_path, state):
+    from oggm.core.ocean_calving import ocean_calving_law
+    with pytest.raises(InvalidWorkflowError, match='process_ocean_data'):
+        ocean_calving_law(FakeGdir(tmp_path), calving_law='tf_power')

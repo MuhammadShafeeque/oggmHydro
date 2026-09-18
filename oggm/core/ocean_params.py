@@ -53,9 +53,15 @@ def init_ocean_params(reset=False):
     Existing values are kept unless ``reset`` is True, so a user override set before
     this call survives it.
     """
-    for k, v in DEFAULTS.items():
-        if reset or k not in cfg.PARAMS:
-            cfg.PARAMS[k] = v
+    # These are extension defaults, not user parameter changes, and PARAMS logs a
+    # warning for every key it does not already know.
+    do_log, cfg.PARAMS.do_log = cfg.PARAMS.do_log, False
+    try:
+        for k, v in DEFAULTS.items():
+            if reset or k not in cfg.PARAMS:
+                cfg.PARAMS[k] = v
+    finally:
+        cfg.PARAMS.do_log = do_log
 
 
 def ocean_param(key):
