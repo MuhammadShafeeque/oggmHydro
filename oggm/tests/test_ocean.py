@@ -309,8 +309,8 @@ def ocean_file(tmp_path):
 
 def test_ocean_file_round_trip(ocean_file):
     with xr.open_dataset(ocean_file.get_filepath('ocean_data')) as ds:
-        assert ds.dims['band'] == 3
-        assert ds.dims['time'] == 264
+        assert ds.sizes['band'] == 3
+        assert ds.sizes['time'] == 264
         assert list(ds['band_top'].values) == [0., 200., 0.]
         assert ds.attrs['yr_0'] == 2000 and ds.attrs['yr_1'] == 2021
         assert ds.attrs['ref_bathymetry_m'] == 60.
