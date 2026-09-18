@@ -12,6 +12,7 @@ selection rather than a re-extraction.
 import logging
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 from netCDF4 import Dataset as ncDataset
 from netCDF4 import date2num
@@ -245,10 +246,9 @@ def _write_ocean_file(gdir, time, names, tops, bots, weights, tf, th, sa,
                       search_radius_km=None, offsets=None, teos10=False,
                       bias_applied=False, filesuffix=''):
     """Write ocean_data.nc, following write_monthly_climate_file's conventions."""
-    time = xr.CFTimeIndex(xr.CFTimeIndex(np.asarray(time)).to_datetimeindex(
-        time_unit='ns')) if False else np.asarray(time)
-    y0 = int(str(np.asarray(time)[0])[:4])
-    y1 = int(str(np.asarray(time)[-1])[:4])
+    time = np.asarray(time)
+    y0 = int(str(time[0])[:4])
+    y1 = int(str(time[-1])[:4])
     time_unit = ('days since 1801-01-01 00:00:00' if y0 > 1800
                  else 'days since 0001-01-01 00:00:00')
 
@@ -343,9 +343,5 @@ def _as_datetimes(time):
     """Whatever time axis we were handed, as objects date2num accepts."""
     time = np.asarray(time)
     if np.issubdtype(time.dtype, np.datetime64):
-        return xr.CFTimeIndex(
-            xr.coding.cftime_offsets.date_range(
-                start=str(time[0])[:10], periods=len(time), freq='MS',
-                calendar='standard'),
-        ).to_pydatetime()
-    return [t for t in time]
+        return pd.to_datetime(time).to_pydatetime()
+    return list(time)
