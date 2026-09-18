@@ -349,3 +349,71 @@ def test_missing_ocean_file_raises(tmp_path, state):
     from oggm.core.ocean_calving import ocean_calving_law
     with pytest.raises(InvalidWorkflowError, match='process_ocean_data'):
         ocean_calving_law(FakeGdir(tmp_path), calving_law='tf_power')
+
+
+# --- inside a real flowline model ----------------------------------------------
+
+pytest.importorskip('geopandas')
+pytest.importorskip('salem')
+
+
+def _marine_model(calving_law=None, years=2500):
+    """A Bassis & Ultee tidewater flowline, run with our law attached."""
+    from oggm.core.flowline import FluxBasedModel
+    from oggm.core.massbalance import ScalarMassBalance
+    from oggm.tests.funcs import bu_tidewater_bed
+
+    model = FluxBasedModel(bu_tidewater_bed(), mb_model=ScalarMassBalance(),
+                           is_tidewater=True, do_kcalving=True,
+                           calving_use_limiter=True, flux_gate=0.06,
+                           calving_k=0.2, water_level=0.,
+                           **({} if calving_law is None
+                              else {'calving_law': calving_law}))
+    ds = model.run_until_and_store(years)
+    # The Bassis & Ultee front only reaches the water after ~1500 years. Without
+    # this the comparisons below would all pass on two runs that never calved.
+    assert model.calving_m3_since_y0 > 0
+    return model, ds
+
+
+@pytest.mark.slow
+def test_mass_is_conserved_with_an_ocean_law():
+    """Volume plus cumulative calving must equal what came through the flux gate."""
+    yrs = np.arange(0, 2501, 1.)
+    law = TFPower(yrs, np.full_like(yrs, 1.5), tf_ref=1.5, gamma=1.18)
+    model, ds = _marine_model(calving_law=law)
+    np.testing.assert_allclose(model.volume_m3 + model.calving_m3_since_y0,
+                               model.flux_gate_m3_since_y0, rtol=1e-6)
+    np.testing.assert_allclose(ds.calving_m3[-1], model.calving_m3_since_y0)
+
+
+@pytest.mark.slow
+def test_constant_law_reproduces_the_stock_run():
+    """The control must be the stock model, run for run, not just call for call."""
+    stock, ds_stock = _marine_model()
+    ours, ds_ours = _marine_model(calving_law=ConstantK())
+    np.testing.assert_allclose(ds_ours.volume_m3, ds_stock.volume_m3)
+    np.testing.assert_allclose(ds_ours.calving_m3, ds_stock.calving_m3)
+
+
+@pytest.mark.slow
+def test_tf_power_reduces_to_the_control_in_a_run():
+    """TF == TF_ref over the whole run is the stock model, including the geometry."""
+    yrs = np.arange(0, 2501, 1.)
+    law = TFPower(yrs, np.full_like(yrs, 1.5), tf_ref=1.5, gamma=1.18)
+    stock, ds_stock = _marine_model()
+    ours, ds_ours = _marine_model(calving_law=law)
+    np.testing.assert_allclose(ds_ours.calving_m3, ds_stock.calving_m3, rtol=1e-8)
+
+
+@pytest.mark.slow
+def test_warming_ocean_calves_more():
+    """A thermal forcing rising through the run must raise cumulative calving."""
+    yrs = np.arange(0, 2501, 1.)
+    warming = TFPower(yrs, np.linspace(1.5, 4.0, len(yrs)), tf_ref=1.5, gamma=1.18)
+    steady = TFPower(yrs, np.full_like(yrs, 1.5), tf_ref=1.5, gamma=1.18)
+    m_warm, ds_warm = _marine_model(calving_law=warming)
+    m_flat, ds_flat = _marine_model(calving_law=steady)
+    assert float(ds_warm.calving_m3[-1]) > float(ds_flat.calving_m3[-1])
+    np.testing.assert_allclose(m_warm.volume_m3 + m_warm.calving_m3_since_y0,
+                               m_warm.flux_gate_m3_since_y0, rtol=1e-6)
