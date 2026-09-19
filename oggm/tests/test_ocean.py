@@ -1156,3 +1156,18 @@ def test_write_frontal_components_without_a_file(tmp_path, state, years):
     the glacier's own diagnostics."""
     law = MeltPlusCalving(years, np.full_like(years, 1.8), tf_ref=1.5, k_c=0.6)
     assert write_frontal_components(FakeGdir(tmp_path), law) == (0., 0.)
+
+
+def test_beta_is_a_law_parameter(state, years):
+    """The low-discharge branch (beta = 1.61) has to be reachable per run, without
+    touching the global parameters another glacier in the same worker reads."""
+    tf = 1.8
+    law = MeltPlusCalving(years, np.full_like(years, tf), tf_ref=1.5, k_c=0.6,
+                          beta=1.61)
+    assert law.beta == 1.61
+    assert ocean_param('calving_melt_beta') == 1.18
+    assert law.melt_rate(100., 1000., 2005.) == pytest.approx(
+        ocean_param('calving_melt_B') * tf ** 1.61 / 86400.)
+    ice = SeaIceModulated(years, np.full_like(years, tf), open_water=np.ones_like(years),
+                          tf_ref=1.5, k_ice=0.6, beta=1.61)
+    assert ice.beta == 1.61
