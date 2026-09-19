@@ -343,6 +343,67 @@ def bed_extension_statistics(gdir, filesuffix='',
     return d
 
 
+@entity_task(log)
+def calving_vs_bed_extension(gdir, run_task=None, filesuffix='',
+                             synthetic_filesuffix='_synthetic',
+                             output_filesuffix='_bedext', **run_kwargs):
+    """What the calving extension is worth, in calving.
+
+    Two runs of the same glacier under the same mass balance and the same ``k``,
+    differing only in the bed beyond the present terminus. The ratio is the answer to
+    whether the synthetic extension is defensible: at one it never mattered, and
+    away from one it set the frontal ablation of the run.
+
+    Parameters
+    ----------
+    run_task : func
+        the run to use. Default
+        :py:func:`oggm.core.flowline.run_from_climate_data`.
+    run_kwargs : dict
+        passed on to it (``ys``, ``ye``, ``calving_law`` ...)
+    """
+
+    from oggm.core.flowline import run_from_climate_data
+    # Not run_constant_climate: its ConstantMassBalance interpolates over a fixed
+    # height table built from the real glacier, and the synthetic extension puts
+    # surface elevations below it -- the run raises before it can be compared.
+    run_task = run_task or run_from_climate_data
+
+    out = {'rgi_id': gdir.rgi_id}
+    for tag, fsx in (('synthetic', synthetic_filesuffix), ('measured', filesuffix)):
+        suffix = f'{output_filesuffix}_{tag}'
+        run_task(gdir, model_flowlines_filesuffix=fsx, output_filesuffix=suffix,
+                 **run_kwargs)
+        with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                               filesuffix=suffix)) as ds:
+            out[f'calving_m3_{tag}'] = float(ds.calving_m3[-1])
+            out[f'volume_m3_{tag}'] = float(ds.volume_m3[-1])
+            out[f'length_m_{tag}'] = float(ds.length_m[-1])
+
+    syn = out['calving_m3_synthetic']
+    out['calving_ratio'] = (out['calving_m3_measured'] / syn if syn > 0
+                            else np.nan)
+    out['calving_diff_m3'] = out['calving_m3_measured'] - syn
+    out['volume_ratio'] = (out['volume_m3_measured'] /
+                           max(out['volume_m3_synthetic'], 1e-9))
+    return out
+
+
+@global_task(log)
+def compile_calving_vs_bed_extension(gdirs, filesuffix='', path=True, **kwargs):
+    """Gather :py:func:`calving_vs_bed_extension` over a list of glaciers."""
+    from oggm.workflow import execute_entity_task
+
+    out = pd.DataFrame(execute_entity_task(calving_vs_bed_extension, gdirs,
+                                           **kwargs)).set_index('rgi_id')
+    if path:
+        if path is True:
+            path = os.path.join(cfg.PATHS['working_dir'],
+                                f'calving_vs_bed_extension{filesuffix}.csv')
+        out.to_csv(path)
+    return out
+
+
 @global_task(log)
 def compile_bed_extension_statistics(gdirs, filesuffix='', path=True, **kwargs):
     """Gather :py:func:`bed_extension_statistics` over a list of glaciers."""

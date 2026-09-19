@@ -480,8 +480,8 @@ def test_destine_reader_writes_the_ocean_file(tmp_path, destine_file):
 
     with xr.open_dataset(gdir.get_filepath('ocean_data')) as ds:
         assert ds.sizes['time'] == 60
-        assert [b''.join(r).decode().strip() for r in ds['band_name'].values] == [
-            'terminus', 'ismip6']
+        assert [b.decode().strip() for b in ds['band_name'].values] == ['terminus',
+                                                                        'ismip6']
         assert np.isfinite(ds.thermal_forcing).all()
         assert ds.ref_pix_lon == pytest.approx(-17.0)   # 343 E, normalised
         assert ds.ref_bathymetry_m == pytest.approx(60.0)
