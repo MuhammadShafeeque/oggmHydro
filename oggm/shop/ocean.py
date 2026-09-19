@@ -191,6 +191,10 @@ def process_ocean_data(gdir, thetao=None, so=None, siconc=None,
     if so is not None and not np.array_equal(so['time'].values,
                                              thetao['time'].values):
         raise InvalidParamsError('thetao and so must share a time axis.')
+    if siconc is not None and len(siconc['time']) != len(thetao['time']):
+        # The file's time dimension is unlimited, so a short siconc is written without
+        # complaint and read back as a fill value that reaches the calving flux.
+        raise InvalidParamsError('siconc must share the thetao time axis.')
 
     if not gdir.is_tidewater:
         # Not an error: land-terminating divides simply get no ocean file, and every
@@ -313,11 +317,6 @@ def process_destine_ocean_data(gdir, fpath=None, y0=None, y1=None,
                 raise InvalidWorkflowError(
                     f'{name} carries non-finite values; the extraction must drop land and '
                     f'sub-bathymetry levels, which this file has not')
-        if siconc is not None and siconc.sizes['time'] != thetao.sizes['time']:
-            # An unlimited time dimension takes a short series without complaint and reads
-            # the tail back as a fill value.
-            raise InvalidWorkflowError('siconc and thetao are on different time axes')
-
         # The file knows which bands its footprint supports; a band it dropped cannot be
         # rebuilt here, and asking for one raises in thermal_forcing_bands.
         if 'depth_bands' not in kwargs and ds.attrs.get('bands'):
