@@ -770,6 +770,27 @@ def test_calving_extension_replaces_the_bed_and_keeps_the_synthetic(columbia):
         out['fl_0']['bed_extension_synthetic_mean']
 
 
+def test_match_terminus_removes_the_step_at_the_junction(columbia):
+    """The inverted bed and the measured one need not meet, and a step is a spike."""
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+
+    raw = bedmachine_calving_extension(gdir, match_terminus=False)
+    bed_raw = gdir.read_pickle('model_flowlines')[-1].bed_h
+    matched = bedmachine_calving_extension(gdir, match_terminus=True)
+    bed_matched = gdir.read_pickle('model_flowlines')[-1].bed_h
+
+    n = gdir.settings['calving_line_extension']
+    offset = raw['fl_0']['bed_terminus_offset']
+    assert abs(offset) > 100.  # the inversion invented this water depth
+    np.testing.assert_allclose(bed_matched[-n:], bed_raw[-n:] + offset)
+    # matched, the first extension point continues the inverted bed
+    assert abs(bed_matched[-n] - bed_matched[-n - 1]) < abs(bed_raw[-n] -
+                                                            bed_raw[-n - 1])
+    assert matched['fl_0']['bed_terminus_offset'] == offset
+
+
 def test_calving_extension_reruns_from_the_synthetic_bed(columbia):
     """Re-running with other options must not compound onto the first result."""
     gdir, path = columbia
@@ -948,7 +969,9 @@ def test_calving_vs_bed_extension_compares_two_runs_of_one_glacier(columbia):
     gdir, path = columbia
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
-    bedmachine_calving_extension(gdir)
+    # match_terminus, or the measured bed starts with the step between the
+    # inverted terminus bed and the measured one, and the run fails on CFL.
+    bedmachine_calving_extension(gdir, match_terminus=True)
 
     d = calving_vs_bed_extension(gdir, ys=1950, ye=2000)
     assert d['calving_m3_synthetic'] > 0

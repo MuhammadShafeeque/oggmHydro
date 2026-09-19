@@ -34,6 +34,9 @@ log = logging.getLogger(__name__)
 
 WIDTH_METHODS = ('inversion', 'terminus', 'mean5')
 
+# A bed step at the junction this large is worth saying out loud (m).
+BED_STEP_WARN = 50.
+
 
 def _purge_lazy(obj):
     """Drop cached lazy properties, which are stale once the bed has moved."""
@@ -189,6 +192,12 @@ def bedmachine_calving_extension(gdir, bed_var='bedmachine_bed',
         offset = float(fl.bed_h[i0 - 1] - bed_at_terminus)
         if match_terminus:
             bed_new = bed_new + offset
+        elif abs(offset) > BED_STEP_WARN:
+            log.warning(
+                f'({gdir.rgi_id}) the inverted bed at the terminus is {offset:.0f} m '
+                f'from the measured one, so the measured extension starts with a step '
+                'of that size. A large step is a surface-gradient spike and can fail '
+                'the run on CFL; match_terminus=True removes it.')
 
         bed_syn = fl.bed_h[sl].copy()
         w_syn = float(fl._w0_m[i0])
