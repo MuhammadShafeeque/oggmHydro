@@ -101,11 +101,11 @@ def _open_bedmachine(path):
     ds = xr.open_dataset(path)
     proj = ds.attrs.get('proj4', None)
     if proj is None:
-        # Both grids are the standard polar stereographic ones; v6 dropped the
-        # global attribute the stock module reads.
+        # Both grids are the standard polar stereographic ones; the global
+        # attribute the stock module reads is not guaranteed to be there.
         proj = 'epsg:3413' if float(ds.y[0]) > 0 else 'epsg:3031'
     ds.attrs['pyproj_srs'] = proj
-    return ds, proj
+    return ds
 
 
 @entity_task(log, writes=['gridded_data'])
@@ -140,7 +140,8 @@ def bedmachine_bed_to_gdir(gdir, version=None, local_file=None, add_vars=None):
 
     out = {}
     attrs = {}
-    with _open_bedmachine(path) as (ds, proj):
+    with _open_bedmachine(path) as ds:
+        proj = ds.attrs['pyproj_srs']
         x0, x1, y0, y1 = gdir.grid.extent_in_crs(proj)
         dsroi = ds.salem.subset(corners=((x0, y0), (x1, y1)), crs=proj, margin=10)
         for vn in add_vars:

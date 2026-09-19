@@ -269,6 +269,7 @@ class FakeGdir:
 
     def __init__(self, path):
         self.dir = path
+        self.settings = {'task_timeout': 0}
 
     def get_filepath(self, name, filesuffix='', delete=False):
         fp = self.dir / (cfg.BASENAMES[name][0].replace('.nc', f'{filesuffix}.nc'))
@@ -282,6 +283,16 @@ class FakeGdir:
 
     def add_to_diagnostics(self, key, value):
         pass
+
+    # entity_task needs these three to run a task against this stand-in.
+    def get_task_status(self, name):
+        return None
+
+    def log(self, name, task_time=None, err=None):
+        pass
+
+    def get_filepath_dir(self):
+        return str(self.dir)
 
 
 @pytest.fixture
@@ -417,3 +428,129 @@ def test_warming_ocean_calves_more():
     assert float(ds_warm.calving_m3[-1]) > float(ds_flat.calving_m3[-1])
     np.testing.assert_allclose(m_warm.volume_m3 + m_warm.calving_m3_since_y0,
                                m_warm.flux_gate_m3_since_y0, rtol=1e-6)
+
+
+# --- the extraction side -------------------------------------------------------
+
+def _destine_file(path, y0=1990, y1=1994, lon=343.0, months=None, bands=None,
+                  nan_below=None, siconc_len=None):
+    """A DestinE per-site extraction as extract_ocean_footprint.py writes it."""
+    import pandas as pd
+
+    time = months if months is not None else pd.date_range(
+        f'{y0}-01-01', f'{y1}-12-01', freq='MS')
+    depth = np.array([5., 20., 45., 80., 150., 250., 400., 600.])
+    n = len(time)
+    thetao = 274.0 + np.linspace(0, 0.5, n)[:, None] + np.zeros((n, depth.size))
+    so = np.full((n, depth.size), 34.6)
+    if nan_below is not None:
+        thetao[:, depth > nan_below] = np.nan
+    ds = xr.Dataset(
+        {'thetao': (('time', 'depth'), thetao), 'so': (('time', 'depth'), so),
+         'siconc': ('time', np.full(siconc_len or n, 0.5))},
+        coords={'time': time, 'depth': depth, 'lon': lon, 'lat': 81.4},
+    )
+    ds.attrs.update(bands=bands if bands is not None else 'terminus:0:60 ismip6:200:500',
+                    terminus_depth_m=60.0, n_cells=1, extraction='test footprint',
+                    model='ICON')
+    ds.to_netcdf(path)
+    return path
+
+
+@pytest.fixture
+def destine_file(tmp_path):
+    return _destine_file(tmp_path / 'ocean_forcing.nc')
+
+
+def test_nan_in_a_band_raises():
+    """A band whose levels are below the sea floor must not average to a nan column."""
+    z = np.array([10., 50., 300.])
+    thetao = np.array([[1., 1., np.nan]])
+    so = np.full((1, 3), 34.8)
+    with pytest.raises(InvalidWorkflowError, match='non-finite'):
+        thermal_forcing_bands(thetao, so, z, [('ismip6', 200., 500.)],
+                              {'ismip6': 'uniform'})
+
+
+def test_destine_reader_writes_the_ocean_file(tmp_path, destine_file):
+    from oggm.shop.ocean import process_destine_ocean_data
+
+    gdir = FakeGdir(tmp_path)
+    process_destine_ocean_data(gdir, fpath=str(destine_file))
+
+    with xr.open_dataset(gdir.get_filepath('ocean_data')) as ds:
+        assert ds.sizes['time'] == 60
+        assert list(ds.band_name.astype(str).str.join(dim='nchar').values) == ['terminus',
+                                                                               'ismip6']
+        assert np.isfinite(ds.thermal_forcing).all()
+        assert ds.ref_pix_lon == pytest.approx(-17.0)   # 343 E, normalised
+        assert ds.ref_bathymetry_m == pytest.approx(60.0)
+        assert ds.ocean_model == 'ICON'
+
+
+def test_destine_reader_takes_bands_from_the_file(tmp_path):
+    """A band the footprint could not build is not in the file and is not requested."""
+    from oggm.shop.ocean import process_destine_ocean_data
+
+    fpath = _destine_file(tmp_path / 'shallow.nc', bands='terminus:0:60')
+    gdir = FakeGdir(tmp_path)
+    process_destine_ocean_data(gdir, fpath=str(fpath))
+
+    with xr.open_dataset(gdir.get_filepath('ocean_data')) as ds:
+        assert ds.sizes['band'] == 1
+
+
+def test_destine_reader_trims_to_whole_years(tmp_path):
+    import pandas as pd
+
+    from oggm.shop.ocean import process_destine_ocean_data
+
+    time = pd.date_range('1990-07-01', '1993-04-01', freq='MS')
+    fpath = _destine_file(tmp_path / 'partial.nc', months=time)
+    gdir = FakeGdir(tmp_path)
+    process_destine_ocean_data(gdir, fpath=str(fpath))
+
+    with xr.open_dataset(gdir.get_filepath('ocean_data')) as ds:
+        assert ds.sizes['time'] == 24        # 1991 and 1992 only
+        assert ds.yr_0 == 1991 and ds.yr_1 == 1992
+
+
+def test_destine_reader_rejects_non_finite_input(tmp_path):
+    from oggm.shop.ocean import process_destine_ocean_data
+
+    fpath = _destine_file(tmp_path / 'wet.nc', nan_below=100.)
+    with pytest.raises(InvalidWorkflowError, match='non-finite'):
+        process_destine_ocean_data(FakeGdir(tmp_path), fpath=str(fpath))
+
+
+def test_destine_reader_rejects_a_short_siconc(tmp_path):
+    from oggm.shop.ocean import process_destine_ocean_data
+
+    fpath = _destine_file(tmp_path / 'short.nc', siconc_len=59)
+    with pytest.raises(InvalidWorkflowError, match='different time axes'):
+        process_destine_ocean_data(FakeGdir(tmp_path), fpath=str(fpath))
+
+
+def test_destine_reader_rejects_kwargs_it_builds(tmp_path, destine_file):
+    from oggm.shop.ocean import process_destine_ocean_data
+
+    with pytest.raises(InvalidParamsError, match='thetao'):
+        process_destine_ocean_data(FakeGdir(tmp_path), fpath=str(destine_file),
+                                   thetao='something')
+
+
+def test_destine_reader_skips_land_terminating(tmp_path, destine_file):
+    from oggm.shop.ocean import process_destine_ocean_data
+
+    gdir = FakeGdir(tmp_path)
+    gdir.is_tidewater = False
+    process_destine_ocean_data(gdir, fpath=str(destine_file))
+    assert not gdir.has_file('ocean_data')
+
+
+def test_destine_reader_needs_a_path(tmp_path):
+    from oggm.shop.ocean import process_destine_ocean_data
+
+    cfg.PATHS.pop('destine_ocean_file', None)
+    with pytest.raises(InvalidParamsError, match='destine_ocean_file'):
+        process_destine_ocean_data(FakeGdir(tmp_path))
