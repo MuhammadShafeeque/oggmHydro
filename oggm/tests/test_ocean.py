@@ -881,59 +881,66 @@ def test_bed_extension_statistics_reports_both_beds(columbia):
     assert d['bed_rmse'] > 0
 
 
-def _extension_bed_model(bed_profile, calving_k=0.6, years=400):
+def _extension_bed_model(bed_profile, flux_gate=0.5, years=800, calving_k=0.6,
+                         nx=60):
     """A marine flowline whose extension bed is prescribed, and nothing else.
 
     Everything upstream of the terminus is identical between calls, so a difference
-    in `calving_m3` is the extension bed and only the extension bed.
+    in `calving_m3` is the extension bed and only the extension bed. The flux gate
+    has to be large enough to push the front past cell `nx`: while it stays in the
+    inverted domain the extension is inert, which is itself the finding.
     """
     from oggm.core.flowline import FluxBasedModel, MixedBedFlowline
     from oggm.core.massbalance import ScalarMassBalance
 
-    nx, n_ext, dx_meter, map_dx = 60, 30, 400., 200.
+    n_ext = len(bed_profile)
+    dx_meter, map_dx = 400., 200.
     bed_h = np.concatenate([np.linspace(900., -60., nx), bed_profile])
-    surface_h = bed_h.copy()
     thick = np.zeros(nx + n_ext)
     thick[:nx] = np.linspace(20., 260., nx)
-    surface_h[:nx] = bed_h[:nx] + thick[:nx]
     widths_m = np.full(nx + n_ext, 1000.)
-    lambdas = np.zeros(nx + n_ext)
     fl = MixedBedFlowline(dx=dx_meter / map_dx, map_dx=map_dx,
-                          surface_h=surface_h, bed_h=bed_h,
+                          surface_h=bed_h + thick, bed_h=bed_h,
                           section=widths_m * thick,
                           bed_shape=np.zeros(nx + n_ext),
                           is_trapezoid=np.ones(nx + n_ext, dtype=bool),
-                          lambdas=lambdas, widths_m=widths_m)
+                          lambdas=np.zeros(nx + n_ext), widths_m=widths_m)
     model = FluxBasedModel([fl], mb_model=ScalarMassBalance(),
                            is_tidewater=True, do_kcalving=True,
-                           calving_use_limiter=True, flux_gate=0.12,
+                           calving_use_limiter=True, flux_gate=flux_gate,
                            calving_k=calving_k, water_level=0.)
     model.run_until(years)
-    return model
+    return model, int(np.nonzero(model.fls[0].thick > 0)[0][-1])
 
 
 @pytest.mark.slow
-def test_a_deepening_extension_calves_more_than_a_measured_shelf():
+def test_a_deepening_extension_calves_more_than_a_measured_one():
     """The first-order consequence: Q is proportional to d, and d is invented.
 
-    OGGM's extension deepens at `calving_front_slope` for 12 km. A measured bed
-    that stays at the terminus depth, or shoals onto a sill, is a different run.
+    OGGM's extension deepens at `calving_front_slope` for 30 cells. A measured bed
+    that holds the terminus depth, or shoals onto a sill, is a different run: less
+    frontal ablation, and a front that gets further.
     """
-    n, dx = 30, 400.
+    n, dx, nx = 30, 400., 60
     deepening = np.linspace(-60., -60. - n * dx * 0.05, n)   # what OGGM builds
     flat = np.full(n, -60.)                                  # a measured shelf
     sill = np.linspace(-60., 5., n)                          # a measured sill
 
-    m_deep = _extension_bed_model(deepening)
-    m_flat = _extension_bed_model(flat)
-    m_sill = _extension_bed_model(sill)
+    m_deep, front_deep = _extension_bed_model(deepening)
+    m_flat, front_flat = _extension_bed_model(flat)
+    m_sill, front_sill = _extension_bed_model(sill)
 
+    # all three have to have reached the extension, or this compares nothing
+    for front in (front_deep, front_flat, front_sill):
+        assert front > nx
     assert m_deep.calving_m3_since_y0 > 0
-    assert m_deep.calving_m3_since_y0 > m_flat.calving_m3_since_y0
-    # a bed that leaves the water switches the calving gate off entirely
-    assert m_sill.calving_m3_since_y0 < m_flat.calving_m3_since_y0
-    # and the difference is not a rounding one
-    assert m_deep.calving_m3_since_y0 / m_flat.calving_m3_since_y0 > 1.1
+
+    # the invented bed calves more, and by a factor rather than a few per cent
+    assert m_deep.calving_m3_since_y0 / m_flat.calving_m3_since_y0 > 1.5
+    assert m_flat.calving_m3_since_y0 > m_sill.calving_m3_since_y0
+    # and it holds the front back, and the glacier smaller, for the same reason
+    assert front_deep < front_flat < front_sill
+    assert m_deep.volume_m3 < m_flat.volume_m3 < m_sill.volume_m3
 
 
 @pytest.mark.slow
