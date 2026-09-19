@@ -264,36 +264,33 @@ def calving_front_width_check(gdir, rtol=None, raise_on_fail=False,
          'rel_diff_extension': np.nan,
          'passes': None}
 
-    for fl in fls:
-        sl = extension_slice(gdir, fl)
-        if sl is None:
-            continue
-        d['width_terminus'] = float(fl.widths_m[sl.start - 1])
-        d['width_extension'] = float(fl._w0_m[sl.start])
-        break
-    else:
-        # already overridden, or a flowline with no extension: use the last cell
-        # that carries ice.
-        fl = fls[-1]
-        with np.errstate(invalid='ignore'):
-            has_ice = np.nonzero(fl.thick > 0)[0]
-        if has_ice.size:
-            d['width_terminus'] = float(fl.widths_m[has_ice[-1]])
+    # The tail is the ice-free, rectangular extension, whether or not it still
+    # carries the synthetic bed: the width is what this check is about.
+    fl = fls[-1]
+    has_ice = np.nonzero(fl.thick > 0)[0]
+    if has_ice.size:
+        d['width_terminus'] = float(fl.widths_m[has_ice[-1]])
+        tail = has_ice[-1] + 1
+        is_rect = getattr(fl, 'is_rectangular', None)
+        if tail < fl.nx and is_rect is not None and is_rect[tail]:
+            d['width_extension'] = float(fl._w0_m[tail])
 
     if w_inv:
         for key in ('terminus', 'extension'):
             w = d[f'width_{key}']
             if np.isfinite(w):
                 d[f'rel_diff_{key}'] = float(abs(w - w_inv) / w_inv)
-        d['passes'] = bool(np.nanmax([d['rel_diff_terminus'],
-                                      d['rel_diff_extension']]) < rtol)
+        diffs = [v for v in (d['rel_diff_terminus'], d['rel_diff_extension'])
+                 if np.isfinite(v)]
+        d['passes'] = bool(diffs and max(diffs) < rtol)
 
     if d['passes'] is False:
         msg = (f'({gdir.rgi_id}) frontal width disagrees with the inversion: '
                f'{d["width_terminus"]:.0f} m at the terminus and '
                f'{d["width_extension"]:.0f} m over the extension against '
                f'{w_inv:.0f} m recorded by the inversion '
-               f'({100 * d["rel_diff_extension"]:.1f}% over the extension).')
+               f'({100 * d["rel_diff_extension"]:.1f}% over the extension). '
+               'Every calving law is proportional to this width.')
         if raise_on_fail:
             raise InvalidWorkflowError(msg)
         log.warning(msg)
