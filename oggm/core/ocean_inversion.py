@@ -137,6 +137,49 @@ def calving_vs_geodetic_residual(gdir, ref_mb=None, ref_mb_err=None):
     return out
 
 
+def partition_calving_constant(k_total, melt_rate, thick, lam=None):
+    """The residual calving constant that keeps the total frontal ablation fixed.
+
+    ``k`` is calibrated against an *observed* frontal ablation, so it already
+    contains the calving that submarine melt drives. Adding a melt term on top of it
+    therefore counts the melt twice, and the default ``k_c = k`` does exactly that.
+    Both terms share the submerged area, so the constraint
+    ``k_c*h + lam*mdot == k_total*h`` is linear and solves in closed form.
+
+    Parameters
+    ----------
+    k_total : float
+        the calibrated calving constant, a-1.
+    melt_rate : float
+        the reference submarine melt rate, m s-1, as the laws return it.
+    thick : float
+        the terminus ice thickness the constant acts on, m.
+    lam : float
+        the undercut efficiency. Defaults to
+        ``cfg.PARAMS['calving_undercut_efficiency']``.
+
+    Returns
+    -------
+    (k_c, melt_fraction) : the residual constant in a-1, and the melt share of the
+    unchanged total.
+    """
+    lam = ocean_param('calving_undercut_efficiency') if lam is None else lam
+    if thick <= 0:
+        raise InvalidParamsError(f'thick = {thick} is not a terminus thickness')
+    u_total = k_total / cfg.SEC_IN_YEAR * thick
+    u_melt = lam * melt_rate
+    if u_total <= 0:
+        return 0., 0.
+    if u_melt >= u_total:
+        log.warning('submarine melt alone (%.3e m s-1) matches or exceeds the '
+                    'calibrated frontal ablation speed (%.3e): the residual calving '
+                    'constant is zero, and the melt term is the whole flux',
+                    u_melt, u_total)
+        return 0., 1.
+    k_c = (u_total - u_melt) / thick * cfg.SEC_IN_YEAR
+    return float(k_c), float(u_melt / u_total)
+
+
 def frontal_ablation_corrected_mb(ref_mb, area_m2, calving_flux_km3=None,
                                   below_wl_flux_km3=None, f_bwl=0.75,
                                   rho=None):

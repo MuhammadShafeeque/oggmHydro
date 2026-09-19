@@ -22,7 +22,9 @@ from oggm.core.bedmachine_flowline import (bed_extension_statistics,
                                            sample_gridded_on_line)
 from oggm.core.flowline import init_present_time_glacier, k_calving_law
 from oggm.core.ocean_calving import (ConstantK, MeltPlusCalving, SeaIceModulated,
-                                     TFPower)
+                                     TFPower, frontal_ablation_components,
+                                     write_frontal_components)
+from oggm.core.ocean_inversion import partition_calving_constant
 from oggm.core.ocean_params import DEFAULTS, init_ocean_params, ocean_param
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 from oggm.shop.bedmachine_bed import (BEDMACHINE_URLS, BEDMACHINE_VARS,
@@ -977,3 +979,180 @@ def test_calving_vs_bed_extension_compares_two_runs_of_one_glacier(columbia):
     assert d['calving_m3_synthetic'] > 0
     assert d['calving_m3_measured'] > 0
     assert np.isfinite(d['calving_ratio'])
+
+
+# --- the melt/calving split ----------------------------------------------------
+#
+# The model adds the two summands and keeps one number, so the laws keep their own
+# books. These tests hold that bookkeeping to three promises: the parts sum to the
+# whole, the nesting survives at the component level, and only the laws that have a
+# melt term report one.
+
+def _laws(years):
+    tf = np.full_like(years, 1.8)
+    ow = np.full_like(years, 0.5)
+    return [ConstantK(k=0.6),
+            TFPower(years, tf, tf_ref=1.5, k0=0.6),
+            MeltPlusCalving(years, tf, tf_ref=1.5, k_c=0.6),
+            SeaIceModulated(years, tf, open_water=ow, tf_ref=1.5, k_ice=0.6)]
+
+
+def test_components_sum_to_the_flux(state, years):
+    """Whatever the law splits, the total it returns must not change."""
+    model, fl, i = state
+    for law in _laws(years):
+        h, w = fl.thick[i], fl.widths_m[i]
+        d = h - (fl.surface_h[i] - model.water_level)
+        u_c, u_m = law.frontal_speed_components(h, d, w, model.yr)
+        assert u_c + u_m == pytest.approx(law.frontal_speed(h, d, w, model.yr))
+        assert (u_c + u_m) * d * w == pytest.approx(law(model, fl, i))
+
+
+def test_only_the_melt_laws_report_melt(state, years):
+    """The control and the power law put everything in the calving slot -- their
+    constant already contains the melt, and pretending otherwise would be a claim."""
+    model, fl, i = state
+    h, w = fl.thick[i], fl.widths_m[i]
+    d = h - (fl.surface_h[i] - model.water_level)
+    for law in _laws(years)[:2]:
+        assert law.frontal_speed_components(h, d, w, model.yr)[1] == 0.
+    for law in _laws(years)[2:]:
+        assert law.frontal_speed_components(h, d, w, model.yr)[1] > 0.
+
+
+def test_delta_zero_recovers_the_split_not_only_the_total(state, years):
+    """The nesting property has to hold component by component, or the split is a
+    different model rather than a report on the same one."""
+    model, fl, i = state
+    tf = np.full_like(years, 1.8)
+    ow = np.linspace(0.1, 0.9, len(years))
+    a = MeltPlusCalving(years, tf, open_water=ow, tf_ref=1.5, k_c=0.6)
+    b = SeaIceModulated(years, tf, open_water=ow, tf_ref=1.5, k_ice=0.6, delta=0.)
+    h, w = fl.thick[i], fl.widths_m[i]
+    d = h - (fl.surface_h[i] - model.water_level)
+    assert (b.frontal_speed_components(h, d, w, 2005.) ==
+            pytest.approx(a.frontal_speed_components(h, d, w, 2005.)))
+
+
+def test_the_sea_ice_gate_moves_the_split(state, years):
+    """Closing the ice season must move mass from the melt term to the calving term
+    without changing what the calving term itself is."""
+    model, fl, i = state
+    tf = np.full_like(years, 1.8)
+    h, w = fl.thick[i], fl.widths_m[i]
+    d = h - (fl.surface_h[i] - model.water_level)
+    open_sea = SeaIceModulated(years, tf, open_water=np.full_like(years, 0.9),
+                               tf_ref=1.5, k_ice=0.6, delta=2.)
+    icy = SeaIceModulated(years, tf, open_water=np.full_like(years, 0.1),
+                          tf_ref=1.5, k_ice=0.6, delta=2.)
+    c_open, m_open = open_sea.frontal_speed_components(h, d, w, 2005.)
+    c_icy, m_icy = icy.frontal_speed_components(h, d, w, 2005.)
+    assert m_icy < m_open
+    assert c_icy == pytest.approx(c_open)
+
+
+def test_a_bare_call_does_not_accumulate(state, years):
+    """A law called without a model clock is an inspection, not a run."""
+    model, fl, i = state
+    law = MeltPlusCalving(years, np.full_like(years, 1.8), tf_ref=1.5, k_c=0.6)
+    law(model, fl, i)
+    assert law.frontal_ablation_m3 == 0.
+    assert law.components_m3() == (0., 0.)
+
+
+def test_accounting_survives_pickle(state, years):
+    law = MeltPlusCalving(years, np.full_like(years, 1.8), tf_ref=1.5, k_c=0.6)
+    law.frontal_ablation_m3, law.submarine_melt_m3 = 10., 3.
+    again = pickle.loads(pickle.dumps(law))
+    assert again.components_m3() == (7., 3.)
+
+
+def test_partition_calving_constant_preserves_the_total():
+    """k_c + the melt term must reproduce exactly what the calibrated k gave."""
+    h, k = 200., 0.6
+    mdot = 0.1 / 86400.  # 0.1 m per day, well inside the calibrated total
+    k_c, frac = partition_calving_constant(k, mdot, h, lam=1.)
+    assert k_c < k
+    assert (k_c / cfg.SEC_IN_YEAR * h + mdot ==
+            pytest.approx(k / cfg.SEC_IN_YEAR * h))
+    assert frac == pytest.approx(mdot / (k / cfg.SEC_IN_YEAR * h))
+
+
+def test_partition_calving_constant_refuses_to_go_negative():
+    """Melt exceeding the observed total is a result to report, not a negative k."""
+    k_c, frac = partition_calving_constant(0.01, 1.0, 200., lam=1.)
+    assert (k_c, frac) == (0., 1.)
+    with pytest.raises(InvalidParamsError, match='thickness'):
+        partition_calving_constant(0.6, 1e-7, 0.)
+
+
+@pytest.mark.slow
+def test_the_split_sums_to_calving_m3_in_a_run():
+    """The two components must close against the model's own counter, including the
+    step that was still open when the run stopped."""
+    yrs = np.arange(0, 2501, 1.)
+    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), tf_ref=1.5, k_c=0.2)
+    model, ds = _marine_model(calving_law=law)
+    calving, melt = frontal_ablation_components(model)
+    assert melt > 0
+    np.testing.assert_allclose(calving + melt, model.calving_m3_since_y0, rtol=1e-12)
+    np.testing.assert_allclose(calving + melt, float(ds.calving_m3[-1]), rtol=1e-12)
+
+
+@pytest.mark.slow
+def test_the_control_reports_no_melt_in_a_run():
+    law = ConstantK()
+    model, ds = _marine_model(calving_law=law)
+    calving, melt = frontal_ablation_components(model)
+    assert melt == 0.
+    np.testing.assert_allclose(calving, model.calving_m3_since_y0, rtol=1e-12)
+
+
+@pytest.mark.slow
+def test_the_split_series_is_monotone_and_closes_at_every_step():
+    yrs = np.arange(0, 2501, 1.)
+    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), tf_ref=1.5, k_c=0.2)
+    model, ds = _marine_model(calving_law=law)
+    t, cum_total, cum_melt = law.component_series(model)
+    assert len(t) > 100
+    assert np.all(np.diff(cum_total) >= 0)
+    assert np.all(np.diff(cum_melt) >= 0)
+    assert np.all(cum_melt <= cum_total)
+
+
+@pytest.mark.slow
+def test_write_frontal_components_writes_a_mappable_sidecar(tmp_path):
+    """The split must be on disk, a share of calving_m3 at every step, and must not
+    touch model_diagnostics, which compile_run_output would then refuse."""
+    from oggm.core.ocean_calving import compile_frontal_components
+
+    yrs = np.arange(0, 2501, 1.)
+    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), tf_ref=1.5, k_c=0.2)
+    model, ds = _marine_model(calving_law=law)
+
+    gdir = FakeGdir(tmp_path)
+    fp = gdir.get_filepath('model_diagnostics')
+    ds.to_netcdf(fp)
+    calving, melt = write_frontal_components(gdir, law, model=model)
+
+    with xr.open_dataset(fp) as stock:
+        assert 'submarine_melt_m3' not in stock
+    with xr.open_dataset(gdir.get_filepath('frontal_ablation_diagnostics')) as out:
+        np.testing.assert_allclose(out.submarine_melt_m3 + out.calving_only_m3,
+                                   out.calving_m3, rtol=1e-12)
+        assert float(out.submarine_melt_m3[-1]) == pytest.approx(melt, rel=1e-9)
+        assert float(out.calving_only_m3[-1]) == pytest.approx(calving, rel=1e-9)
+        assert np.all(out.submarine_melt_m3.values >= 0)
+        assert out.attrs['calving_law'] == 'melt_calving'
+
+    comp = compile_frontal_components([gdir], path=str(tmp_path / 'c.nc'))
+    assert comp.sizes['rgi_id'] == 1
+    assert float(comp.lon[0]) == FakeGdir.cenlon
+    assert (tmp_path / 'c.nc').exists()
+
+
+def test_write_frontal_components_without_a_file(tmp_path, state, years):
+    """No diagnostics file is a missing output, not an error: the totals still go to
+    the glacier's own diagnostics."""
+    law = MeltPlusCalving(years, np.full_like(years, 1.8), tf_ref=1.5, k_c=0.6)
+    assert write_frontal_components(FakeGdir(tmp_path), law) == (0., 0.)
