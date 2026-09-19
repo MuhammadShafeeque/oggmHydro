@@ -5,18 +5,29 @@ the stock model at its root: `test_tf_power_reduces_to_stock_law` and
 `test_delta_zero_recovers_melt_calving`. Every comparison the paper makes is then a
 comparison inside one model rather than between four.
 """
+import os
 import pickle
 
 import numpy as np
 import pytest
+import shapely.geometry as shpg
 import xarray as xr
 
 from oggm import cfg, utils
-from oggm.core.flowline import k_calving_law
+from oggm.core.bedmachine_flowline import (bed_extension_statistics,
+                                           bedmachine_calving_extension,
+                                           calving_front_width_check,
+                                           calving_vs_bed_extension,
+                                           extension_slice,
+                                           sample_gridded_on_line)
+from oggm.core.flowline import init_present_time_glacier, k_calving_law
 from oggm.core.ocean_calving import (ConstantK, MeltPlusCalving, SeaIceModulated,
                                      TFPower)
 from oggm.core.ocean_params import DEFAULTS, init_ocean_params, ocean_param
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
+from oggm.shop.bedmachine_bed import (BEDMACHINE_URLS, BEDMACHINE_VARS,
+                                      DEFAULT_VERSION, bedmachine_bed_to_gdir,
+                                      bedmachine_file)
 from oggm.shop.ocean import (LAMBDA1, LAMBDA2, LAMBDA3, freezing_point,
                              open_water_fraction, thermal_forcing_bands)
 
@@ -564,3 +575,375 @@ def test_destine_reader_needs_a_path(tmp_path):
     cfg.PATHS.pop('destine_ocean_file', None)
     with pytest.raises(InvalidParamsError, match='destine_ocean_file'):
         process_destine_ocean_data(FakeGdir(tmp_path))
+
+
+# --- the bed under and beyond the calving front --------------------------------
+
+@pytest.fixture
+def columbia():
+    """A real tidewater gdir, inverted, with a synthetic BedMachine beside it.
+
+    Columbia rather than a dummy flowline because the two numbers this part of the
+    code exists to produce -- the inversion's `calving_front_width` and the width
+    `init_present_time_glacier` puts on the extension -- only exist after a real
+    inversion. `clip_tidewater_border` is off because OGGM forces the grid of a
+    tidewater glacier to a 10 pixel border while extending its flowline by
+    `calving_line_extension * dx` pixels, so the extension leaves the grid at once.
+    """
+    import geopandas as gpd
+
+    import oggm
+    from oggm import tasks
+    from oggm.core import gis, centerlines
+    from oggm.core.ocean_params import init_ocean_params
+    from oggm.tests.funcs import get_test_dir
+    from oggm.utils import get_demo_file, mkdir
+
+    testdir = os.path.join(get_test_dir(), 'tmp_bedmachine_flowline')
+    mkdir(testdir)
+
+    cfg.initialize()
+    init_ocean_params(reset=True)
+    cfg.PATHS['working_dir'] = testdir
+    cfg.PATHS['dem_file'] = get_demo_file('dem_Columbia.tif')
+    cfg.PARAMS['use_intersects'] = False
+    cfg.PARAMS['border'] = 100
+    cfg.PARAMS['clip_tidewater_border'] = False
+    cfg.PARAMS['use_kcalving_for_inversion'] = True
+    cfg.PARAMS['use_kcalving_for_run'] = True
+    cfg.PARAMS['prcp_fac'] = 2.5
+    cfg.PARAMS['baseline_climate'] = 'CRU'
+    cfg.PARAMS['evolution_model'] = 'FluxBased'
+
+    entity = gpd.read_file(get_demo_file('01_rgi60_Columbia.shp')).iloc[0]
+    gdir = oggm.GlacierDirectory(entity)
+    if not gdir.has_file('climate_historical'):
+        gis.define_glacier_region(gdir)
+        gis.simple_glacier_masks(gdir)
+        centerlines.elevation_band_flowline(gdir)
+        centerlines.fixed_dx_elevation_band_flowline(gdir)
+        centerlines.compute_downstream_line(gdir)
+        tasks.process_dummy_cru_file(gdir, seed=0)
+        tasks.mb_calibration_from_geodetic_mb(gdir)
+        tasks.apparent_mb_from_any_mb(gdir)
+        tasks.find_inversion_calving_from_any_mb(gdir)
+
+    path = os.path.join(testdir, 'synthetic_bedmachine.nc')
+    if not os.path.exists(path):
+        write_synthetic_bedmachine(gdir, path)
+    return gdir, path
+
+
+def synthetic_bed(x, y):
+    """A plane in the BedMachine projection, so a sampled value has a known answer."""
+    return -80. + 3e-4 * (x - X_REF) - 1e-3 * (y - Y_REF)
+
+
+X_REF, Y_REF = -3.2e6, 8.5e5
+
+
+def write_synthetic_bedmachine(gdir, path, dx=150.):
+    """A BedMachine-shaped file over this glacier: same names, same projection."""
+    import pyproj
+
+    proj = 'epsg:3413'
+    x0, x1, y0, y1 = gdir.grid.extent_in_crs(proj)
+    pad = 20e3
+    x = np.arange(x0 - pad, x1 + pad, dx)
+    y = np.arange(y1 + pad, y0 - pad, -dx)  # BedMachine's y descends
+    xx, yy = np.meshgrid(x, y)
+    bed = synthetic_bed(xx, yy)
+    ds = xr.Dataset(
+        {'bed': (('y', 'x'), bed.astype('f4'), {'units': 'meters'}),
+         'errbed': (('y', 'x'), np.full(bed.shape, 42., dtype='f4'),
+                    {'units': 'meters'}),
+         'source': (('y', 'x'), np.where(xx > xx.mean(), 10, 2).astype('i2'),
+                    {'flag_values': '2, 10',
+                     'flag_meanings': 'mass_conservation multibeam'}),
+         'thickness': (('y', 'x'), np.full(bed.shape, 500., dtype='f4'),
+                       {'units': 'meters'}),
+         'surface': (('y', 'x'), (bed + 500.).astype('f4'), {'units': 'meters'}),
+         'mask': (('y', 'x'), np.full(bed.shape, 2, dtype='i2'), {})},
+        coords={'x': x, 'y': y})
+    ds.attrs['proj4'] = pyproj.CRS(proj).to_proj4()
+    ds.to_netcdf(path)
+    return path
+
+
+def test_greenland_v6_is_the_default():
+    """The stock shop module predates v6 (released 2025-12-11); this one does not."""
+    assert DEFAULT_VERSION['05'] == '6'
+    assert 'BedMachineGreenland-v6.nc' in BEDMACHINE_URLS[('05', '6')]
+    assert 'BedMachineGreenland-v5.nc' in BEDMACHINE_URLS[('05', '5')]
+    # Antarctica moved to v4 as well.
+    assert DEFAULT_VERSION['19'] == '4'
+
+
+def test_bedmachine_file_rejects_a_missing_local_file(tmp_path):
+    with pytest.raises(InvalidParamsError):
+        bedmachine_file(None, local_file=str(tmp_path / 'nope.nc'))
+
+
+def test_bedmachine_bed_to_gdir_writes_bed_errbed_and_source(columbia):
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+
+    with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+        for vn in BEDMACHINE_VARS:
+            assert vn in ds
+        # Categorical fields are mapped with nearest neighbour: an interpolated
+        # source flag would be a number that means nothing.
+        assert set(np.unique(ds['bedmachine_source'].data)) <= {2., 10.}
+        np.testing.assert_allclose(ds['bedmachine_errbed'].data, 42., rtol=1e-5)
+        # The bed is a plane in EPSG:3413, so the regridded values are the
+        # analytic ones at the same points.
+        xx, yy = np.meshgrid(np.arange(gdir.grid.nx), np.arange(gdir.grid.ny))
+        x3413, y3413 = gdir.grid.ij_to_crs(xx, yy, crs='epsg:3413')
+        np.testing.assert_allclose(ds['bedmachine_bed'].data,
+                                   synthetic_bed(x3413, y3413), atol=1.)
+        # and the thickness keeps the name and the masking of the stock task
+        assert ds['bedmachine_ice_thickness'].long_name.startswith('Ice thickness')
+
+
+def test_bedmachine_bed_to_gdir_rejects_unknown_variables(columbia):
+    gdir, path = columbia
+    with pytest.raises(InvalidParamsError):
+        bedmachine_bed_to_gdir(gdir, local_file=path, add_vars=('bedrock',))
+
+
+def test_extension_slice_finds_what_init_present_time_glacier_built(columbia):
+    gdir, _ = columbia
+    init_present_time_glacier(gdir)
+    fl = gdir.read_pickle('model_flowlines')[-1]
+
+    sl = extension_slice(gdir, fl)
+    assert sl is not None
+    n = gdir.settings['calving_line_extension']
+    assert sl.stop - sl.start == n
+    assert sl.stop == fl.nx
+    # ice-free, rectangular, one width, and a linearly deepening bed
+    assert np.all(fl.thick[sl] == 0)
+    assert np.all(fl.is_rectangular[sl])
+    assert len(np.unique(fl._w0_m[sl])) == 1
+    steps = np.diff(fl.bed_h[sl])
+    np.testing.assert_allclose(steps, steps[0])
+    assert steps[0] < 0
+
+
+def test_extension_slice_refuses_a_bed_it_did_not_build(columbia):
+    """The guard against overwriting real ice, or an extension already replaced."""
+    gdir, _ = columbia
+    init_present_time_glacier(gdir)
+    fl = gdir.read_pickle('model_flowlines')[-1]
+
+    fl.bed_h[-5] += 10.
+    assert extension_slice(gdir, fl) is None
+
+
+def test_calving_extension_replaces_the_bed_and_keeps_the_synthetic(columbia):
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+
+    syn_before = gdir.read_pickle('model_flowlines')[-1].bed_h.copy()
+    out = bedmachine_calving_extension(gdir)
+
+    meas = gdir.read_pickle('model_flowlines')[-1]
+    syn = gdir.read_pickle('model_flowlines', filesuffix='_synthetic')[-1]
+    n = gdir.settings['calving_line_extension']
+
+    # the synthetic copy is untouched, and everything upstream of the front is
+    np.testing.assert_allclose(syn.bed_h, syn_before)
+    np.testing.assert_allclose(meas.bed_h[:-n], syn.bed_h[:-n])
+    assert not np.allclose(meas.bed_h[-n:], syn.bed_h[-n:])
+
+    # the measured bed is the one in gridded_data, at the flowline's own points
+    x, y = (np.asarray(c) for c in meas.line.coords.xy)
+    x3413, y3413 = gdir.grid.ij_to_crs(x[-n:], y[-n:], crs='epsg:3413')
+    np.testing.assert_allclose(meas.bed_h[-n:], synthetic_bed(x3413, y3413),
+                               atol=2.)
+
+    # the ice-free extension stays ice-free: only the ground under it moved
+    assert np.all(meas.thick[-n:] == 0)
+    np.testing.assert_allclose(meas.surface_h[-n:], meas.bed_h[-n:])
+    assert out['fl_0']['bed_extension_measured_mean'] != \
+        out['fl_0']['bed_extension_synthetic_mean']
+
+
+def test_calving_extension_reruns_from_the_synthetic_bed(columbia):
+    """Re-running with other options must not compound onto the first result."""
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+
+    bedmachine_calving_extension(gdir, width_method='terminus')
+    first = gdir.read_pickle('model_flowlines')[-1].bed_h.copy()
+    bedmachine_calving_extension(gdir, width_method='mean5')
+    second = gdir.read_pickle('model_flowlines')[-1]
+
+    np.testing.assert_allclose(second.bed_h, first)
+    n = gdir.settings['calving_line_extension']
+    syn = gdir.read_pickle('model_flowlines', filesuffix='_synthetic')[-1]
+    np.testing.assert_allclose(second._w0_m[-n:], syn._w0_m[-n:])
+
+
+def test_calving_extension_raises_outside_the_grid(columbia):
+    """OGGM clips a tidewater grid to 10 pixels; the extension is 60 pixels long."""
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+
+    fl = gdir.read_pickle('model_flowlines')[-1]
+    with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+        nx = ds.sizes['x']
+    assert np.max(fl.line.coords.xy[0]) < nx  # this fixture has room
+
+    # the same sampling one grid width further out has none
+    shifted = shpg.LineString(np.array(fl.line.coords) + [nx, 0])
+    vals = sample_gridded_on_line(gdir, shifted, 'bedmachine_bed')
+    assert np.all(np.isnan(vals))
+
+
+def test_calving_extension_refuses_a_land_terminating_glacier(columbia):
+    gdir, path = columbia
+    init_present_time_glacier(gdir)
+    gdir.is_tidewater = False
+    try:
+        with pytest.raises(InvalidWorkflowError):
+            bedmachine_calving_extension(gdir)
+    finally:
+        gdir.is_tidewater = True
+
+
+def test_width_methods_pick_the_width_the_law_will_use(columbia):
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+    n = gdir.settings['calving_line_extension']
+    w_inv = gdir.settings['calving_front_width']
+
+    widths = {}
+    for method in ('mean5', 'terminus', 'inversion'):
+        out = bedmachine_calving_extension(gdir, width_method=method)
+        widths[method] = gdir.read_pickle('model_flowlines')[-1]._w0_m[-n:]
+        assert out['fl_0']['width_method'] == method
+
+    np.testing.assert_allclose(widths['inversion'], w_inv)
+    # the terminus cell is the inversion's own front, so those two agree exactly
+    np.testing.assert_allclose(widths['terminus'], w_inv)
+    # OGGM's five-cell mean does not
+    assert np.all(widths['mean5'] > 2 * w_inv)
+
+    with pytest.raises(InvalidParamsError):
+        bedmachine_calving_extension(gdir, width_method='mean10')
+
+
+def test_calving_front_width_check_is_exact_at_the_front_and_not_beyond(columbia):
+    """OGGM #875. Every law is proportional to this width."""
+    gdir, path = columbia
+    init_present_time_glacier(gdir)
+
+    d = calving_front_width_check(gdir)
+    # the run's width at the present terminus IS the inversion's, to machine
+    # precision: the defect is latent, not immediate
+    assert d['rel_diff_terminus'] < 1e-12
+    # and it is the extension that breaks it, by a factor, not a few per cent
+    assert d['rel_diff_extension'] > 1.
+    assert d['passes'] is False
+
+    with pytest.raises(InvalidWorkflowError):
+        calving_front_width_check(gdir, raise_on_fail=True)
+
+
+def test_calving_front_width_check_passes_once_the_bed_is_replaced(columbia):
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+    bedmachine_calving_extension(gdir, width_method='inversion')
+
+    d = calving_front_width_check(gdir)
+    assert d['passes'] is True
+    assert d['rel_diff_extension'] < 1e-12
+
+
+def test_bed_extension_statistics_reports_both_beds(columbia):
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+    bedmachine_calving_extension(gdir)
+
+    d = bed_extension_statistics(gdir)
+    assert d['n_extension'] == gdir.settings['calving_line_extension']
+    assert d['extension_length_m'] == d['n_extension'] * d['dx_meter']
+    # the synthetic bed deepens by construction; the measured one need not
+    assert d['slope_synthetic'] > 0
+    assert d['depth_mean_synthetic'] != d['depth_mean_measured']
+    assert d['bed_rmse'] > 0
+
+
+def _extension_bed_model(bed_profile, calving_k=0.6, years=400):
+    """A marine flowline whose extension bed is prescribed, and nothing else.
+
+    Everything upstream of the terminus is identical between calls, so a difference
+    in `calving_m3` is the extension bed and only the extension bed.
+    """
+    from oggm.core.flowline import FluxBasedModel, MixedBedFlowline
+    from oggm.core.massbalance import ScalarMassBalance
+
+    nx, n_ext, dx_meter, map_dx = 60, 30, 400., 200.
+    bed_h = np.concatenate([np.linspace(900., -60., nx), bed_profile])
+    surface_h = bed_h.copy()
+    thick = np.zeros(nx + n_ext)
+    thick[:nx] = np.linspace(20., 260., nx)
+    surface_h[:nx] = bed_h[:nx] + thick[:nx]
+    widths_m = np.full(nx + n_ext, 1000.)
+    lambdas = np.zeros(nx + n_ext)
+    fl = MixedBedFlowline(dx=dx_meter / map_dx, map_dx=map_dx,
+                          surface_h=surface_h, bed_h=bed_h,
+                          section=widths_m * thick,
+                          bed_shape=np.zeros(nx + n_ext),
+                          is_trapezoid=np.ones(nx + n_ext, dtype=bool),
+                          lambdas=lambdas, widths_m=widths_m)
+    model = FluxBasedModel([fl], mb_model=ScalarMassBalance(),
+                           is_tidewater=True, do_kcalving=True,
+                           calving_use_limiter=True, flux_gate=0.12,
+                           calving_k=calving_k, water_level=0.)
+    model.run_until(years)
+    return model
+
+
+@pytest.mark.slow
+def test_a_deepening_extension_calves_more_than_a_measured_shelf():
+    """The first-order consequence: Q is proportional to d, and d is invented.
+
+    OGGM's extension deepens at `calving_front_slope` for 12 km. A measured bed
+    that stays at the terminus depth, or shoals onto a sill, is a different run.
+    """
+    n, dx = 30, 400.
+    deepening = np.linspace(-60., -60. - n * dx * 0.05, n)   # what OGGM builds
+    flat = np.full(n, -60.)                                  # a measured shelf
+    sill = np.linspace(-60., 5., n)                          # a measured sill
+
+    m_deep = _extension_bed_model(deepening)
+    m_flat = _extension_bed_model(flat)
+    m_sill = _extension_bed_model(sill)
+
+    assert m_deep.calving_m3_since_y0 > 0
+    assert m_deep.calving_m3_since_y0 > m_flat.calving_m3_since_y0
+    # a bed that leaves the water switches the calving gate off entirely
+    assert m_sill.calving_m3_since_y0 < m_flat.calving_m3_since_y0
+    # and the difference is not a rounding one
+    assert m_deep.calving_m3_since_y0 / m_flat.calving_m3_since_y0 > 1.1
+
+
+@pytest.mark.slow
+def test_calving_vs_bed_extension_compares_two_runs_of_one_glacier(columbia):
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+    bedmachine_calving_extension(gdir)
+
+    d = calving_vs_bed_extension(gdir, ys=1950, ye=2000)
+    assert d['calving_m3_synthetic'] > 0
+    assert d['calving_m3_measured'] > 0
+    assert np.isfinite(d['calving_ratio'])
