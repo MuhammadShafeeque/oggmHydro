@@ -480,8 +480,8 @@ def test_destine_reader_writes_the_ocean_file(tmp_path, destine_file):
 
     with xr.open_dataset(gdir.get_filepath('ocean_data')) as ds:
         assert ds.sizes['time'] == 60
-        assert list(ds.band_name.astype(str).str.join(dim='nchar').values) == ['terminus',
-                                                                               'ismip6']
+        assert [b''.join(r).decode().strip() for r in ds['band_name'].values] == [
+            'terminus', 'ismip6']
         assert np.isfinite(ds.thermal_forcing).all()
         assert ds.ref_pix_lon == pytest.approx(-17.0)   # 343 E, normalised
         assert ds.ref_bathymetry_m == pytest.approx(60.0)
@@ -523,12 +523,22 @@ def test_destine_reader_rejects_non_finite_input(tmp_path):
         process_destine_ocean_data(FakeGdir(tmp_path), fpath=str(fpath))
 
 
-def test_destine_reader_rejects_a_short_siconc(tmp_path):
-    from oggm.shop.ocean import process_destine_ocean_data
+def test_short_siconc_raises(tmp_path):
+    """Written into an unlimited dimension, a short series reads back as a fill value."""
+    import pandas as pd
 
-    fpath = _destine_file(tmp_path / 'short.nc', siconc_len=59)
-    with pytest.raises(InvalidWorkflowError, match='different time axes'):
-        process_destine_ocean_data(FakeGdir(tmp_path), fpath=str(fpath))
+    from oggm.shop.ocean import process_ocean_data
+
+    time = pd.date_range('2000-01-01', '2001-12-01', freq='MS')
+    depth = np.array([10., 50., 300.])
+    coords = {'time': time, 'depth': depth, 'lon': -17.0, 'lat': 81.4}
+    thetao = xr.DataArray(np.full((24, 3), 275.), dims=('time', 'depth'), coords=coords)
+    so = xr.DataArray(np.full((24, 3), 34.6), dims=('time', 'depth'), coords=coords)
+    siconc = xr.DataArray(np.full(20, 0.5), dims=('time',),
+                          coords={'time': time[:20]})
+    with pytest.raises(InvalidParamsError, match='siconc'):
+        process_ocean_data(FakeGdir(tmp_path), thetao=thetao, so=so, siconc=siconc,
+                           depth_bands=[('terminus', 0., 60.)])
 
 
 def test_destine_reader_rejects_kwargs_it_builds(tmp_path, destine_file):
