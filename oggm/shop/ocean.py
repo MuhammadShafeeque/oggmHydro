@@ -10,6 +10,7 @@ ISMIP6 200-500 m average against a band matched to the real terminus depth is a
 selection rather than a re-extraction.
 """
 import logging
+import os
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,7 @@ from oggm import cfg
 from oggm import entity_task
 from oggm import utils
 from oggm.core.ocean_params import ocean_param
+from oggm.shop.gcm_climate import _get_xr_cftime_kwargs
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 
 log = logging.getLogger(__name__)
@@ -98,6 +100,13 @@ def thermal_forcing_bands(thetao, so, depth, depth_bands, band_weighting,
             raise InvalidWorkflowError(
                 f'band {name} [{top}, {bot}] m contains no ocean levels; '
                 f'available depths are {z.min():.0f}-{z.max():.0f} m')
+
+        if not np.isfinite(thetao[:, sel]).all() or not np.isfinite(so[:, sel]).all():
+            # The level check above tests the depth coordinate, so a band whose levels are
+            # all below the sea floor passes it and averages to a nan column instead.
+            raise InvalidWorkflowError(
+                f'band {name} [{top}, {bot}] m has non-finite values; land and '
+                f'sub-bathymetry levels must be dropped before this call')
 
         how = band_weighting.get(name, 'uniform')
         if how == 'depth_weighted':
@@ -237,6 +246,111 @@ def process_ocean_data(gdir, thetao=None, so=None, siconc=None,
                       offsets=offsets, teos10=teos10,
                       bias_applied=bool(apply_bias_correction),
                       filesuffix=output_filesuffix)
+
+
+@entity_task(log, writes=['ocean_data'])
+def process_destine_ocean_data(gdir, fpath=None, y0=None, y1=None,
+                               terminus_depth=None, terminus_depth_source='',
+                               thetao_var='thetao', so_var='so', siconc_var='siconc',
+                               depth_var='depth', filesuffix='', output_filesuffix='',
+                               source=None, ocean_model='', **kwargs):
+    """Write ocean_data.nc from a DestinE Climate-DT per-site extraction.
+
+    The file is the footprint reduction of the Gen2 archive: one water column, monthly,
+    with scalar lon/lat. Everything spatial happened upstream, so this is the calendar and
+    units layer between that file and :func:`process_ocean_data`, built like
+    :func:`oggm.shop.gcm_climate.process_cmip_data`.
+
+    Parameters
+    ----------
+    fpath : str
+        the extraction file. Defaults to ``cfg.PATHS['destine_ocean_file']``.
+    y0, y1 : int
+        clip to these years, whole calendar years only.
+    terminus_depth : float
+        water depth at this terminus, metres. Bathymetry, not an ocean-model quantity,
+        so it is never read from `fpath`.
+    thetao_var, so_var, siconc_var, depth_var : str
+        source variable names, since the archive's own labels are not settled.
+    **kwargs : any kwarg accepted by :func:`process_ocean_data`.
+    """
+    if filesuffix:
+        output_filesuffix = filesuffix
+    for key in ('thetao', 'so', 'siconc', 'subglacial_discharge', 'output_filesuffix'):
+        if key in kwargs:
+            raise InvalidParamsError(f'{key} is built by this task, not passed to it')
+
+    if not gdir.is_tidewater:
+        log.warning('(%s) not tidewater, no ocean data written', gdir.rgi_id)
+        return
+
+    fpath = fpath or cfg.PATHS.get('destine_ocean_file')
+    if not fpath:
+        raise InvalidParamsError("Need to set cfg.PATHS['destine_ocean_file']")
+
+    with xr.open_dataset(fpath, **_get_xr_cftime_kwargs()) as ds:
+        ds = ds.squeeze(drop=True)
+        if y0 is not None or y1 is not None:
+            ds = ds.sel(time=slice(str(y0) if y0 else None, str(y1) if y1 else None))
+        ds = _whole_years(ds)
+        if not ds.sizes.get('time'):
+            raise InvalidWorkflowError('no complete calendar year in the selection')
+
+        thetao = ds[thetao_var].rename({depth_var: 'depth'}).transpose('time', 'depth')
+        so = ds[so_var].rename({depth_var: 'depth'}).transpose('time', 'depth')
+        if float(thetao['depth'][0]) < 0:
+            thetao = thetao.assign_coords(depth=-thetao['depth'])
+            so = so.assign_coords(depth=thetao['depth'])
+        siconc = ds[siconc_var] if siconc_var in ds else None
+
+        lon = ((float(ds['lon']) + 180) % 360) - 180
+        for da in (thetao, so):
+            da.coords['lon'] = lon
+            da.coords['lat'] = float(ds['lat'])
+
+        for name, da in (('thetao', thetao), ('so', so)):
+            if not np.isfinite(da.values).all():
+                raise InvalidWorkflowError(
+                    f'{name} carries non-finite values; the extraction must drop land and '
+                    f'sub-bathymetry levels, which this file has not')
+        if siconc is not None and siconc.sizes['time'] != thetao.sizes['time']:
+            # An unlimited time dimension takes a short series without complaint and reads
+            # the tail back as a fill value.
+            raise InvalidWorkflowError('siconc and thetao are on different time axes')
+
+        # The file knows which bands its footprint supports; a band it dropped cannot be
+        # rebuilt here, and asking for one raises in thermal_forcing_bands.
+        if 'depth_bands' not in kwargs and ds.attrs.get('bands'):
+            kwargs['depth_bands'] = [(b.split(':')[0], float(b.split(':')[1]),
+                                      float(b.split(':')[2]))
+                                     for b in ds.attrs['bands'].split()]
+        for key, attr in (('extraction', 'extraction'), ('n_cells', 'n_cells'),
+                          ('search_radius_km', 'search_radius_km')):
+            if key not in kwargs and attr in ds.attrs:
+                kwargs[key] = ds.attrs[attr]
+        if terminus_depth is None and 'terminus_depth_m' in ds.attrs:
+            terminus_depth = float(ds.attrs['terminus_depth_m'])
+
+        source = source or ds.attrs.get('source') or os.path.basename(fpath)
+        ocean_model = ocean_model or ds.attrs.get('model', '')
+
+        process_ocean_data(gdir, thetao=thetao, so=so, siconc=siconc,
+                           terminus_depth=terminus_depth,
+                           terminus_depth_source=terminus_depth_source,
+                           source=source, ocean_model=ocean_model,
+                           output_filesuffix=output_filesuffix, **kwargs)
+
+
+def _whole_years(ds):
+    """Trim to complete January-December years, which process_ocean_data insists on."""
+    years = ds['time.year'].values
+    months = ds['time.month'].values
+    keep = np.zeros(ds.sizes['time'], dtype=bool)
+    for year in np.unique(years):
+        sel = years == year
+        if sel.sum() == 12 and months[sel][0] == 1 and months[sel][-1] == 12:
+            keep |= sel
+    return ds.isel(time=keep)
 
 
 def _write_ocean_file(gdir, time, names, tops, bots, weights, tf, th, sa,
