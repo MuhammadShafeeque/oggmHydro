@@ -315,8 +315,8 @@ def process_destine_ocean_data(gdir, fpath=None, y0=None, y1=None,
         for name, da in (('thetao', thetao), ('so', so)):
             if not np.isfinite(da.values).all():
                 raise InvalidWorkflowError(
-                    f'{name} carries non-finite values; the extraction must drop land and '
-                    f'sub-bathymetry levels, which this file has not')
+                    f'{name} carries non-finite values; land and sub-bathymetry '
+                    f'levels must be dropped by the extraction')
         # The file knows which bands its footprint supports; a band it dropped cannot be
         # rebuilt here, and asking for one raises in thermal_forcing_bands.
         if 'depth_bands' not in kwargs and ds.attrs.get('bands'):
