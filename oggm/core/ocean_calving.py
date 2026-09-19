@@ -274,12 +274,14 @@ class MeltPlusCalving(_OceanCalvingLaw):
 
     name = 'melt_calving'
 
-    def __init__(self, *args, k_c=None, lam=None, water_depth=None, **kwargs):
+    def __init__(self, *args, k_c=None, lam=None, water_depth=None, alpha=None,
+                 beta=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.A = ocean_param('calving_melt_A')
         self.B = ocean_param('calving_melt_B')
-        self.alpha = ocean_param('calving_melt_alpha')
-        self.beta = ocean_param('calving_melt_beta')
+        # per law, so a sweep need not mutate cfg.PARAMS
+        self.alpha = ocean_param('calving_melt_alpha') if alpha is None else alpha
+        self.beta = ocean_param('calving_melt_beta') if beta is None else beta
         self.lam = ocean_param('calving_undercut_efficiency') if lam is None else lam
         self.k_c = k_c  # a-1
         self.water_depth = water_depth  # m, from bathymetry when known
