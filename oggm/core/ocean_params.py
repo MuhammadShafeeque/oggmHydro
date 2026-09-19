@@ -44,6 +44,14 @@ DEFAULTS = {
     'calving_undercut_efficiency': 1.0,
     'calving_openwater_exponent': 1.0,
     'calving_ocean_water_depth': 'inverted',
+
+    # --- the bed under the calving front (oggm.shop.bedmachine_bed,
+    #     oggm.core.bedmachine_flowline) ---
+    'bedmachine_version': None,
+    'bedmachine_file': None,
+    'bed_extension_width_method': 'inversion',
+    'bed_extension_match_terminus': False,
+    'calving_front_width_rtol': 0.05,
 }
 
 
