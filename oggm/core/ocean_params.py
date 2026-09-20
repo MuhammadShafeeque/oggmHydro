@@ -34,6 +34,7 @@ DEFAULTS = {
     'ocean_search_radius_km': 25.,
     'ocean_open_water_threshold': 0.15,
     'ocean_bias_correct': False,
+    'ocean_water_density': 1028.,
 
     'calving_law': 'constant',
     'calving_tf_exponent': 1.18,
