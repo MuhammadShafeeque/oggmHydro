@@ -25,6 +25,7 @@ from oggm import entity_task
 from oggm.core.ocean_calving import _band_names
 from oggm.core.ocean_params import ocean_param
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
+from oggm.utils import DisableLogger
 
 log = logging.getLogger(__name__)
 
@@ -210,3 +211,198 @@ def frontal_ablation_corrected_mb(ref_mb, area_m2, calving_flux_km3=None,
     if below_wl_flux_km3:
         corr += f_bwl * below_wl_flux_km3 * 1e9 * rho / area_m2
     return ref_mb - corr
+
+
+# --- the bathymetry route ---------------------------------------------------
+#
+# The stock inversion solves for the water depth that makes the calving law and the
+# SIA agree, taking the free-board from the DEM. Where the DEM puts a marine terminus
+# at sea level the free-board is ~0, the solved depth collapses onto the full ice
+# thickness, and the flux scales as thickness squared. Fixing the depth from measured
+# bathymetry replaces one unknown with an observation and leaves `k` as the only
+# parameter, which is what the frontal-ablation observations constrain.
+
+
+@entity_task(log)
+def terminus_water_depth_from_bed(gdir, bed_var='bedmachine_bed',
+                                  dilate=2, min_pixels=5):
+    """Measured water depth at the calving front, metres, positive down.
+
+    The median of the sub-sea-level bed over the ocean cells that touch the glacier
+    mask, i.e. the ice-ocean contact on the glacier's own grid. Taken from the mask
+    rather than from a terminus coordinate because elevation-band flowlines carry no
+    geometry, and taken as a median over the contact rather than one cell because
+    neither the outline nor the bed grid is accurate to a single 150 m cell.
+
+    Writes ``terminus_water_depth`` and ``terminus_water_depth_n`` to the settings.
+    """
+    import xarray as xr
+    from scipy import ndimage
+
+    if not gdir.is_tidewater:
+        return None
+
+    with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+        if bed_var not in ds:
+            raise InvalidWorkflowError(
+                f'({gdir.rgi_id}) no {bed_var} in gridded_data; run '
+                'bedmachine_bed_to_gdir first.')
+        bed = ds[bed_var].values
+        mask = ds['glacier_mask'].values.astype(bool)
+
+    ring = ndimage.binary_dilation(mask, iterations=int(dilate)) & ~mask
+    wet = bed[ring & np.isfinite(bed) & (bed < 0)]
+    if wet.size < min_pixels:
+        # No ocean touching the outline: fall back to the deepest water in the
+        # domain, which is the fjord the front drains into.
+        wet = bed[np.isfinite(bed) & (bed < 0)]
+    if wet.size < min_pixels:
+        raise InvalidWorkflowError(
+            f'({gdir.rgi_id}) only {wet.size} sub-sea-level bed cells in the '
+            f'domain; cannot set a water depth.')
+
+    depth = float(-np.median(wet))
+    gdir.settings['terminus_water_depth'] = depth
+    gdir.settings['terminus_water_depth_n'] = int(wet.size)
+    return depth
+
+
+def flotation_thickness(water_depth, rho_ocean=None, rho_ice=None):
+    """Ice thickness a front of this water depth carries at flotation, metres."""
+    rho_ocean = rho_ocean or ocean_param('ocean_water_density')
+    rho_ice = rho_ice or cfg.PARAMS['ice_density']
+    return float(water_depth) * rho_ocean / rho_ice
+
+
+def calving_law_flux(gdir, water_depth=None, k=None, thick=None,
+                     input_filesuffix=''):
+    """``k * thick * water_depth * width`` in km3 yr-1, at a prescribed depth.
+
+    Deliberately not :func:`oggm.core.inversion.calving_flux_from_depth`: that one
+    derives the thickness from the DEM free-board, which is the quantity this route
+    exists to stop using.
+    """
+    if water_depth is None:
+        water_depth = gdir.settings['terminus_water_depth']
+    if k is None:
+        k = gdir.settings['inversion_calving_k']
+    if thick is None:
+        thick = flotation_thickness(water_depth)
+    fl = gdir.read_pickle('inversion_flowlines', filesuffix=input_filesuffix)[-1]
+    width = fl.widths[-1] * gdir.grid.dx
+    return dict(flux=max(k * thick * water_depth * width / 1e9, 0.),
+                width=width, thick=thick, water_depth=water_depth,
+                inversion_calving_k=k, free_board=thick - water_depth)
+
+
+@entity_task(log)
+def find_inversion_calving_from_bathymetry(gdir, water_depth=None, k=None,
+                                           mb_model=None, mb_years=None,
+                                           glen_a=None, fs=None,
+                                           settings_filesuffix='',
+                                           input_filesuffix='',
+                                           output_filesuffix=''):
+    """Calving inversion with the water depth prescribed rather than solved.
+
+    Drop-in for :func:`oggm.core.inversion.find_inversion_calving_from_any_mb` when
+    bathymetry is available. The flux follows from the measured depth and ``k``; the
+    thickness inversion is then re-run against it, exactly as the stock task does
+    once it has found its own flux.
+    """
+    from oggm.core import massbalance
+    from oggm.core.inversion import prepare_for_inversion, mass_conservation_inversion
+
+    if not gdir.is_tidewater:
+        return None
+
+    if water_depth is None:
+        water_depth = gdir.settings.get('terminus_water_depth')
+    if water_depth is None:
+        raise InvalidWorkflowError(
+            f'({gdir.rgi_id}) no terminus_water_depth; run '
+            'terminus_water_depth_from_bed first, or pass one.')
+
+    # Volume without calving, for the same statistic the stock task records.
+    gdir.inversion_calving_rate = 0
+    with DisableLogger():
+        massbalance.apparent_mb_from_any_mb(
+            gdir, settings_filesuffix=settings_filesuffix,
+            input_filesuffix=input_filesuffix,
+            output_filesuffix=output_filesuffix,
+            mb_model=mb_model, mb_years=mb_years)
+        prepare_for_inversion(gdir, settings_filesuffix=settings_filesuffix,
+                              input_filesuffix=input_filesuffix,
+                              output_filesuffix=output_filesuffix)
+        v_ref = mass_conservation_inversion(
+            gdir, settings_filesuffix=settings_filesuffix,
+            input_filesuffix=output_filesuffix,
+            output_filesuffix=output_filesuffix, glen_a=glen_a, fs=fs)
+    gdir.settings['volume_before_calving'] = v_ref
+
+    out = calving_law_flux(gdir, water_depth=water_depth, k=k,
+                           input_filesuffix=output_filesuffix)
+    gdir.inversion_calving_rate = out['flux']
+
+    with DisableLogger():
+        massbalance.apparent_mb_from_any_mb(
+            gdir, settings_filesuffix=settings_filesuffix,
+            input_filesuffix=input_filesuffix,
+            output_filesuffix=output_filesuffix,
+            mb_model=mb_model, mb_years=mb_years)
+        prepare_for_inversion(gdir, settings_filesuffix=settings_filesuffix,
+                              input_filesuffix=output_filesuffix,
+                              output_filesuffix=output_filesuffix)
+        mass_conservation_inversion(
+            gdir, settings_filesuffix=settings_filesuffix,
+            input_filesuffix=output_filesuffix,
+            output_filesuffix=output_filesuffix,
+            water_level=0., glen_a=glen_a, fs=fs)
+
+    fl = gdir.read_pickle('inversion_flowlines', filesuffix=output_filesuffix)[-1]
+    f_calving = (fl.flux[-1] * (gdir.grid.dx ** 2) * 1e-9
+                 / gdir.settings['ice_density'])
+
+    odf = {'calving_flux': f_calving,
+           'calving_law_flux': out['flux'],
+           'calving_rate_myr': f_calving * 1e9 / (out['thick'] * out['width']),
+           'calving_water_level': 0.,
+           'calving_inversion_k': out['inversion_calving_k'],
+           'calving_front_water_depth': out['water_depth'],
+           'calving_front_free_board': out['free_board'],
+           'calving_front_thick': out['thick'],
+           'calving_front_width': out['width'],
+           'calving_depth_source': 'bathymetry'}
+    for key, val in odf.items():
+        gdir.settings[key] = val
+    return odf
+
+
+def fit_calving_k(gdirs, observed_flux, water_depth=None, input_filesuffix=''):
+    """Pooled ``k`` matching the summed observed frontal ablation.
+
+    Pooled rather than per-divide because `k` is fitted across the divide set, the
+    same argument that makes the Glen A fit a global task. Returns the pooled value
+    and the per-divide values it is pooled from, which are the spread to report.
+
+    Parameters
+    ----------
+    observed_flux : dict
+        rgi_id -> observed frontal ablation in km3 yr-1 of ice. Divides absent
+        from it take no part in the fit.
+    """
+    num, den, per = 0., 0., {}
+    for gdir in gdirs:
+        obs = observed_flux.get(gdir.rgi_id)
+        if obs is None or not gdir.is_tidewater:
+            continue
+        d = water_depth or gdir.settings.get('terminus_water_depth')
+        shape = calving_law_flux(gdir, water_depth=d, k=1.,
+                                 input_filesuffix=input_filesuffix)['flux']
+        if shape <= 0:
+            continue
+        num += obs
+        den += shape
+        per[gdir.rgi_id] = obs / shape
+    if den <= 0:
+        raise InvalidWorkflowError('no divide contributed to the k fit')
+    return num / den, per

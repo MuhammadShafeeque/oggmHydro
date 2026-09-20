@@ -97,13 +97,21 @@ def bedmachine_file(gdir, version=None, local_file=None):
 
 
 def _open_bedmachine(path):
-    """BedMachine as a salem-aware dataset, with its projection filled in."""
+    """BedMachine as a salem-aware dataset, with its projection filled in.
+
+    The projection comes from the file's own `mapping` variable, which both
+    hemispheres carry. Guessing it from the sign of `y` is wrong: BedMachine
+    Greenland spans -3384425 to -632675 m, so a sign test puts it in Antarctica.
+    """
     ds = xr.open_dataset(path)
-    proj = ds.attrs.get('proj4', None)
+    proj = ds.attrs.get('proj4')
+    if proj is None and 'mapping' in ds:
+        a = ds['mapping'].attrs
+        proj = a.get('proj4text') or a.get('crs_wkt') or a.get('spatial_ref')
     if proj is None:
-        # Both grids are the standard polar stereographic ones; the global
-        # attribute the stock module reads is not guaranteed to be there.
-        proj = 'epsg:3413' if float(ds.y[0]) > 0 else 'epsg:3031'
+        lat0 = ds.attrs.get('geospatial_lat_min')
+        north = float(lat0) > 0 if lat0 is not None else float(ds.y[-1]) > -3.5e6
+        proj = 'epsg:3413' if north else 'epsg:3031'
     ds.attrs['pyproj_srs'] = proj
     return ds
 
