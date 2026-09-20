@@ -438,6 +438,7 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
         n = int(min(max(n, 1), i0 + 1))
         bed_old = fl.bed_h.copy()
         surf = fl.surface_h.copy()
+        vol_before = float(np.sum(fl.section) * fl.dx_meter)
 
         # The ice: the full correction at the front, dying out n cells upglacier.
         target = wl - water_depth
@@ -490,10 +491,8 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
                                             if n_ext > 0 else np.nan),
             'bed_extension_synthetic_mean': (float(np.mean(bed_old[i0 + 1:]))
                                              if n_ext > 0 else np.nan),
-            'volume_removed_m3': float(np.sum((surf - bed_new) * 0. +
-                                              (bed_new - bed_old)[:i0 + 1] *
-                                              fl.widths_m[:i0 + 1]) *
-                                       fl.dx_meter),
+            'volume_before_m3': vol_before,
+            'volume_after_m3': float(np.sum(fl.section) * fl.dx_meter),
         }
 
     if not out:
