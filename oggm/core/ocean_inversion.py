@@ -302,25 +302,46 @@ def flotation_thickness(water_depth, rho_ocean=None, rho_ice=None):
     return float(water_depth) * rho_ocean / rho_ice
 
 
+def front_thickness(gdir, water_depth, input_filesuffix=''):
+    """Terminus thickness at the prescribed depth: free board plus depth.
+
+    Flotation is the *minimum* a front of this depth can carry, not what it does
+    carry. Over the twelve FIIC divides the DEM free board puts eleven above it, by
+    a median factor of 1.39, so they are grounded and flotation understates them.
+    It is kept as the floor, which is what the twelfth needs.
+
+    This is also the thickness the run has: ``bedmachine_terminus_bed`` holds the
+    DEM surface and sets ``bed_h = water_level - water_depth``, so the forward
+    model's front carries exactly this. Calibrating ``k`` against anything else
+    makes the run miss the observation at t = 0 by the ratio between the two.
+    """
+    fl = gdir.read_pickle('inversion_flowlines', filesuffix=input_filesuffix)[-1]
+    free_board = max(float(fl.surface_h[-1]), 0.)
+    return max(free_board + float(water_depth), flotation_thickness(water_depth))
+
+
 def calving_law_flux(gdir, water_depth=None, k=None, thick=None,
                      input_filesuffix=''):
     """``k * thick * water_depth * width`` in km3 yr-1, at a prescribed depth.
 
     Deliberately not :func:`oggm.core.inversion.calving_flux_from_depth`: that one
-    derives the thickness from the DEM free-board, which is the quantity this route
-    exists to stop using.
+    *solves* for the depth and takes the thickness from it, which is the step this
+    route exists to replace. Here the depth is the measurement and the thickness
+    follows from it and the free board (:func:`front_thickness`).
     """
     if water_depth is None:
         water_depth = gdir.settings['terminus_water_depth']
     if k is None:
         k = gdir.settings['inversion_calving_k']
     if thick is None:
-        thick = flotation_thickness(water_depth)
+        thick = front_thickness(gdir, water_depth,
+                                input_filesuffix=input_filesuffix)
     fl = gdir.read_pickle('inversion_flowlines', filesuffix=input_filesuffix)[-1]
     width = fl.widths[-1] * gdir.grid.dx
     return dict(flux=max(k * thick * water_depth * width / 1e9, 0.),
                 width=width, thick=thick, water_depth=water_depth,
-                inversion_calving_k=k, free_board=thick - water_depth)
+                inversion_calving_k=k, free_board=thick - water_depth,
+                thick_flotation=flotation_thickness(water_depth))
 
 
 @entity_task(log)
@@ -398,6 +419,7 @@ def find_inversion_calving_from_bathymetry(gdir, water_depth=None, k=None,
            'calving_front_water_depth': out['water_depth'],
            'calving_front_free_board': out['free_board'],
            'calving_front_thick': out['thick'],
+           'calving_front_thick_flotation': out['thick_flotation'],
            'calving_front_width': out['width'],
            'calving_depth_source': 'bathymetry'}
     for key, val in odf.items():
