@@ -153,9 +153,13 @@ def offshore_bed_profile(gdir, n_points, bed_var='bedmachine_bed', min_pixels=3)
     """
     from scipy import ndimage
 
+    from oggm.core.ocean_inversion import ocean_cells
+
     bed, mask = _gridded(gdir, bed_var, 'glacier_mask')
-    dist = ndimage.distance_transform_edt(mask != 1) * gdir.grid.dx
-    wet = np.isfinite(bed) & (bed < 0)
+    mask = mask == 1
+    with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+        wet, _ = ocean_cells(ds, mask, bed_var=bed_var)
+    dist = ndimage.distance_transform_edt(~mask) * gdir.grid.dx
     dx = gdir.grid.dx
     out = np.full(int(n_points), np.nan)
     for j in range(int(n_points)):
@@ -502,7 +506,7 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
                 f'at the front (surface {surf[i0]:.0f} m). The prescribed water '
                 'depth and the DEM disagree about where sea level is.')
 
-        rho_o = ocean_param('ocean_water_density')
+        from oggm.core.ocean_inversion import flotation_thickness
         out[f'fl_{i}'] = {
             'terminus_index': i0,
             'n_blend': n,
@@ -515,8 +519,7 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
             'bed_terminus_after': float(bed_new[i0]),
             'thick_terminus_before': float(surf[i0] - bed_old[i0]),
             'thick_terminus_after': float(fl.thick[i0]),
-            'thick_flotation': float(water_depth * rho_o /
-                                     cfg.PARAMS['ice_density']),
+            'thick_flotation': flotation_thickness(water_depth),
             'width_terminus': float(fl.widths_m[i0]),
             'bed_extension_measured_mean': (float(np.mean(bed_new[i0 + 1:]))
                                             if n_ext > 0 else np.nan),
