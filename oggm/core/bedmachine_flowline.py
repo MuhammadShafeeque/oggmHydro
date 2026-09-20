@@ -462,13 +462,13 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
         if method == 'measured':
             bed_bm = sample_gridded_by_band(gdir, surf[:i0 + 1], bed_var)
             bed_bm = bed_bm + (target - bed_bm[i0])
-            marine = np.nonzero((bed_bm >= wl) | (bed_old >= wl))[0]
+            marine = np.nonzero((bed_bm >= wl) | (bed_old[:i0 + 1] >= wl))[0]
             lo = int(marine[-1]) + 1 if marine.size else 0
             zone = slice(lo, i0 + 1)
             ramp = np.ones(i0 + 1 - lo)
             m = min(n, len(ramp))
             ramp[:m] = np.arange(1, m + 1) / m
-            bed_new[zone] += ramp * (bed_bm[zone] - bed_old[zone])
+            bed_new[zone] += ramp * (bed_bm[lo:] - bed_old[zone])
         elif method == 'flat':
             lo = i0 - n + 1
             bed_new[lo:i0 + 1] += (np.linspace(1., n, n) / n) * (target - bed_old[i0])
