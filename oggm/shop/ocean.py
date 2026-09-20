@@ -21,6 +21,7 @@ from netCDF4 import date2num
 from oggm import cfg
 from oggm import entity_task
 from oggm import utils
+from oggm.core.ocean_calving import _band_names
 from oggm.core.ocean_params import ocean_param
 from oggm.shop.gcm_climate import _get_xr_cftime_kwargs
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
@@ -226,6 +227,22 @@ def process_ocean_data(gdir, thetao=None, so=None, siconc=None,
     offsets = np.zeros(len(names))
     if ref_ocean is not None:
         ref = ref_ocean.sel(time=slice(*year_range)).thermal_forcing.mean('time')
+        # `band` is a bare dimension in ocean_data.nc, so an unaligned reference would
+        # be subtracted band by index and produce a plausible wrong offset.
+        ref_names = _band_names(ref_ocean) if 'band_name' in ref_ocean else None
+        if ref_names is not None:
+            missing = [n for n in names if n not in ref_names]
+            if missing:
+                raise InvalidParamsError(
+                    f'ref_ocean has no band(s) {", ".join(missing)}; it carries '
+                    f'{", ".join(ref_names)}')
+            ref = ref.isel(band=[ref_names.index(n) for n in names])
+        elif ref.sizes['band'] != len(names):
+            raise InvalidParamsError(
+                f'ref_ocean has {ref.sizes["band"]} bands against {len(names)} here, '
+                f'and no band_name to align them by')
+        if not np.isfinite(ref.values).all():
+            raise InvalidWorkflowError('ref_ocean has no data in the reference period')
         mod = xr.DataArray(
             tf, dims=('time', 'band'),
             coords={'time': thetao['time'].values, 'band': names},
