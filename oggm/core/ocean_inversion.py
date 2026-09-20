@@ -223,6 +223,27 @@ def frontal_ablation_corrected_mb(ref_mb, area_m2, calving_flux_km3=None,
 # parameter, which is what the frontal-ablation observations constrain.
 
 
+# BedMachine's own mask: 0 ocean, 1 ice-free land, 2 grounded ice, 3 floating ice.
+BEDMACHINE_OCEAN, BEDMACHINE_FLOATING = 0, 3
+
+
+def ocean_cells(ds, mask, bed_var='bedmachine_bed'):
+    """Cells outside the glacier that are ocean, with the reason recorded.
+
+    ``bedmachine_mask`` is used where the file carries it. "Bed below sea level
+    outside the divide" is not the same thing at 81 N, where most of the bed around
+    one divide is below sea level *under the neighbouring ice*: over the twelve FIIC
+    divides that test admits two to six times as many cells as BedMachine's own
+    ocean class, and it changes the median depth by up to a factor of three.
+    """
+    bed = np.asarray(ds[bed_var].values, dtype=float)
+    wet = np.isfinite(bed) & (bed < 0) & ~mask
+    if 'bedmachine_mask' in ds:
+        cls = np.round(np.asarray(ds['bedmachine_mask'].values, dtype=float))
+        return wet & np.isin(cls, (BEDMACHINE_OCEAN, BEDMACHINE_FLOATING)), 'mask'
+    return wet, 'bed_below_sea_level'
+
+
 @entity_task(log)
 def terminus_water_depth_from_bed(gdir, bed_var='bedmachine_bed',
                                   dilate=2, min_pixels=5):
@@ -249,13 +270,14 @@ def terminus_water_depth_from_bed(gdir, bed_var='bedmachine_bed',
                 'bedmachine_bed_to_gdir first.')
         bed = ds[bed_var].values
         mask = ds['glacier_mask'].values.astype(bool)
+        ocean, source = ocean_cells(ds, mask, bed_var=bed_var)
 
     ring = ndimage.binary_dilation(mask, iterations=int(dilate)) & ~mask
-    wet = bed[ring & np.isfinite(bed) & (bed < 0)]
+    wet = bed[ring & ocean]
     if wet.size < min_pixels:
-        # No ocean touching the outline: fall back to the deepest water in the
+        # No ocean touching the outline: fall back to the whole ocean in the
         # domain, which is the fjord the front drains into.
-        wet = bed[np.isfinite(bed) & (bed < 0)]
+        wet = bed[ocean]
     if wet.size < min_pixels:
         raise InvalidWorkflowError(
             f'({gdir.rgi_id}) only {wet.size} sub-sea-level bed cells in the '
@@ -264,6 +286,7 @@ def terminus_water_depth_from_bed(gdir, bed_var='bedmachine_bed',
     depth = float(-np.median(wet))
     gdir.settings['terminus_water_depth'] = depth
     gdir.settings['terminus_water_depth_n'] = int(wet.size)
+    gdir.settings['terminus_water_depth_ocean_source'] = source
     return depth
 
 
