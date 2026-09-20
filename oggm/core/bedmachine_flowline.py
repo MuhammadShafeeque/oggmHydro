@@ -361,8 +361,8 @@ def _rectangular_tail(fl, i0):
 
 @entity_task(log, writes=['model_flowlines'])
 def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
-                            bed_var='bedmachine_bed', filesuffix='',
-                            synthetic_filesuffix='_synthetic'):
+                            method='measured', bed_var='bedmachine_bed',
+                            filesuffix='', synthetic_filesuffix='_synthetic'):
     """Put the prescribed calving-front depth on the run's flowline.
 
     :py:func:`oggm.core.ocean_inversion.find_inversion_calving_from_bathymetry`
@@ -373,11 +373,16 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
     Since every calving law reads its water depth as ``-bed_h`` at the last cell
     above water level, the run then calves against a depth nothing constrained.
 
-    This sets the bed at the front to ``water_level - water_depth``, ramps the
-    correction out over ``n_blend`` cells so no surface-gradient step is created,
-    and continues past the terminus over the measured offshore bed
+    This puts the bed at the front at ``water_level - water_depth``, takes the
+    shape of the bed upglacier of it from the measured bed over every cell grounded
+    below sea level, and continues past the terminus over the measured offshore bed
     (:py:func:`offshore_bed_profile`) instead of the invented linear deepening. The
     DEM surface is held fixed, so the ice thickness absorbs the change.
+
+    The zone has to reach upglacier, not just to the front cell: a correction
+    applied to the front alone leaves the cell behind it on the inverted bed, so
+    the first calving step moves the front into deeper water and thicker ice than
+    it left, and the flux runs away over the run.
 
     Parameters
     ----------
@@ -388,8 +393,14 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
         :py:func:`oggm.core.ocean_inversion.terminus_water_depth_from_bed`, which
         is the depth ``k`` was fitted at.
     n_blend : int
-        cells to ramp the correction over, the front included. Default: the
-        rectangular tail, over which the width does not follow the thickness.
+        cells to ramp the correction in over at the upglacier end of the zone.
+        Default: the rectangular tail, over which the width does not follow the
+        thickness.
+    method : str
+        ``'measured'`` takes the shape of the bed from ``bed_var`` binned by
+        elevation and shifts it onto the prescribed front depth; ``'flat'`` ramps
+        the inverted bed onto that depth over ``n_blend`` cells and leaves its
+        shape alone, which is the control.
     bed_var : str
         the ``gridded_data`` variable holding the measured bed
     filesuffix : str
@@ -440,12 +451,30 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
         surf = fl.surface_h.copy()
         vol_before = float(np.sum(fl.section) * fl.dx_meter)
 
-        # The ice: the full correction at the front, dying out n cells upglacier.
+        # The ice. Correcting only the front cell is not enough and is not even
+        # stable: it leaves the cell behind it carrying the inverted bed, so the
+        # first calving step moves the front into deeper water and thicker ice than
+        # it just left, and the flux runs away. The measured bed gives the shape
+        # over the whole grounded-below-sea-level zone; the front is then shifted
+        # onto the prescribed depth, which is what `k` was fitted at.
         target = wl - water_depth
-        delta = target - bed_old[i0]
-        ramp = np.linspace(1., n, n) / n
         bed_new = bed_old.copy()
-        bed_new[i0 - n + 1:i0 + 1] += ramp * delta
+        if method == 'measured':
+            bed_bm = sample_gridded_by_band(gdir, surf[:i0 + 1], bed_var)
+            bed_bm = bed_bm + (target - bed_bm[i0])
+            marine = np.nonzero((bed_bm >= wl) | (bed_old >= wl))[0]
+            lo = int(marine[-1]) + 1 if marine.size else 0
+            zone = slice(lo, i0 + 1)
+            ramp = np.ones(i0 + 1 - lo)
+            m = min(n, len(ramp))
+            ramp[:m] = np.arange(1, m + 1) / m
+            bed_new[zone] += ramp * (bed_bm[zone] - bed_old[zone])
+        elif method == 'flat':
+            lo = i0 - n + 1
+            bed_new[lo:i0 + 1] += (np.linspace(1., n, n) / n) * (target - bed_old[i0])
+        else:
+            raise InvalidParamsError(f"method must be 'measured' or 'flat', "
+                                     f'not {method!r}')
 
         # Beyond it: the measured bed, ring by ring, with the prescribed depth
         # where a ring holds too little water to take a median of.
@@ -477,6 +506,8 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
         out[f'fl_{i}'] = {
             'terminus_index': i0,
             'n_blend': n,
+            'method': method,
+            'n_corrected': int(i0 + 1 - lo),
             'water_depth_prescribed': float(water_depth),
             'water_depth_before': float(max(wl - bed_old[i0], 0.)),
             'water_depth_after': float(max(wl - bed_new[i0], 0.)),
