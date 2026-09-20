@@ -7,10 +7,19 @@ the period-mean thermal forcing:
 
 ``k_inv = k_ref * (mean(TF, period) / TF_ref) ** gamma``
 
-That forces the order of operations: calibrate the mass balance first, set the
-calving rate second, and never re-calibrate. There is no loop between ``melt_f``
-and ``k``, which is a limitation to state rather than one to hide;
-:func:`calving_vs_geodetic_residual` is what puts a number on it.
+That forced the order of operations: calibrate the mass balance first, set the
+calving rate second, and never re-calibrate. ``mb_calibration_from_geodetic_mb`` no
+longer refuses a calving glacier -- it shifts the surface target by ``calving_mb``,
+since the geodetic observation is the total mass change and the surface balance is
+not -- so the two can now be calibrated together.
+
+There is still no *loop*, and on the bathymetry route there need not be one: the
+calving law's shape is the DEM free board, the measured bed and the inversion-flowline
+width, none of which the climate sets, so ``k = observed / shape`` is exact on the
+first pass. :func:`fit_calving_k_model` is the per-divide replacement for the pooled
+constant, and the one term of the parameterization the atmosphere does set --
+subglacial discharge, via :func:`subglacial_discharge_from_mb` -- is what lets ``k``
+differ between climate baselines at all.
 
 Unlike OGGM v1.6.3, where ``inversion_calving_k`` was a global and mutating it inside
 a worker leaked to the next glacier, this version resolves it per glacier through
@@ -456,3 +465,256 @@ def fit_calving_k(gdirs, observed_flux, water_depth=None, input_filesuffix=''):
     if den <= 0:
         raise InvalidWorkflowError('no divide contributed to the k fit')
     return num / den, per
+
+
+def subglacial_discharge_from_mb(gdir, period=None, mb_model=None,
+                                 input_filesuffix=''):
+    """Monthly runoff leaving the glacier, m3 s-1, from the calibrated mass balance.
+
+    The melt parameterization's ``q_sg`` has to come from the same climate as the run
+    it forces, and no dynamical run exists when the inversion needs it. This reads
+    melt and liquid precipitation straight off the calibrated mass-balance model, which
+    is the same decomposition ``run_with_hydro`` reports -- ``melt_f * tmelt`` for melt
+    and ``prcp - prcpsol`` for rain -- one stage earlier.
+
+    It is potential runoff on a fixed geometry: there is no snow-bucket accounting and
+    no refreezing, so it is an upper bound that is monotone in the melt energy. As a
+    covariate that is what is wanted; as a water budget it is not.
+
+    Returns ``(floatyears, discharge)`` monthly, or ``(None, None)`` when the climate
+    file does not cover the period.
+    """
+    import xarray as xr
+    from oggm.core.massbalance import MultipleFlowlineMassBalance, MonthlyTIModel
+    from oggm.utils import date_to_floatyear
+
+    fls = gdir.read_pickle('inversion_flowlines', filesuffix=input_filesuffix)
+    if mb_model is None:
+        mb_model = MultipleFlowlineMassBalance(gdir, fls=fls,
+                                               mb_model_class=MonthlyTIModel)
+    with xr.open_dataset(gdir.get_filepath('climate_historical')) as ds:
+        y0c, y1c = int(ds.time.dt.year[0]), int(ds.time.dt.year[-1])
+    y0, y1 = (int(period[0]), int(period[1])) if period else (y0c, y1c)
+    y0, y1 = max(y0, y0c + 1), min(y1, y1c)
+    if y1 < y0:
+        return None, None
+
+    years, q = [], []
+    for yr in range(y0, y1 + 1):
+        for m in range(1, 13):
+            t = date_to_floatyear(yr, m)
+            total_kg = 0.
+            for fl, mbm in zip(fls, mb_model.flowline_mb_models):
+                _, _, tmelt, prcp, prcpsol = mbm.get_monthly_mb(
+                    fl.surface_h, year=t, add_climate=True)
+                runoff = mbm.melt_f * tmelt + (prcp - prcpsol)   # kg m-2 month-1
+                area = fl.widths_m * fl.dx_meter                 # m2 per node
+                total_kg += float(np.sum(np.clip(runoff, 0., None) * area))
+            sec = mbm.sec_in_month(year=t)
+            years.append(yr + (m - 0.5) / 12)
+            q.append(total_kg / 1000. / sec)                     # m3 s-1 of water
+    return np.asarray(years), np.asarray(q)
+
+
+@entity_task(log)
+def write_subglacial_discharge(gdir, period=None, ocean_filesuffix='',
+                               input_filesuffix=''):
+    """Add ``subglacial_discharge`` to ``ocean_data.nc`` so the melt law can use it.
+
+    Without it :class:`~oggm.core.ocean_calving.MeltPlusCalving` runs in Rignot's
+    no-discharge limit, where the law collapses to ``B * TF**beta`` and the ``h``
+    and ``q`` terms drop out entirely.
+    """
+    import netCDF4
+    import numpy as np
+
+    if not gdir.is_tidewater:
+        return None
+    if not gdir.has_file('ocean_data', filesuffix=ocean_filesuffix):
+        raise InvalidWorkflowError(f'({gdir.rgi_id}) no ocean_data file')
+
+    yrs, q = subglacial_discharge_from_mb(gdir, period=period,
+                                          input_filesuffix=input_filesuffix)
+    if yrs is None:
+        raise InvalidWorkflowError(f'({gdir.rgi_id}) climate does not cover {period}')
+
+    path = gdir.get_filepath('ocean_data', filesuffix=ocean_filesuffix)
+    with netCDF4.Dataset(path, 'a') as nc:
+        t = nc.variables['time']
+        target = (nc.variables['time'][:].astype(float))
+        # The ocean file's own axis decides the length; discharge is interpolated onto
+        # it rather than the reverse, because the thermal forcing is the measurement.
+        import cftime
+        dates = cftime.num2date(target, t.units,
+                                getattr(t, 'calendar', 'standard'))
+        tgt_yrs = np.array([d.year + (d.month - 0.5) / 12 for d in dates])
+        vals = np.interp(tgt_yrs, yrs, q, left=np.nan, right=np.nan)
+        if 'subglacial_discharge' in nc.variables:
+            v = nc.variables['subglacial_discharge']
+        else:
+            v = nc.createVariable('subglacial_discharge', 'f4', ('time',))
+            v.units = 'm3 s-1'
+            v.long_name = 'subglacial discharge'
+        v[:] = vals
+    gdir.add_to_diagnostics('subglacial_discharge_mean',
+                            float(np.nanmean(vals)))
+    return float(np.nanmean(vals))
+
+
+def submarine_melt_rate(water_depth, q_sg, tf, A=None, B=None, alpha=None, beta=None):
+    """Rignot et al. (2016) Eqn 1 as Slater et al. (2020) Eqn 2 applies it, m d-1.
+
+    ``mdot = (A * h * q**alpha + B) * TF**beta`` with ``h`` the grounding-line water
+    depth in m, ``q`` the subglacial runoff normalised by calving-front area in m d-1
+    and ``TF`` the thermal forcing in degC. The scalar twin of
+    :meth:`~oggm.core.ocean_calving.MeltPlusCalving.melt_rate`, for use on the
+    inversion side where there is one value per divide rather than a series.
+    """
+    A = ocean_param('calving_melt_A') if A is None else A
+    B = ocean_param('calving_melt_B') if B is None else B
+    alpha = ocean_param('calving_melt_alpha') if alpha is None else alpha
+    beta = ocean_param('calving_melt_beta') if beta is None else beta
+    if not np.isfinite(water_depth) or not np.isfinite(tf) or tf <= 0:
+        return np.nan
+    q = 0. if not np.isfinite(q_sg) else max(q_sg, 0.)
+    return (A * max(water_depth, 0.) * q ** alpha + B) * tf ** beta
+
+
+def calving_covariates(gdir, observed_flux=None, ocean_filesuffix='', band=None,
+                       period=None, input_filesuffix=''):
+    """Every candidate predictor of one divide's calving constant.
+
+    The geometric terms are the ones the calving law already carries plus the shape
+    around them; ``q_sg`` and ``melt_rate`` are the part of the melt parameterization
+    that has never entered this calibration. ``k`` is included when an observed flux is
+    given, so the same call builds both sides of a fit.
+    """
+    out = {'rgi_id': gdir.rgi_id, 'is_tidewater': bool(gdir.is_tidewater)}
+    if not gdir.is_tidewater:
+        return out
+
+    shape = calving_law_flux(gdir, k=1., input_filesuffix=input_filesuffix)
+    cls = gdir.read_pickle('inversion_input', filesuffix=input_filesuffix)[-1]
+    fl = gdir.read_pickle('inversion_flowlines', filesuffix=input_filesuffix)[-1]
+    out.update(shape_km3=shape['flux'],
+               water_depth=shape['water_depth'],
+               front_thickness=shape['thick'],
+               free_board=shape['free_board'],
+               thick_flotation=shape['thick_flotation'],
+               width=shape['width'],
+               area_km2=gdir.rgi_area_km2,
+               terminus_slope=float(cls['slope_angle'][-1]),
+               terminus_elev=float(fl.surface_h[-1]),
+               flowline_length=float(fl.dx_meter * len(fl.surface_h)))
+    # How close the front is to floating. The law floors the thickness at flotation, so
+    # this is also which divides that floor is binding on.
+    out['flotation_ratio'] = (out['front_thickness'] / out['thick_flotation']
+                              if out['thick_flotation'] > 0 else np.nan)
+    out['depth_fraction'] = out['water_depth'] / out['front_thickness']
+    out['aspect_ratio'] = out['width'] / out['front_thickness']
+
+    front_area = out['width'] * out['front_thickness']
+    yrs, q = subglacial_discharge_from_mb(gdir, period=period,
+                                          input_filesuffix=input_filesuffix)
+    # m3 s-1 over the front area, expressed per day, which is the unit Eqn 2 wants.
+    out['q_sg'] = (float(np.nanmean(q)) * 86400. / front_area
+                   if yrs is not None and front_area > 0 else np.nan)
+
+    if gdir.has_file('ocean_data', filesuffix=ocean_filesuffix):
+        out['tf'] = ocean_tf_mean(gdir, band=band, period=period,
+                                  ocean_filesuffix=ocean_filesuffix)
+        out['melt_rate'] = submarine_melt_rate(out['water_depth'], out['q_sg'],
+                                               out['tf'])
+    if observed_flux is not None and gdir.rgi_id in observed_flux:
+        obs = observed_flux[gdir.rgi_id]
+        out['obs_flux_km3'] = obs
+        out['k'] = obs / shape['flux'] if shape['flux'] > 0 else np.nan
+    return out
+
+
+# Terms that enter a model in logs: positive, scale free, and multiplicative in the
+# parameterization the model is trying to recover.
+_LOG_TERMS = frozenset(('water_depth', 'front_thickness', 'width', 'area_km2',
+                        'free_board', 'aspect_ratio', 'flowline_length', 'q_sg',
+                        'tf', 'melt_rate', 'shape_km3'))
+
+
+def _design(rows, terms):
+    cols = [np.ones(len(rows))]
+    for t in terms:
+        v = np.array([r[t] for r in rows], dtype=float)
+        cols.append(np.log(v) if t in _LOG_TERMS else v)
+    return np.column_stack(cols)
+
+
+def fit_calving_k_model(gdirs, observed_flux, terms=(), covariates=None, **kwargs):
+    """``log k`` regressed on covariates across the divide set.
+
+    Global rather than per glacier, for the same reason the Glen A fit is: the
+    coefficients are shared, and fitting them per divide is what makes the model
+    unfalsifiable. With no ``terms`` this is an intercept alone, i.e. the geometric
+    mean ``k`` -- the honest baseline for :func:`fit_calving_k`'s flux-weighted pool.
+
+    Returns a dict with the coefficients, the terms, the in-sample and leave-one-out
+    log residuals, and the per-divide ``k`` the model implies.
+    """
+    rows = covariates if covariates is not None else [
+        calving_covariates(g, observed_flux=observed_flux, **kwargs) for g in gdirs]
+    rows = [r for r in rows if r.get('k') is not None
+            and np.isfinite(r.get('k', np.nan))
+            and all(np.isfinite(r.get(t, np.nan)) for t in terms)]
+    if len(rows) <= len(terms) + 1:
+        raise InvalidWorkflowError(
+            f'{len(rows)} usable divides against {len(terms) + 1} coefficients: the '
+            'model would interpolate rather than fit.')
+
+    y = np.log(np.array([r['k'] for r in rows], dtype=float))
+    X = _design(rows, terms)
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+
+    loo = np.full(len(rows), np.nan)
+    for i in range(len(rows)):
+        keep = np.arange(len(rows)) != i
+        if np.linalg.matrix_rank(X[keep]) < X.shape[1]:
+            continue
+        b, *_ = np.linalg.lstsq(X[keep], y[keep], rcond=None)
+        loo[i] = X[i] @ b - y[i]
+
+    return dict(terms=list(terms), coefficients=beta,
+                rgi_ids=[r['rgi_id'] for r in rows],
+                k_model={r['rgi_id']: float(np.exp(v))
+                         for r, v in zip(rows, X @ beta)},
+                residual=X @ beta - y, loo_residual=loo,
+                loo_sd=float(np.nanstd(loo)),
+                n=len(rows))
+
+
+@entity_task(log)
+def set_inversion_k_from_model(gdir, model=None, k_fallback=None, **kwargs):
+    """Write the calving constant a fitted covariate model implies for one divide.
+
+    Sets both ``inversion_calving_k`` and ``calving_k``: OGGM keeps the inversion's
+    constant and the forward model's apart, and writing only the first leaves every
+    run at the default while every report names the fitted value.
+    """
+    if not gdir.is_tidewater:
+        return None
+    if model is None:
+        raise InvalidParamsError('set_inversion_k_from_model needs a model from '
+                                 'fit_calving_k_model')
+    k = model['k_model'].get(gdir.rgi_id)
+    if k is None:
+        row = calving_covariates(gdir, **kwargs)
+        terms = model['terms']
+        if all(np.isfinite(row.get(t, np.nan)) for t in terms):
+            k = float(np.exp(_design([row], terms) @ model['coefficients']))
+        elif k_fallback is not None:
+            k = float(k_fallback)
+        else:
+            raise InvalidWorkflowError(
+                f'({gdir.rgi_id}) is missing {terms} and no k_fallback was given; a '
+                'silent default here is a factor on every frontal flux.')
+    gdir.write_to_settings({'inversion_calving_k': k, 'calving_k': k},
+                           overwrite=True)
+    gdir.add_to_diagnostics('covariate_inversion_k', float(k))
+    return float(k)
