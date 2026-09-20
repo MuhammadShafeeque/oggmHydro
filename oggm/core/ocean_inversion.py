@@ -620,6 +620,11 @@ def calving_covariates(gdir, observed_flux=None, ocean_filesuffix='', band=None,
     out['q_sg'] = (float(np.nanmean(q)) * 86400. / front_area
                    if yrs is not None and front_area > 0 else np.nan)
 
+    # `ocean_data` is registered in cfg.BASENAMES at shop import time, and a process
+    # that only called init_ocean_params() has not done it. Importing here rather than
+    # asking every caller to remember is what keeps a missing forcing distinguishable
+    # from an unregistered basename.
+    from oggm.shop import ocean as _ocean_basenames  # noqa: F401
     if gdir.has_file('ocean_data', filesuffix=ocean_filesuffix):
         out['tf'] = ocean_tf_mean(gdir, band=band, period=period,
                                   ocean_filesuffix=ocean_filesuffix)
