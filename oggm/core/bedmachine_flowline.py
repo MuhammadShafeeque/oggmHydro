@@ -14,6 +14,13 @@ and keeps the synthetic version beside it under its own filesuffix so the two ca
 run against each other. Nothing OGGM owns is modified: this is an edit of
 ``model_flowlines`` applied after ``init_present_time_glacier``.
 
+Elevation-band flowlines carry no geometry: ``fixed_dx_elevation_band_flowline``
+builds its ``Centerline`` with ``line=None`` and ``Flowline.__init__`` then invents a
+straight line along the first grid row. Sampling a gridded field along *that* is not
+sampling the glacier, so :py:func:`sample_gridded_on_line` is refused on it and
+:py:func:`sample_gridded_by_band` -- the same field binned by surface elevation, which
+is what a band flowline's cells are -- is used instead.
+
 :py:func:`calving_front_width_check` is the same geometry read for OGGM issue #875 --
 the width the run uses at the front is not the ``calving_front_width`` the inversion
 recorded, and every law is linear in it.
@@ -73,6 +80,89 @@ def extension_slice(gdir, fl, atol=1e-6):
     if not np.allclose(fl.bed_h[sl], expected, atol=atol):
         return None
     return sl
+
+
+def has_line_geometry(fl):
+    """False when ``fl.line`` is the straight line ``Flowline`` invents for a band.
+
+    ``Flowline.__init__`` builds ``x = arange(nx) * dx, y = 0`` whenever it is given
+    no line, which is every elevation-band flowline. It is a valid LineString and it
+    indexes the first row of the grid, so a sample along it returns numbers.
+    """
+
+    if fl.line is None:
+        return False
+    x, y = (np.asarray(c, dtype=float) for c in fl.line.coords.xy)
+    return not (np.all(y == 0) and
+                np.allclose(x, np.arange(len(x)) * fl.dx))
+
+
+def _gridded(gdir, *varnames):
+    """One or more ``gridded_data`` variables as float arrays."""
+    with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
+        out = []
+        for varname in varnames:
+            if varname not in ds:
+                raise InvalidWorkflowError(
+                    f'({gdir.rgi_id}) {varname!r} is not in gridded_data. Run '
+                    'tasks.bedmachine_bed_to_gdir first.')
+            out.append(np.asarray(ds[varname].data, dtype=float))
+    return out[0] if len(out) == 1 else out
+
+
+def sample_gridded_by_band(gdir, z_eval, varname, bsize=None,
+                           topo_var='topo_smoothed'):
+    """A ``gridded_data`` variable binned by surface elevation, read at ``z_eval``.
+
+    The band-flowline analogue of :py:func:`sample_gridded_on_line`: a band's cells
+    are elevation intervals over the glacier mask, so ``elevation_band_flowline``'s
+    own binning is what puts a gridded field onto them. Bands holding no glacier
+    pixel are interpolated over.
+    """
+
+    data, topo, mask = _gridded(gdir, varname, topo_var, 'glacier_mask')
+    mask = mask == 1
+    data, topo = data[mask], topo[mask]
+    ok = np.isfinite(data) & np.isfinite(topo)
+    data, topo = data[ok], topo[ok]
+    if data.size < 3:
+        raise InvalidWorkflowError(
+            f'({gdir.rgi_id}) only {data.size} glacier cells carry {varname!r}.')
+
+    bsize = bsize or cfg.PARAMS['elevation_band_flowline_binsize']
+    bins = np.arange(np.floor(topo.min() / bsize) * bsize,
+                     np.ceil(topo.max() / bsize) * bsize + 0.01, bsize)
+    i = np.clip(np.digitize(topo, bins) - 1, 0, max(len(bins) - 2, 0))
+    n = np.bincount(i, minlength=len(bins) - 1)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mean = np.bincount(i, weights=data, minlength=len(bins) - 1) / n
+    zc = 0.5 * (bins[:-1] + bins[1:])
+    return np.interp(np.asarray(z_eval, dtype=float), zc[n > 0], mean[n > 0])
+
+
+def offshore_bed_profile(gdir, n_points, bed_var='bedmachine_bed', min_pixels=3):
+    """Median sub-sea-level bed at each distance ring outside the glacier mask.
+
+    The measured counterpart of the linear deepening the calving extension invents.
+    Like :py:func:`oggm.core.ocean_inversion.terminus_water_depth_from_bed` it reads
+    the mask rather than a terminus coordinate, so it needs no line geometry; like
+    it, it is a median over the whole ice-ocean contact at that distance and not
+    over the fjord ahead of one front.
+
+    Rings holding fewer than ``min_pixels`` wet cells come back as NaN.
+    """
+    from scipy import ndimage
+
+    bed, mask = _gridded(gdir, bed_var, 'glacier_mask')
+    dist = ndimage.distance_transform_edt(mask != 1) * gdir.grid.dx
+    wet = np.isfinite(bed) & (bed < 0)
+    dx = gdir.grid.dx
+    out = np.full(int(n_points), np.nan)
+    for j in range(int(n_points)):
+        ring = wet & (dist > j * dx) & (dist <= (j + 1) * dx)
+        if ring.sum() >= min_pixels:
+            out[j] = float(np.median(bed[ring]))
+    return out
 
 
 def sample_gridded_on_line(gdir, line, varname, interp='linear', sl=None):
@@ -173,6 +263,13 @@ def bedmachine_calving_extension(gdir, bed_var='bedmachine_bed',
         sl = extension_slice(gdir, fl)
         if sl is None:
             continue
+        if not has_line_geometry(fl):
+            raise InvalidWorkflowError(
+                f'({gdir.rgi_id}) this flowline has no geometry, so there is no '
+                'line to sample the bed along. Elevation-band flowlines are built '
+                'with line=None and Flowline invents a straight one along the '
+                'first grid row. Use bedmachine_terminus_bed instead, which reads '
+                'the mask.')
 
         i0 = sl.start
         bed_new = sample_gridded_on_line(gdir, fl.line, bed_var, sl=sl)
