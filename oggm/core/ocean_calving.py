@@ -339,12 +339,64 @@ LAWS = {'constant': ConstantK, 'tf_power': TFPower,
         'melt_calving': MeltPlusCalving, 'sea_ice': SeaIceModulated}
 
 
+def partition_law_k(gdir, law, period=None):
+    """Give a melt-bearing law the residual calving constant, keeping the total.
+
+    ``k`` was fitted against an *observed* frontal ablation, so it already contains
+    the calving that submarine melt drives. A melt term added on top of it counts
+    that melt twice: measured on the twelve FIIC divides with `melt_calving` on the
+    200-500 m band, the total came out at 13.7 Gt yr-1 against a calibrated 0.12.
+
+    :func:`partition_calving_constant` solves ``k_c h + lam mdot = k h`` for ``k_c``,
+    so the total is unchanged and only its split moves. The reference melt rate is
+    the law's own, averaged over the reference period, at the prescribed front.
+
+    Sets ``law.k_c`` in place and returns ``(k_c, melt_fraction)``.
+    """
+    from oggm.core.ocean_inversion import _setting, partition_calving_constant
+
+    if not hasattr(law, 'melt_rate'):
+        return None, 0.
+    k_total = _setting(gdir, 'calving_k', _setting(gdir, 'inversion_calving_k'))
+    thick = _setting(gdir, 'calving_front_thick')
+    depth = _setting(gdir, 'terminus_water_depth')
+    width = _setting(gdir, 'calving_front_width')
+    if None in (k_total, thick, depth, width):
+        raise InvalidWorkflowError(
+            f'({gdir.rgi_id}) partitioning needs calving_k, calving_front_thick, '
+            'terminus_water_depth and calving_front_width in the settings; run the '
+            'calving inversion first.')
+
+    period = period or ocean_param('ocean_tf_ref_period')
+    y0, y1 = (float(y) for y in period)
+    yrs = np.asarray(law.years, dtype=float)
+    sel = (yrs >= y0) & (yrs < y1 + 1)
+    if not sel.any():
+        raise InvalidWorkflowError(
+            f'({gdir.rgi_id}) the ocean record does not cover {y0:.0f}-{y1:.0f}, so '
+            'the reference melt rate cannot be formed. Give the law an explicit '
+            'k_c, or pick a period the product covers.')
+    mdot = float(np.mean([law.melt_rate(depth, width, y) for y in yrs[sel]]))
+
+    k_c, frac = partition_calving_constant(k_total, mdot, thick, lam=law.lam)
+    law.k_c = k_c
+    return k_c, frac
+
+
 def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
-                      tf_ref=None, **law_kwargs):
+                      tf_ref=None, partition=False, **law_kwargs):
     """Build a calving law for one glacier from its ocean_data file.
 
     Separate from the run task so a law can be built, inspected and tested without
     running the model.
+
+    Parameters
+    ----------
+    partition : bool
+        for a melt-bearing law, set ``k_c`` from :func:`partition_law_k` so the melt
+        term is carved out of the calibrated total rather than added to it. Off by
+        default, because it changes what a law means and every run table should say
+        so explicitly.
     """
     import xarray as xr
 
@@ -372,13 +424,19 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
 
     yrs = (ds['time.year'].values + (ds['time.month'].values - 0.5) / 12)
     tf_ref = ocean_param('ocean_tf_ref') if tf_ref is None else tf_ref
-    return LAWS[calving_law](
+    law = LAWS[calving_law](
         yrs, ds['thermal_forcing'].values[:, i],
         open_water=(ds['open_water_frac'].values if 'open_water_frac' in ds
                     else None),
         q_sg=(ds['subglacial_discharge'].values if 'subglacial_discharge' in ds
               else None),
         tf_ref=tf_ref, **law_kwargs)
+    if partition:
+        k_c, frac = partition_law_k(gdir, law)
+        if k_c is not None:
+            gdir.add_to_diagnostics('calving_k_residual', float(k_c))
+            gdir.add_to_diagnostics('calving_melt_fraction_reference', float(frac))
+    return law
 
 
 def _band_names(ds):
