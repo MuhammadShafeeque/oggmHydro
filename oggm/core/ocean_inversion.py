@@ -267,6 +267,11 @@ def terminus_water_depth_from_bed(gdir, bed_var='bedmachine_bed',
     return depth
 
 
+def _setting(gdir, key, default=None):
+    """One setting, or `default`. `gdir.settings.get` raises on a missing key."""
+    return gdir.settings[key] if key in gdir.settings else default
+
+
 def flotation_thickness(water_depth, rho_ocean=None, rho_ice=None):
     """Ice thickness a front of this water depth carries at flotation, metres."""
     rho_ocean = rho_ocean or ocean_param('ocean_water_density')
@@ -316,7 +321,7 @@ def find_inversion_calving_from_bathymetry(gdir, water_depth=None, k=None,
         return None
 
     if water_depth is None:
-        water_depth = gdir.settings.get('terminus_water_depth')
+        water_depth = _setting(gdir, 'terminus_water_depth')
     if water_depth is None:
         raise InvalidWorkflowError(
             f'({gdir.rgi_id}) no terminus_water_depth; run '
@@ -395,7 +400,7 @@ def fit_calving_k(gdirs, observed_flux, water_depth=None, input_filesuffix=''):
         obs = observed_flux.get(gdir.rgi_id)
         if obs is None or not gdir.is_tidewater:
             continue
-        d = water_depth or gdir.settings.get('terminus_water_depth')
+        d = water_depth or _setting(gdir, 'terminus_water_depth')
         shape = calving_law_flux(gdir, water_depth=d, k=1.,
                                  input_filesuffix=input_filesuffix)['flux']
         if shape <= 0:
