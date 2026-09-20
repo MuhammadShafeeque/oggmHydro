@@ -342,6 +342,169 @@ def bedmachine_calving_extension(gdir, bed_var='bedmachine_bed',
     return out
 
 
+def _rectangular_tail(fl, i0):
+    """How many cells of ice immediately above ``i0`` are rectangular.
+
+    ``fixed_dx_elevation_band_flowline`` marks the last five bins of a tidewater
+    glacier rectangular, so their width is ``_w0_m`` and does not move with the
+    thickness. Correcting the bed inside that tail therefore changes the ice column
+    and nothing else, which is why it is the default blend window.
+    """
+    is_rect = getattr(fl, 'is_rectangular', None)
+    if is_rect is None:
+        return 1
+    n = 0
+    while n < i0 and is_rect[i0 - n]:
+        n += 1
+    return max(n, 1)
+
+
+@entity_task(log, writes=['model_flowlines'])
+def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
+                            bed_var='bedmachine_bed', filesuffix='',
+                            synthetic_filesuffix='_synthetic'):
+    """Put the prescribed calving-front depth on the run's flowline.
+
+    :py:func:`oggm.core.ocean_inversion.find_inversion_calving_from_bathymetry`
+    fixes the water depth the *inversion* uses, but the terminus thickness the
+    inversion returns comes from the SIA and the surface mass balance, so
+    ``bed_h = surface_h - thick`` puts the run's front far deeper than the depth
+    that was prescribed -- measured at 1.8x to 5.1x over the twelve FIIC divides.
+    Since every calving law reads its water depth as ``-bed_h`` at the last cell
+    above water level, the run then calves against a depth nothing constrained.
+
+    This sets the bed at the front to ``water_level - water_depth``, ramps the
+    correction out over ``n_blend`` cells so no surface-gradient step is created,
+    and continues past the terminus over the measured offshore bed
+    (:py:func:`offshore_bed_profile`) instead of the invented linear deepening. The
+    DEM surface is held fixed, so the ice thickness absorbs the change.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory to process
+    water_depth : float
+        metres, positive down. Default: the ``terminus_water_depth`` written by
+        :py:func:`oggm.core.ocean_inversion.terminus_water_depth_from_bed`, which
+        is the depth ``k`` was fitted at.
+    n_blend : int
+        cells to ramp the correction over, the front included. Default: the
+        rectangular tail, over which the width does not follow the thickness.
+    bed_var : str
+        the ``gridded_data`` variable holding the measured bed
+    filesuffix : str
+        the ``model_flowlines`` to edit
+    synthetic_filesuffix : str
+        where to keep the untouched copy
+
+    Returns
+    -------
+    a dict, one entry per edited flowline, of what changed
+    """
+
+    if not gdir.is_tidewater:
+        raise InvalidWorkflowError(f'({gdir.rgi_id}) not tidewater: there is no '
+                                   'calving front to place.')
+
+    if water_depth is None:
+        if 'terminus_water_depth' not in gdir.settings:
+            raise InvalidWorkflowError(
+                f'({gdir.rgi_id}) no terminus_water_depth in the settings; run '
+                'terminus_water_depth_from_bed first, or pass one.')
+        water_depth = float(gdir.settings['terminus_water_depth'])
+    if not (water_depth > 0):
+        raise InvalidParamsError(f'({gdir.rgi_id}) water_depth = {water_depth} '
+                                 'is not a depth below sea level.')
+
+    keep = gdir.has_file('model_flowlines', filesuffix=synthetic_filesuffix)
+    fls = gdir.read_pickle('model_flowlines',
+                           filesuffix=synthetic_filesuffix if keep else filesuffix)
+    if not keep:
+        gdir.write_pickle(fls, 'model_flowlines', filesuffix=synthetic_filesuffix)
+
+    out = {}
+    for i, fl in enumerate(fls):
+        has_ice = np.nonzero(fl.thick > 0)[0]
+        if not has_ice.size:
+            continue
+        i0 = int(has_ice[-1])
+        wl = fl.water_level if fl.water_level is not None else 0.
+        if fl.surface_h[i0] <= wl:
+            raise InvalidWorkflowError(
+                f'({gdir.rgi_id}) the last cell holding ice is already below the '
+                'water level; there is no front to place.')
+
+        n = int(n_blend) if n_blend else _rectangular_tail(fl, i0)
+        n = int(min(max(n, 1), i0 + 1))
+        bed_old = fl.bed_h.copy()
+        surf = fl.surface_h.copy()
+
+        # The ice: the full correction at the front, dying out n cells upglacier.
+        target = wl - water_depth
+        delta = target - bed_old[i0]
+        ramp = np.linspace(1., n, n) / n
+        bed_new = bed_old.copy()
+        bed_new[i0 - n + 1:i0 + 1] += ramp * delta
+
+        # Beyond it: the measured bed, ring by ring, with the prescribed depth
+        # where a ring holds too little water to take a median of.
+        n_ext = fl.nx - i0 - 1
+        if n_ext > 0:
+            off = offshore_bed_profile(gdir, n_ext, bed_var=bed_var)
+            miss = ~np.isfinite(off)
+            if miss.all():
+                off[:] = target
+            elif miss.any():
+                j = np.arange(n_ext)
+                off[miss] = np.interp(j[miss], j[~miss], off[~miss])
+            bed_new[i0 + 1:] = np.minimum(off, target)
+
+        # The DEM surface is an observation: the thickness takes the change. Beyond
+        # the terminus the surface is the bed, as init_present_time_glacier has it.
+        surf[i0 + 1:] = bed_new[i0 + 1:]
+        fl.bed_h = bed_new
+        fl.thick = surf - bed_new
+        _purge_lazy(fl)
+
+        if fl.thick[i0] <= 0:
+            raise InvalidWorkflowError(
+                f'({gdir.rgi_id}) raising the bed to {target:.0f} m leaves no ice '
+                f'at the front (surface {surf[i0]:.0f} m). The prescribed water '
+                'depth and the DEM disagree about where sea level is.')
+
+        rho_o = ocean_param('ocean_water_density')
+        out[f'fl_{i}'] = {
+            'terminus_index': i0,
+            'n_blend': n,
+            'water_depth_prescribed': float(water_depth),
+            'water_depth_before': float(max(wl - bed_old[i0], 0.)),
+            'water_depth_after': float(max(wl - bed_new[i0], 0.)),
+            'bed_terminus_before': float(bed_old[i0]),
+            'bed_terminus_after': float(bed_new[i0]),
+            'thick_terminus_before': float(surf[i0] - bed_old[i0]),
+            'thick_terminus_after': float(fl.thick[i0]),
+            'thick_flotation': float(water_depth * rho_o /
+                                     cfg.PARAMS['ice_density']),
+            'width_terminus': float(fl.widths_m[i0]),
+            'bed_extension_measured_mean': (float(np.mean(bed_new[i0 + 1:]))
+                                            if n_ext > 0 else np.nan),
+            'bed_extension_synthetic_mean': (float(np.mean(bed_old[i0 + 1:]))
+                                             if n_ext > 0 else np.nan),
+            'volume_removed_m3': float(np.sum((surf - bed_new) * 0. +
+                                              (bed_new - bed_old)[:i0 + 1] *
+                                              fl.widths_m[:i0 + 1]) *
+                                       fl.dx_meter),
+        }
+
+    if not out:
+        raise InvalidWorkflowError(f'({gdir.rgi_id}) no flowline holds ice.')
+
+    gdir.write_pickle(fls, 'model_flowlines', filesuffix=filesuffix)
+    for k, v in out.items():
+        gdir.add_to_diagnostics(f'terminus_bed_{k}', v)
+    return out
+
+
 @entity_task(log)
 def calving_front_width_check(gdir, rtol=None, raise_on_fail=False,
                               filesuffix=''):
