@@ -4285,12 +4285,22 @@ def mb_calibration_to_rmsd(gdir, *,
     ref_mb_years = ref_df.index.values
     years = ref_mb_years
 
-    # Do we have a calving glacier?
+    # Do we have a calving glacier? The geodetic observation is the total mass
+    # change, which frontal ablation contributes to but the surface mass balance
+    # does not include, so the surface target is the observation plus the frontal
+    # flux: dV/dt = SMB - cmb.
     cmb = calving_mb(gdir)
     if cmb != 0:
-        raise NotImplementedError('Calving with geodetic MB is not implemented '
-                                  'yet, but it should actually work. Well keep '
-                                  'you posted!')
+        if ref_mb_unit == 'kg m-2':
+            # cmb is a rate, the target a total over the period.
+            steps_per_year = {'annual': 1, 'monthly': 12}.get(time_resolution)
+            if steps_per_year is None:
+                raise NotImplementedError(
+                    f'calving with a {time_resolution} reference mass balance '
+                    "given as 'kg m-2': the number of years the frontal flux "
+                    'spans is not defined here.')
+            cmb = cmb * len(years) / steps_per_year
+        ref_mb = ref_mb + cmb
 
     # Ok, regardless on how we want to calibrate, we start with defaults
     if melt_f is None:
@@ -5010,12 +5020,22 @@ def mb_calibration_from_scalar_mb(gdir, *,
             "'kg m-2 yr-1'. Please set the correct unit using the `ref_mb_unit` "
             "parameter and make sure `ref_mb` is provided correctly.")
 
-    # Do we have a calving glacier?
+    # Do we have a calving glacier? The geodetic observation is the total mass
+    # change, which frontal ablation contributes to but the surface mass balance
+    # does not include, so the surface target is the observation plus the frontal
+    # flux: dV/dt = SMB - cmb.
     cmb = calving_mb(gdir)
     if cmb != 0:
-        raise NotImplementedError('Calving with geodetic MB is not implemented '
-                                  'yet, but it should actually work. Well keep '
-                                  'you posted!')
+        if ref_mb_unit == 'kg m-2':
+            # cmb is a rate, the target a total over the period.
+            steps_per_year = {'annual': 1, 'monthly': 12}.get(time_resolution)
+            if steps_per_year is None:
+                raise NotImplementedError(
+                    f'calving with a {time_resolution} reference mass balance '
+                    "given as 'kg m-2': the number of years the frontal flux "
+                    'spans is not defined here.')
+            cmb = cmb * len(years) / steps_per_year
+        ref_mb = ref_mb + cmb
 
     # Ok, regardless on how we want to calibrate, we start with defaults
     if melt_f is None:
