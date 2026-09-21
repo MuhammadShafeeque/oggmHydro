@@ -565,10 +565,28 @@ def run_dynamic_spinup(gdir, settings_filesuffix='',
         raise InvalidParamsError('Only use annual mb_elev_feedback with the '
                                  'dynamic spinup function!')
 
+    # `flowline_model_run` hands these to the evolution model; here the model is built
+    # directly, and without them it falls back to is_tidewater=False, which leaves
+    # `do_calving` False and runs the whole spinup with no frontal ablation.
+    kwargs.setdefault('is_tidewater', gdir.is_tidewater)
+    kwargs.setdefault('is_lake_terminating', gdir.is_lake_terminating)
+
     if gdir.settings['use_kcalving_for_run']:
         if allow_calving:
             log.warning("You are using the dynamic spinup with calving, this "
                         "is experimental and not tested!")
+            if gdir.is_tidewater and kwargs.get('water_level') is None:
+                try:
+                    water_level = gdir.settings['calving_water_level']
+                except KeyError:
+                    water_level = None
+                if water_level is None:
+                    raise InvalidWorkflowError(
+                        'This tidewater glacier seems to not have been '
+                        'inverted with the `find_inversion_calving` task. Set '
+                        "gdir.settings['use_kcalving_for_run'] to `False` or "
+                        'set `water_level` to prevent this error.')
+                kwargs['water_level'] = water_level
         else:
             raise InvalidParamsError('Dynamic spinup not tested with '
                                      "gdir.settings['use_kcalving_for_run'] is "
