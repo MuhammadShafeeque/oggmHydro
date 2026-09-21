@@ -5036,6 +5036,9 @@ def mb_calibration_from_scalar_mb(gdir, *,
                     'spans is not defined here.')
             cmb = cmb * len(years) / steps_per_year
         ref_mb = ref_mb + cmb
+    # The observation, kept apart from the surface target it was turned into: the
+    # stored `reference_mb` is what everything downstream compares a model against.
+    ref_mb_geodetic = ref_mb - cmb
 
     # Ok, regardless on how we want to calibrate, we start with defaults
     if melt_f is None:
@@ -5212,8 +5215,10 @@ def mb_calibration_from_scalar_mb(gdir, *,
     df['melt_f'] = melt_f
     df['prcp_fac'] = prcp_fac
     df['temp_bias'] = temp_bias
-    # What did we try to match?
-    df['reference_mb'] = ref_mb
+    # What did we try to match? `reference_mb` stays the observation; for a calving
+    # glacier the surface balance was fitted to it plus `calving_mb`.
+    df['reference_mb'] = ref_mb_geodetic
+    df['calving_mb'] = cmb
     df['reference_mb_err'] = ref_mb_err
     df['reference_period'] = ref_mb_period
 
@@ -5233,8 +5238,9 @@ def mb_calibration_from_scalar_mb(gdir, *,
                                        '`overwrite_gdir` to True if you want to '
                                        'overwrite a previous calibration.')
         for key in ['rgi_id', 'bias', 'melt_f', 'prcp_fac', 'temp_bias',
-                    'reference_mb', 'reference_mb_err', 'reference_period',
-                    'mb_global_params', 'baseline_climate_source']:
+                    'reference_mb', 'calving_mb', 'reference_mb_err',
+                    'reference_period', 'mb_global_params',
+                    'baseline_climate_source']:
             gdir.settings[key] = df[key]
 
     if return_mb_model:
