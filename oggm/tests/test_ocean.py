@@ -16,6 +16,7 @@ import xarray as xr
 from oggm import cfg, utils
 from oggm.core.bedmachine_flowline import (bed_extension_statistics,
                                            bedmachine_calving_extension,
+                                           bedmachine_terminus_bed,
                                            calving_front_width_check,
                                            calving_vs_bed_extension,
                                            extension_slice,
@@ -581,8 +582,7 @@ def test_destine_reader_needs_a_path(tmp_path):
 
 # --- the bed under and beyond the calving front --------------------------------
 
-@pytest.fixture
-def columbia():
+def _columbia(flowlines):
     """A real tidewater gdir, inverted, with a synthetic BedMachine beside it.
 
     Columbia rather than a dummy flowline because the two numbers this part of the
@@ -591,6 +591,11 @@ def columbia():
     inversion. `clip_tidewater_border` is off because OGGM forces the grid of a
     tidewater glacier to a 10 pixel border while extending its flowline by
     `calving_line_extension * dx` pixels, so the extension leaves the grid at once.
+
+    `flowlines` picks the geometry, and the two kinds live in separate working
+    directories because they write the same files. `elev_bands` is what production
+    runs on. `centerlines` is the only kind that carries a real `fl.line`, which is
+    what `bedmachine_calving_extension` samples the gridded bed along.
     """
     import geopandas as gpd
 
@@ -601,7 +606,7 @@ def columbia():
     from oggm.tests.funcs import get_test_dir
     from oggm.utils import get_demo_file, mkdir
 
-    testdir = os.path.join(get_test_dir(), 'tmp_bedmachine_flowline')
+    testdir = os.path.join(get_test_dir(), f'tmp_bedmachine_flowline_{flowlines}')
     mkdir(testdir)
 
     cfg.initialize()
@@ -621,10 +626,21 @@ def columbia():
     gdir = oggm.GlacierDirectory(entity)
     if not gdir.has_file('climate_historical'):
         gis.define_glacier_region(gdir)
-        gis.simple_glacier_masks(gdir)
-        centerlines.elevation_band_flowline(gdir)
-        centerlines.fixed_dx_elevation_band_flowline(gdir)
+        if flowlines == 'elev_bands':
+            gis.simple_glacier_masks(gdir)
+            centerlines.elevation_band_flowline(gdir)
+            centerlines.fixed_dx_elevation_band_flowline(gdir)
+        else:
+            gis.glacier_masks(gdir)
+            centerlines.compute_centerlines(gdir)
+            centerlines.initialize_flowlines(gdir)
+            centerlines.catchment_area(gdir)
+            centerlines.catchment_intersections(gdir)
+            centerlines.catchment_width_geom(gdir)
+            centerlines.catchment_width_correction(gdir)
         centerlines.compute_downstream_line(gdir)
+        if flowlines == 'centerlines':
+            centerlines.compute_downstream_bedshape(gdir)
         tasks.process_dummy_cru_file(gdir, seed=0)
         tasks.mb_calibration_from_geodetic_mb(gdir)
         tasks.apparent_mb_from_any_mb(gdir)
@@ -634,6 +650,23 @@ def columbia():
     if not os.path.exists(path):
         write_synthetic_bedmachine(gdir, path)
     return gdir, path
+
+
+@pytest.fixture
+def columbia():
+    """Production geometry: elevation-band flowlines, which carry no `line`."""
+    return _columbia('elev_bands')
+
+
+@pytest.fixture
+def columbia_lines():
+    """Geometrical flowlines, the only kind `bedmachine_calving_extension` accepts.
+
+    Production does not hit that restriction: it runs on elevation bands and uses
+    `bedmachine_terminus_bed`, which reads the mask instead of a line. The guard
+    itself is pinned by `test_calving_extension_refuses_elevation_band_flowlines`.
+    """
+    return _columbia('centerlines')
 
 
 def synthetic_bed(x, y):
@@ -742,8 +775,8 @@ def test_extension_slice_refuses_a_bed_it_did_not_build(columbia):
     assert extension_slice(gdir, fl) is None
 
 
-def test_calving_extension_replaces_the_bed_and_keeps_the_synthetic(columbia):
-    gdir, path = columbia
+def test_calving_extension_replaces_the_bed_and_keeps_the_synthetic(columbia_lines):
+    gdir, path = columbia_lines
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
 
@@ -768,13 +801,17 @@ def test_calving_extension_replaces_the_bed_and_keeps_the_synthetic(columbia):
     # the ice-free extension stays ice-free: only the ground under it moved
     assert np.all(meas.thick[-n:] == 0)
     np.testing.assert_allclose(meas.surface_h[-n:], meas.bed_h[-n:])
-    assert out['fl_0']['bed_extension_measured_mean'] != \
-        out['fl_0']['bed_extension_synthetic_mean']
+    # one entry per flowline the task edited: a tributary has no extension slice,
+    # so on centerlines the edited one is the main flowline, not `fl_0`
+    assert out, 'the task edited no flowline'
+    edited = out[list(out)[-1]]
+    assert edited['bed_extension_measured_mean'] != \
+        edited['bed_extension_synthetic_mean']
 
 
-def test_match_terminus_removes_the_step_at_the_junction(columbia):
+def test_match_terminus_removes_the_step_at_the_junction(columbia_lines):
     """The inverted bed and the measured one need not meet, and a step is a spike."""
-    gdir, path = columbia
+    gdir, path = columbia_lines
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
 
@@ -784,18 +821,21 @@ def test_match_terminus_removes_the_step_at_the_junction(columbia):
     bed_matched = gdir.read_pickle('model_flowlines')[-1].bed_h
 
     n = gdir.settings['calving_line_extension']
-    offset = raw['fl_0']['bed_terminus_offset']
+    # the edited flowline is the last key: on centerlines a tributary has no
+    # extension slice, so it is not `fl_0`
+    edited = list(raw)[-1]
+    offset = raw[edited]['bed_terminus_offset']
     assert abs(offset) > 100.  # the inversion invented this water depth
     np.testing.assert_allclose(bed_matched[-n:], bed_raw[-n:] + offset)
     # matched, the first extension point continues the inverted bed
     assert abs(bed_matched[-n] - bed_matched[-n - 1]) < abs(bed_raw[-n] -
                                                             bed_raw[-n - 1])
-    assert matched['fl_0']['bed_terminus_offset'] == offset
+    assert matched[edited]['bed_terminus_offset'] == offset
 
 
-def test_calving_extension_reruns_from_the_synthetic_bed(columbia):
+def test_calving_extension_reruns_from_the_synthetic_bed(columbia_lines):
     """Re-running with other options must not compound onto the first result."""
-    gdir, path = columbia
+    gdir, path = columbia_lines
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
 
@@ -827,6 +867,22 @@ def test_calving_extension_raises_outside_the_grid(columbia):
     assert np.all(np.isnan(vals))
 
 
+def test_calving_extension_refuses_elevation_band_flowlines(columbia):
+    """The guard that sends production to `bedmachine_terminus_bed` instead.
+
+    Elevation-band flowlines carry `line=None`, and `Flowline` then invents a
+    straight line along the first grid row. Sampling a gridded bed along that line
+    would return values from somewhere else on the grid, silently. The `columbia`
+    fixture builds exactly those flowlines, because that is what production runs on.
+    """
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+
+    with pytest.raises(InvalidWorkflowError, match='no geometry'):
+        bedmachine_calving_extension(gdir)
+
+
 def test_calving_extension_refuses_a_land_terminating_glacier(columbia):
     gdir, path = columbia
     init_present_time_glacier(gdir)
@@ -838,8 +894,8 @@ def test_calving_extension_refuses_a_land_terminating_glacier(columbia):
         gdir.is_tidewater = True
 
 
-def test_width_methods_pick_the_width_the_law_will_use(columbia):
-    gdir, path = columbia
+def test_width_methods_pick_the_width_the_law_will_use(columbia_lines):
+    gdir, path = columbia_lines
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
     n = gdir.settings['calving_line_extension']
@@ -849,13 +905,15 @@ def test_width_methods_pick_the_width_the_law_will_use(columbia):
     for method in ('mean5', 'terminus', 'inversion'):
         out = bedmachine_calving_extension(gdir, width_method=method)
         widths[method] = gdir.read_pickle('model_flowlines')[-1]._w0_m[-n:]
-        assert out['fl_0']['width_method'] == method
+        assert out[list(out)[-1]]['width_method'] == method
 
     np.testing.assert_allclose(widths['inversion'], w_inv)
     # the terminus cell is the inversion's own front, so those two agree exactly
     np.testing.assert_allclose(widths['terminus'], w_inv)
-    # OGGM's five-cell mean does not
-    assert np.all(widths['mean5'] > 2 * w_inv)
+    # OGGM's five-cell mean does not. How far it differs is geometry-dependent:
+    # on elevation bands it is several times the front width, on centerlines a few
+    # per cent, so the test asserts that it is a different width and not how much.
+    assert not np.allclose(widths['mean5'], w_inv)
 
     with pytest.raises(InvalidParamsError):
         bedmachine_calving_extension(gdir, width_method='mean10')
@@ -878,8 +936,8 @@ def test_calving_front_width_check_is_exact_at_the_front_and_not_beyond(columbia
         calving_front_width_check(gdir, raise_on_fail=True)
 
 
-def test_calving_front_width_check_passes_once_the_bed_is_replaced(columbia):
-    gdir, path = columbia
+def test_calving_front_width_check_passes_once_the_bed_is_replaced(columbia_lines):
+    gdir, path = columbia_lines
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
     bedmachine_calving_extension(gdir, width_method='inversion')
@@ -889,8 +947,8 @@ def test_calving_front_width_check_passes_once_the_bed_is_replaced(columbia):
     assert d['rel_diff_extension'] < 1e-12
 
 
-def test_bed_extension_statistics_reports_both_beds(columbia):
-    gdir, path = columbia
+def test_bed_extension_statistics_reports_both_beds(columbia_lines):
+    gdir, path = columbia_lines
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
     bedmachine_calving_extension(gdir)
@@ -968,12 +1026,18 @@ def test_a_deepening_extension_calves_more_than_a_measured_one():
 
 @pytest.mark.slow
 def test_calving_vs_bed_extension_compares_two_runs_of_one_glacier(columbia):
+    """Two runs differing only in the bed at and beyond the front.
+
+    On the production geometry, elevation bands, and through the production task:
+    `bedmachine_terminus_bed` reads the mask rather than a line, so it is the one
+    the FIIC runs use. Columbia on centerlines blows the CFL limit on a tributary
+    (max_u of order 1e7 m yr-1 at fl_id 21), which is a property of the demo glacier
+    rather than of the bed code, so the comparison is made here where it is stable.
+    """
     gdir, path = columbia
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
-    # match_terminus, or the measured bed starts with the step between the
-    # inverted terminus bed and the measured one, and the run fails on CFL.
-    bedmachine_calving_extension(gdir, match_terminus=True)
+    bedmachine_terminus_bed(gdir, water_depth=200.)
 
     d = calving_vs_bed_extension(gdir, ys=1950, ye=2000)
     assert d['calving_m3_synthetic'] > 0
