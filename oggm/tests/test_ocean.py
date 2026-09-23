@@ -25,7 +25,8 @@ from oggm.core.flowline import init_present_time_glacier, k_calving_law
 from oggm.core.ocean_calving import (ConstantK, MeltPlusCalving, SeaIceModulated,
                                      TFPower, frontal_ablation_components,
                                      write_frontal_components)
-from oggm.core.ocean_inversion import partition_calving_constant
+from oggm.core.ocean_inversion import (partition_calving_constant,
+                                       terminus_water_depth_from_bed)
 from oggm.core.ocean_params import DEFAULTS, init_ocean_params, ocean_param
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 from oggm.shop.bedmachine_bed import (BEDMACHINE_URLS, BEDMACHINE_VARS,
@@ -1235,3 +1236,28 @@ def test_beta_is_a_law_parameter(state, years):
     ice = SeaIceModulated(years, np.full_like(years, tf), open_water=np.ones_like(years),
                           tf_ref=1.5, k_ice=0.6, beta=1.61)
     assert ice.beta == 1.61
+
+
+def _depth_grid(tmp_path):
+    """No water at the outline, shallow water inside a 5-cell trim, deep water only past it."""
+    bed = np.full((40, 40), 100.)
+    mask = np.zeros((40, 40))
+    mask[15:25, 15:25] = 1
+    bed[30:34, 15:21] = -50.
+    bed[0:4, 0:11] = -900.
+    gdir = FakeGdir(tmp_path)
+    xr.Dataset({'bedmachine_bed': (('y', 'x'), bed),
+                'glacier_mask': (('y', 'x'), mask)}).to_netcdf(gdir.get_filepath('gridded_data'))
+    return gdir
+
+
+def test_depth_fallback_is_trimmed_to_the_old_map(tmp_path):
+    gdir = _depth_grid(tmp_path)
+    assert terminus_water_depth_from_bed(gdir) == 900.
+    assert terminus_water_depth_from_bed(gdir, fallback_trim=5) == 50.
+
+
+def test_depth_fallback_trim_defaults_to_the_setting(tmp_path):
+    gdir = _depth_grid(tmp_path)
+    gdir.settings['terminus_depth_fallback_trim'] = 5
+    assert terminus_water_depth_from_bed(gdir) == 50.
