@@ -1151,6 +1151,28 @@ class TestInitialize(unittest.TestCase):
         cfg.set_intersects_db(gdf)
         assert len(cfg.INTERSECTS_GDF) == 0
 
+    def test_unpack_config_keeps_shared_data(self):
+        # a pool worker unpacking its config must not wipe what its running
+        # siblings put in the manager dict
+        import multiprocessing
+        manager = multiprocessing.Manager()
+        try:
+            cfg.set_manager(manager)
+            cfg.DATA['parent'] = 1
+            packed = cfg.pack_config()
+            cfg.DATA['sibling'] = 2
+            cfg.unpack_config(packed)
+            assert cfg.DATA['sibling'] == 2
+            assert cfg.DATA['parent'] == 1
+        finally:
+            cfg.set_manager(None)
+            manager.shutdown()
+        # a plain dict is still reset to exactly what was packed
+        cfg.DATA['stale'] = 3
+        cfg.unpack_config(packed)
+        assert 'stale' not in cfg.DATA
+        assert 'sibling' not in cfg.DATA
+
 
 class TestWorkflowTools(unittest.TestCase):
 
