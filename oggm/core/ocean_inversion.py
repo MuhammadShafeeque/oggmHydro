@@ -255,7 +255,7 @@ def ocean_cells(ds, mask, bed_var='bedmachine_bed'):
 
 @entity_task(log)
 def terminus_water_depth_from_bed(gdir, bed_var='bedmachine_bed',
-                                  dilate=2, min_pixels=5):
+                                  dilate=2, min_pixels=5, fallback_trim=None):
     """Measured water depth at the calving front, metres, positive down.
 
     The median of the sub-sea-level bed over the ocean cells that touch the glacier
@@ -265,12 +265,18 @@ def terminus_water_depth_from_bed(gdir, bed_var='bedmachine_bed',
     neither the outline nor the bed grid is accurate to a single 150 m cell.
 
     Writes ``terminus_water_depth`` and ``terminus_water_depth_n`` to the settings.
+
+    ``fallback_trim`` cells are cut from each edge of the map before the fallback
+    searches it, so a directory built with a wider border than OGGM's tidewater 10 falls
+    back to the same water. Default: the ``terminus_depth_fallback_trim`` setting, else 0.
     """
     import xarray as xr
     from scipy import ndimage
 
     if not gdir.is_tidewater:
         return None
+    if fallback_trim is None:
+        fallback_trim = int(_setting(gdir, 'terminus_depth_fallback_trim', 0))
 
     with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
         if bed_var not in ds:
@@ -286,7 +292,11 @@ def terminus_water_depth_from_bed(gdir, bed_var='bedmachine_bed',
     if wet.size < min_pixels:
         # No ocean touching the outline: fall back to the whole ocean in the
         # domain, which is the fjord the front drains into.
-        wet = bed[ocean]
+        sea = ocean.copy()
+        if fallback_trim:
+            t = fallback_trim
+            sea[:t, :] = sea[-t:, :] = sea[:, :t] = sea[:, -t:] = False
+        wet = bed[sea]
     if wet.size < min_pixels:
         raise InvalidWorkflowError(
             f'({gdir.rgi_id}) only {wet.size} sub-sea-level bed cells in the '
