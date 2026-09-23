@@ -834,16 +834,17 @@ def unpack_config(cfg_dict):
     PARAMS.clear()
     PATHS.clear()
     LRUHANDLERS.clear()
-    DATA.clear()
-    DL_VERIFIED.clear()
-    DEM_SOURCE_TABLE.clear()
 
     PARAMS.update(cfg_dict['PARAMS'])
     PATHS.update(cfg_dict['PATHS'])
     LRUHANDLERS.update(cfg_dict['LRUHANDLERS'])
-    DATA.update(cfg_dict['DATA'])
-    DL_VERIFIED.update(cfg_dict['DL_VERIFIED'])
-    DEM_SOURCE_TABLE.update(cfg_dict['DEM_SOURCE_TABLE'])
+    for shared, key in ((DATA, 'DATA'), (DL_VERIFIED, 'DL_VERIFIED'),
+                        (DEM_SOURCE_TABLE, 'DEM_SOURCE_TABLE')):
+        # A pool worker starting up shares these with its running siblings
+        # through the manager; clearing them there races their lookups.
+        if isinstance(shared, dict):
+            shared.clear()
+        shared.update(cfg_dict[key])
 
     PARAMS.do_log = prev_log
 
