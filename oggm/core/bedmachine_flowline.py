@@ -461,8 +461,12 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
         # it just left, and the flux runs away. The measured bed gives the shape
         # over the whole grounded-below-sea-level zone; the front is then shifted
         # onto the prescribed depth, which is what `k` was fitted at.
+        if method not in ('measured', 'flat'):
+            raise InvalidParamsError(f"method must be 'measured' or 'flat', "
+                                     f'not {method!r}')
         target = wl - water_depth
         bed_new = bed_old.copy()
+        used = method
         if method == 'measured':
             bed_bm = sample_gridded_by_band(gdir, surf[:i0 + 1], bed_var)
             bed_bm = bed_bm + (target - bed_bm[i0])
@@ -473,12 +477,13 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
             m = min(n, len(ramp))
             ramp[:m] = np.arange(1, m + 1) / m
             bed_new[zone] += ramp * (bed_bm[lo:] - bed_old[zone])
-        elif method == 'flat':
+            # An inverted front cell above water leaves no zone, and the front on
+            # land: it is ramped onto the depth as 'flat' does instead.
+            if lo > i0:
+                used = 'flat'
+        if used == 'flat':
             lo = i0 - n + 1
             bed_new[lo:i0 + 1] += (np.linspace(1., n, n) / n) * (target - bed_old[i0])
-        else:
-            raise InvalidParamsError(f"method must be 'measured' or 'flat', "
-                                     f'not {method!r}')
 
         # Beyond it: the measured bed, ring by ring, with the prescribed depth
         # where a ring holds too little water to take a median of.
@@ -510,7 +515,7 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
         out[f'fl_{i}'] = {
             'terminus_index': i0,
             'n_blend': n,
-            'method': method,
+            'method': used,
             'n_corrected': int(i0 + 1 - lo),
             'water_depth_prescribed': float(water_depth),
             'water_depth_before': float(max(wl - bed_old[i0], 0.)),

@@ -14,7 +14,7 @@ import shapely.geometry as shpg
 import xarray as xr
 
 from oggm import cfg, utils
-from oggm.core.bedmachine_flowline import (bed_extension_statistics,
+from oggm.core.bedmachine_flowline import (_purge_lazy, bed_extension_statistics,
                                            bedmachine_calving_extension,
                                            bedmachine_terminus_bed,
                                            calving_front_width_check,
@@ -1044,6 +1044,42 @@ def test_calving_vs_bed_extension_compares_two_runs_of_one_glacier(columbia):
     assert d['calving_m3_synthetic'] > 0
     assert d['calving_m3_measured'] > 0
     assert np.isfinite(d['calving_ratio'])
+
+
+def test_terminus_bed_moves_a_front_the_inversion_left_on_land(columbia):
+    """An inverted front cell above sea level still ends at the prescribed depth.
+
+    When the inverted bed bounded the correction zone, such a front kept its bed on
+    land, calved nothing, and sat on a step down to the measured depth beyond it.
+    """
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+    syn = gdir.get_filepath('model_flowlines', filesuffix='_synthetic')
+    if os.path.exists(syn):
+        os.remove(syn)
+    fls = gdir.read_pickle('model_flowlines')
+    fl = fls[-1]
+    i0 = int(np.nonzero(fl.thick > 0)[0][-1])
+    surf = fl.surface_h.copy()
+    surf[i0] = max(surf[i0], 40.)
+    bed = fl.bed_h.copy()
+    bed[i0] = surf[i0] - 25.
+    fl.bed_h = bed
+    fl.thick = surf - bed
+    _purge_lazy(fl)
+    gdir.write_pickle(fls, 'model_flowlines')
+
+    out = bedmachine_terminus_bed(gdir, water_depth=200.)
+    d = out[list(out)[-1]]
+    assert d['bed_terminus_before'] > 0
+    assert d['n_corrected'] >= 1
+    assert d['method'] == 'flat'
+    assert d['water_depth_after'] == pytest.approx(200.)
+    fl = gdir.read_pickle('model_flowlines')[-1]
+    assert int(np.nonzero(fl.thick > 0)[0][-1]) == i0
+    assert fl.bed_h[i0] == pytest.approx(-200.)
+    assert fl.thick[i0] == pytest.approx(surf[i0] + 200.)
 
 
 # --- the melt/calving split ----------------------------------------------------
