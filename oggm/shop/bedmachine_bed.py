@@ -1,25 +1,16 @@
 """BedMachine bed topography on the glacier grid.
 
-:py:func:`oggm.shop.bedmachine.bedmachine_to_gdir` writes only ``thickness``. The
-bed itself is what a marine terminus needs: the water depth every calving law is
-proportional to, over the ground the front advances onto. This module writes ``bed``,
-``errbed`` and ``source`` beside it, so that the uncertainty and the provenance of
-each sampled point travel with the bed rather than being looked up by hand.
+:py:func:`oggm.shop.bedmachine.bedmachine_to_gdir` writes the ice thickness
+only. This module also writes the bed, its error, its data source flag, the
+surface and the mask, which is what a marine terminus needs: the water depth
+every calving law is proportional to, over the ground the front moves onto.
 
-``source`` is categorical and is mapped with nearest-neighbour rather than linear
-interpolation, so that "this point is multibeam bathymetry" survives regridding.
+The categorical fields (``source``, ``mask``) are mapped with
+nearest-neighbour interpolation.
 
-Three facts about the data, checked 2026-09-19 rather than assumed:
-
-- **Greenland v6 exists** (released 2025-12-11, DOI 10.5067/6B6B225B8V2D), which the
-  stock module predates; it is the default here. v5 remains selectable.
-- The **NSIDC cloud** URLs above are the ones NASA CMR returns. The stock module's
-  ``n5eil01u.ecs.nsidc.org`` host belongs to the retired on-premises distribution.
-- Antarctica is now **v4**, not the v3 the stock module points at.
-
-NSIDC needs Earthdata credentials (``oggm_netrc_credentials``). Where the file is
-already on disk -- an HPC without outbound access, say -- pass ``local_file``, or set
-``cfg.PARAMS['bedmachine_file']``.
+The NSIDC files need Earthdata credentials (``oggm_netrc_credentials``). Where
+the file is already on disk, pass ``local_file`` or set
+``cfg.PATHS['bedmachine_file']``.
 """
 import logging
 import os
@@ -29,12 +20,11 @@ import pandas as pd
 import xarray as xr
 
 from oggm import cfg, entity_task, global_task, utils
-from oggm.core.ocean_params import ocean_param
 from oggm.exceptions import InvalidParamsError
 
 log = logging.getLogger(__name__)
 
-# From NASA CMR (short_name IDBMG4 / NSIDC-0756), not from the dataset landing pages.
+# As listed by NASA CMR (short names IDBMG4 and NSIDC-0756)
 BEDMACHINE_URLS = {
     ('05', '6'): ('https://data.nsidc.earthdatacloud.nasa.gov/'
                   'nsidc-cumulus-prod-protected/ICEBRIDGE/IDBMG4/6/1993/01/01/'
@@ -50,8 +40,7 @@ BEDMACHINE_URLS = {
 
 DEFAULT_VERSION = {'05': '6', '19': '4'}
 
-# gridded_data name -> (BedMachine name, interpolation). Nearest for the two
-# categorical fields; a linearly interpolated source flag is a meaningless number.
+# gridded_data name -> (BedMachine name, interpolation)
 BEDMACHINE_VARS = {
     'bedmachine_bed': ('bed', 'linear'),
     'bedmachine_errbed': ('errbed', 'linear'),
@@ -72,10 +61,20 @@ LONG_NAMES = {
 
 
 def bedmachine_file(gdir, version=None, local_file=None):
-    """Path to the BedMachine file for this glacier, downloading it if needed."""
+    """Path to the BedMachine file for this glacier, downloading it if needed.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory to process
+    version : str, optional
+        default: ``cfg.PARAMS['bedmachine_version']``, else the newest known
+    local_file : str, optional
+        default: ``cfg.PATHS['bedmachine_file']``, else the file is downloaded
+    """
 
     if local_file is None:
-        local_file = ocean_param('bedmachine_file')
+        local_file = cfg.PATHS.get('bedmachine_file')
     if local_file is not None:
         if not os.path.exists(local_file):
             raise InvalidParamsError(f'BedMachine file not found: {local_file}')
@@ -85,7 +84,7 @@ def bedmachine_file(gdir, version=None, local_file=None):
     if region not in DEFAULT_VERSION:
         raise NotImplementedError('BedMachine data not available for this '
                                   f'region: {region}')
-    version = str(version or ocean_param('bedmachine_version')
+    version = str(version or cfg.PARAMS['bedmachine_version']
                   or DEFAULT_VERSION[region])
     try:
         url = BEDMACHINE_URLS[(region, version)]
@@ -99,9 +98,8 @@ def bedmachine_file(gdir, version=None, local_file=None):
 def _open_bedmachine(path):
     """BedMachine as a salem-aware dataset, with its projection filled in.
 
-    The projection comes from the file's own `mapping` variable, which both
-    hemispheres carry. Guessing it from the sign of `y` is wrong: BedMachine
-    Greenland spans -3384425 to -632675 m, so a sign test puts it in Antarctica.
+    The projection is read from the file (its ``proj4`` attribute or its
+    ``mapping`` variable), not guessed from the coordinates.
     """
     ds = xr.open_dataset(path)
     proj = ds.attrs.get('proj4')
@@ -121,7 +119,7 @@ def bedmachine_bed_to_gdir(gdir, version=None, local_file=None, add_vars=None):
     """Add the BedMachine bed, its error and its source flag to ``gridded_data``.
 
     A superset of :py:func:`oggm.shop.bedmachine.bedmachine_to_gdir`: the ice
-    thickness is written under the same name, so the two are interchangeable.
+    thickness is written under the same name.
 
     Parameters
     ----------
@@ -132,7 +130,7 @@ def bedmachine_bed_to_gdir(gdir, version=None, local_file=None, add_vars=None):
         Default: ``cfg.PARAMS['bedmachine_version']``, else the newest known.
     local_file : str
         read this file instead of downloading. Default:
-        ``cfg.PARAMS['bedmachine_file']``.
+        ``cfg.PATHS['bedmachine_file']``.
     add_vars : sequence of str
         which ``gridded_data`` variables to write. Default: all of
         ``BEDMACHINE_VARS``.
@@ -142,7 +140,8 @@ def bedmachine_bed_to_gdir(gdir, version=None, local_file=None, add_vars=None):
         add_vars = tuple(BEDMACHINE_VARS)
     unknown = set(add_vars) - set(BEDMACHINE_VARS)
     if unknown:
-        raise InvalidParamsError(f'Unknown BedMachine variables: {sorted(unknown)}')
+        raise InvalidParamsError('Unknown BedMachine variables: '
+                                 f'{sorted(unknown)}')
 
     path = bedmachine_file(gdir, version=version, local_file=local_file)
 
@@ -151,7 +150,8 @@ def bedmachine_bed_to_gdir(gdir, version=None, local_file=None, add_vars=None):
     with _open_bedmachine(path) as ds:
         proj = ds.attrs['pyproj_srs']
         x0, x1, y0, y1 = gdir.grid.extent_in_crs(proj)
-        dsroi = ds.salem.subset(corners=((x0, y0), (x1, y1)), crs=proj, margin=10)
+        dsroi = ds.salem.subset(corners=((x0, y0), (x1, y1)), crs=proj,
+                                margin=10)
         for vn in add_vars:
             src, interp = BEDMACHINE_VARS[vn]
             if src not in dsroi:
@@ -165,7 +165,7 @@ def bedmachine_bed_to_gdir(gdir, version=None, local_file=None, add_vars=None):
                                   'valid_range', 'source', 'grid_mapping')}
 
     if 'bedmachine_ice_thickness' in out:
-        # As the stock task: no ice means no thickness, not a zero.
+        # as bedmachine_to_gdir: no ice means no thickness, not a zero
         thick = np.asarray(out['bedmachine_ice_thickness'], dtype=np.float64)
         thick[thick <= 0] = np.nan
         out['bedmachine_ice_thickness'] = thick
@@ -180,8 +180,9 @@ def bedmachine_bed_to_gdir(gdir, version=None, local_file=None, add_vars=None):
             v.units = attrs[vn].get('units', 'm')
             v.long_name = LONG_NAMES[vn]
             v.data_source = path
-            v.bedmachine_version = str(version or ocean_param('bedmachine_version')
-                                       or DEFAULT_VERSION.get(gdir.rgi_region, ''))
+            v.bedmachine_version = str(
+                version or cfg.PARAMS['bedmachine_version']
+                or DEFAULT_VERSION.get(gdir.rgi_region, ''))
             for k in ('flag_values', 'flag_meanings'):
                 if k in attrs[vn]:
                     setattr(v, k, attrs[vn][k])
@@ -190,7 +191,18 @@ def bedmachine_bed_to_gdir(gdir, version=None, local_file=None, add_vars=None):
 
 @entity_task(log)
 def bedmachine_bed_statistics(gdir):
-    """Per-glacier summary of the BedMachine bed, its error and its sources."""
+    """Per-glacier summary of the BedMachine bed, its error and its sources.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory to process
+
+    Returns
+    -------
+    dict
+        one row of statistics
+    """
 
     d = {'rgi_id': gdir.rgi_id,
          'rgi_region': gdir.rgi_region,
@@ -234,7 +246,18 @@ def bedmachine_bed_statistics(gdir):
 
 @global_task(log)
 def compile_bedmachine_bed_statistics(gdirs, filesuffix='', path=True):
-    """Gather :py:func:`bedmachine_bed_statistics` over a list of glaciers."""
+    """Gather :py:func:`bedmachine_bed_statistics` over a list of glaciers.
+
+    Parameters
+    ----------
+    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+        the glacier directories to process
+    filesuffix : str
+        add suffix to output file
+    path : str, bool
+        Set to "True" in order to store the info in the working directory
+        Set to a path to store the file to your chosen location
+    """
     from oggm.workflow import execute_entity_task
 
     out = pd.DataFrame(execute_entity_task(bedmachine_bed_statistics,

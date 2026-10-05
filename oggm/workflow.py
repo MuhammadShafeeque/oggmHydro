@@ -806,7 +806,10 @@ def inversion_tasks(gdirs, settings_filesuffix='', input_filesuffix=None,
                                     add_to_log_file=add_to_log_file)
 
         if gdirs_c:
-            execute_entity_task(tasks.find_inversion_calving_from_any_mb,
+            calving_task = tasks.find_inversion_calving_from_any_mb
+            if gdirs[0].settings['inversion_calving_from_bathymetry']:
+                calving_task = tasks.find_inversion_calving_from_bathymetry
+            execute_entity_task(calving_task,
                                 gdirs_c,
                                 settings_filesuffix=settings_filesuffix,
                                 input_filesuffix=output_filesuffix,

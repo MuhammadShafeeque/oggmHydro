@@ -1,4 +1,4 @@
-"""Ocean-forced frontal ablation laws for the OGGM dynamical model.
+"""Ocean-forced frontal ablation laws for the flowline models.
 
 Four laws, as a nested family rooted at the stock model:
 
@@ -8,47 +8,75 @@ Four laws, as a nested family rooted at the stock model:
 ``tf_power``         :class:`TFPower`, ``k(t) = k0 (TF/TF_ref)**gamma``.
                      Reduces to the control when ``TF == TF_ref``.
 ``melt_calving``     :class:`MeltPlusCalving`, an explicit submarine-melt term
-                     after Rignot et al. (2016) plus a residual calving term.
-``sea_ice``          :class:`SeaIceModulated`, the melt term gated by open-water
-                     fraction. Reduces to ``melt_calving`` at ``delta = 0``.
+                     after Rignot et al. (2016) plus a calving term.
+``sea_ice``          :class:`SeaIceModulated`, the melt term gated by the
+                     open-water fraction. Reduces to ``melt_calving`` at
+                     ``delta = 0``.
 ===================  =========================================================
 
-Each is a drop-in for the ``calving_law=`` kwarg of ``FluxBasedModel`` and
-``SemiImplicitModel``, so nothing in OGGM is modified. They are nested on purpose:
-comparing them is then a comparison inside one model rather than between four.
+Each is passed as the ``calving_law`` of ``FluxBasedModel`` or
+``SemiImplicitModel``, and reads the ``ocean_data`` file written by
+:mod:`oggm.shop.ocean`.
 
-Each law also reports the **split** of what it returns: ``frontal_speed_components``
-gives ``(calving, submarine melt)`` separately, and the base class keeps an exact
-running total of each, which :func:`write_frontal_components` appends to the run's
-sidecar ``frontal_ablation_diagnostics.nc`` as ``calving_only_m3`` and
-``submarine_melt_m3`` (``compile_run_output`` rejects unknown variables). It is a partition
-the model asserts, not one any observation constrains -- melt undercutting drives
-calving, so the two are not independently forced, and a calving constant calibrated
-against an observed total already contains the melt-driven part.
+Each law also reports the split of what it returns into calving and submarine
+melt, which :func:`write_frontal_components` writes beside the run output. The
+split is a model diagnostic: melt undercutting drives calving, so a calving
+constant calibrated against an observed frontal ablation already contains the
+melt-driven part (see ``partition`` in :func:`ocean_calving_law`).
 
-Two traps the classes exist to close. ``model.calving_k`` is in s-1 while
-``cfg.PARAMS['calving_k']`` is in a-1, and a law must return m3 s-1. And a negative
-thermal forcing raised to a fractional power is a NaN that propagates silently into
-``calving_m3``, so every law clips the forcing at zero before the power.
+``model.calving_k`` is in s-1 while ``cfg.PARAMS['calving_k']`` is in yr-1, and
+a law returns m3 s-1. The thermal forcing is clipped at zero before any power.
 """
 import logging
 import os
 
 import numpy as np
+import xarray as xr
 
 from oggm import cfg
-from oggm import entity_task
+from oggm import entity_task, global_task
 from oggm import utils
-from oggm.core.ocean_params import ocean_param
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 
 log = logging.getLogger(__name__)
 
-# A sidecar, because compile_run_output raises on any variable it does not know.
-cfg.add_to_basenames(
-    'frontal_ablation_diagnostics', 'frontal_ablation_diagnostics.nc',
-    'The submarine melt and calving parts of the frontal ablation of a run, on '
-    'the time axis of its model_diagnostics file.')
+
+def band_names(ds):
+    """The depth-band names of an ``ocean_data`` dataset, in file order."""
+    if 'band_name' not in ds:
+        return [str(b) for b in ds['band'].values]
+    raw = np.asarray(ds['band_name'].values)
+    if raw.ndim == 2:  # netCDF char array, if xarray did not join it
+        raw = [b''.join(r) for r in raw]
+    return [(r.decode() if isinstance(r, bytes) else str(r)).strip('\x00')
+            for r in raw]
+
+
+def tf_power_mean(tf, gamma):
+    """The reference thermal forcing at which ``tf_power`` leaves k unchanged.
+
+    The power mean ``mean(max(TF, 0)**gamma)**(1/gamma)``, i.e. the ``TF_ref``
+    for which ``(TF/TF_ref)**gamma`` averages to one over ``tf``.
+
+    Parameters
+    ----------
+    tf : array
+        thermal forcing, degC
+    gamma : float
+        the exponent of the law
+
+    Returns
+    -------
+    float
+        the reference, or nan when ``tf`` holds no finite value
+    """
+    tf = np.asarray(tf, dtype=float)
+    tf = np.clip(tf[np.isfinite(tf)], 0., None)
+    if not tf.size:
+        return np.nan
+    if gamma == 0:
+        return float(np.mean(tf))
+    return float(np.mean(tf ** gamma) ** (1. / gamma))
 
 
 def _melt_fraction(u_calving, u_melt):
@@ -62,27 +90,33 @@ def _melt_fraction(u_calving, u_melt):
 class _OceanCalvingLaw:
     """Base for time-varying calving laws driven by an ocean_data file.
 
-    Sub-classes implement :meth:`frontal_speed`, returning a front-normal speed in
-    m s-1. This class multiplies by the submerged area, which is the algebra of the
-    stock law: ``k*d*h*w == (k*h) * (d*w)``.
+    Sub-classes implement :meth:`frontal_speed_components`, returning
+    front-normal speeds in m s-1. This class multiplies by the submerged area,
+    which is the algebra of the stock law: ``k*d*h*w == (k*h) * (d*w)``.
+
+    Parameters
+    ----------
+    years : array
+        the time axis of the forcing, in float years
+    tf : array
+        thermal forcing on that axis, degC
+    open_water : array, optional
+        open-water fraction on that axis
+    q_sg : array, optional
+        subglacial discharge on that axis, m3 s-1
     """
 
     name = 'ocean'
+    # law kwarg -> the parameter it defaults to
+    settings_keys = {}
 
-    def __init__(self, years, tf, open_water=None, q_sg=None, tf_ref=None):
+    def __init__(self, years, tf, open_water=None, q_sg=None):
         self._init_accounting()
         self.years = np.asarray(years, dtype=float)
         self.tf = np.asarray(tf, dtype=float)
-        self.open_water = None if open_water is None else np.asarray(open_water, float)
+        self.open_water = (None if open_water is None
+                           else np.asarray(open_water, dtype=float))
         self.q_sg = None if q_sg is None else np.asarray(q_sg, dtype=float)
-        self.tf_ref = float(tf_ref) if tf_ref is not None else float(np.nanmean(self.tf))
-        if not np.isfinite(self.tf_ref) or self.tf_ref <= 0:
-            # (TF/TF_ref)**gamma is meaningless for TF_ref <= 0. This is the
-            # freezing-point case, and it has to be a deliberate modelling decision
-            # rather than a division.
-            raise InvalidParamsError(
-                f'TF_ref = {self.tf_ref} is not usable; set '
-                "cfg.PARAMS['ocean_tf_ref'] explicitly or pick a different band.")
         self._model_k = None
 
     def _at(self, arr, yr):
@@ -92,7 +126,7 @@ class _OceanCalvingLaw:
         return float(np.interp(yr, self.years, arr, left=arr[0], right=arr[-1]))
 
     def _tf_at(self, yr):
-        return max(self._at(self.tf, yr), 0.)  # clip before any power, as ISSM does
+        return max(self._at(self.tf, yr), 0.)  # clip before any power
 
     def frontal_speed(self, h, d, w, yr):
         """The total front-normal speed, m s-1."""
@@ -101,9 +135,8 @@ class _OceanCalvingLaw:
     def frontal_speed_components(self, h, d, w, yr):
         """``(calving, submarine melt)`` front-normal speeds, m s-1.
 
-        They sum to :meth:`frontal_speed`. A law with no explicit melt term puts
-        everything in the first slot, which is the honest statement: its calving
-        constant already contains the melt.
+        They sum to :meth:`frontal_speed`. A law with no explicit melt term
+        puts everything in the first slot.
         """
         raise NotImplementedError
 
@@ -121,22 +154,22 @@ class _OceanCalvingLaw:
         return q
 
     def _k(self, value):
-        """A calving constant in s-1, from `value` in a-1 or from the model."""
+        """A calving constant in s-1, from `value` in yr-1 or from the model."""
         if value is not None:
             return value / cfg.SEC_IN_YEAR
         if self._model_k is None:
-            raise InvalidWorkflowError('no calving constant: pass one to the law or '
-                                       'let the model provide calving_k')
+            raise InvalidWorkflowError('no calving constant: pass one to the '
+                                       'law or let the model provide '
+                                       'calving_k')
         return self._model_k
 
     # --- the melt/calving split ------------------------------------------------
     #
-    # The evolution models call the law, multiply what it returns by ``dt`` and add
-    # the product to one counter. They never see the two summands and there is no
-    # diagnostic hook for a second one, so the law keeps its own books. It cannot
-    # see ``dt`` either -- ``self.t`` advances *after* the calving block -- so each
-    # step is closed on the next call, and the final open step is closed against
-    # the model's own total by :meth:`components_m3`. The split is then exact.
+    # The evolution models add what the law returns times ``dt`` to one
+    # counter and never see the two summands, so the law keeps its own books.
+    # It cannot see ``dt`` either (``model.t`` advances after the calving
+    # block), so each step is closed on the next call, and the last open step
+    # is closed against the model's own total by :meth:`components_m3`.
 
     def _init_accounting(self):
         self.frontal_ablation_m3 = 0.
@@ -168,7 +201,7 @@ class _OceanCalvingLaw:
         self._pending = {}
         if yr is None:
             return
-        # one record per month is enough to carry a series and bounds the memory
+        # one record per month bounds the memory
         if not self._series or int(yr * 12) > int(self._series[-1][0] * 12):
             self._series.append((float(yr), self.frontal_ablation_m3,
                                  self.submarine_melt_m3))
@@ -182,8 +215,8 @@ class _OceanCalvingLaw:
     def components_m3(self, model=None):
         """``(calving, submarine melt)`` since the run started, m3.
 
-        With a model they sum exactly to its ``calving_m3_since_y0``: the step still
-        open when the run stopped is closed here at that step's own melt fraction.
+        With a model they sum to its ``calving_m3_since_y0``: the step still
+        open when the run stopped is closed here at its own melt fraction.
         """
         total, melt = self.frontal_ablation_m3, self.submarine_melt_m3
         ref = getattr(model, 'calving_m3_since_y0', None)
@@ -193,7 +226,7 @@ class _OceanCalvingLaw:
         return total - melt, melt
 
     def component_series(self, model=None):
-        """Monthly cumulative ``(years, frontal ablation, submarine melt)``, m3."""
+        """Monthly cumulative (years, frontal ablation, submarine melt), m3."""
         rec = list(self._series)
         if model is not None:
             yr = getattr(model, 'yr', None)
@@ -207,18 +240,21 @@ class _OceanCalvingLaw:
 
 
 class ConstantK(_OceanCalvingLaw):
-    """The control. Bit-identical to :func:`oggm.core.flowline.k_calving_law`.
+    """The control: :func:`oggm.core.flowline.k_calving_law` with accounting.
 
-    Written out rather than delegating so that all four laws share one geometry, and
-    so the equivalence is something a test asserts rather than something assumed.
-    Unlike its siblings it does *not* clip at zero, because the stock law does not.
+    Like the stock law, and unlike its siblings, it does not clip at zero.
+
+    Parameters
+    ----------
+    k : float, optional
+        the calving constant in yr-1. Default: the model's ``calving_k``.
     """
 
     name = 'constant'
 
     def __init__(self, years=None, tf=None, k=None, **kwargs):
         self._init_accounting()
-        self.k = k  # a-1, or None to take the model's calving_k
+        self.k = k
         self.years = None if years is None else np.asarray(years, dtype=float)
         self.tf = None if tf is None else np.asarray(tf, dtype=float)
         self._model_k = None
@@ -236,22 +272,40 @@ class ConstantK(_OceanCalvingLaw):
 
 
 class TFPower(_OceanCalvingLaw):
-    """Oerlemans-Nick with an ocean-scaled proportionality constant.
+    """The stock law with a calving constant scaled by the thermal forcing.
 
     ``k(t) = k0 * (max(TF(t), 0) / TF_ref) ** gamma``
 
-    ``gamma`` defaults to Rignot et al. (2016) beta, on the argument that the thermal
-    dependence of frontal ablation inherits that of submarine melt. That is an
-    assumption, not a derivation: Rignot's beta describes an undercutting rate, and
-    the two coincide only if frontal ablation is melt-limited.
+    The default ``gamma`` is the thermal-forcing exponent of the submarine
+    melt rate of Rignot et al. (2016), which assumes that frontal ablation
+    inherits the thermal dependence of the melt.
+
+    Parameters
+    ----------
+    tf_ref : float
+        the reference thermal forcing, degC. Must be positive:
+        :func:`tf_power_mean` over a reference period makes the law return
+        ``k0`` on average over that period.
+    k0 : float, optional
+        the calving constant at ``TF_ref``, yr-1. Default: the model's
+        ``calving_k``.
+    gamma : float, optional
+        default: ``cfg.PARAMS['calving_tf_exponent']``
     """
 
     name = 'tf_power'
+    settings_keys = {'gamma': 'calving_tf_exponent'}
 
-    def __init__(self, *args, k0=None, gamma=None, **kwargs):
+    def __init__(self, *args, tf_ref=None, k0=None, gamma=None, **kwargs):
         super().__init__(*args, **kwargs)
+        if tf_ref is None or not np.isfinite(tf_ref) or tf_ref <= 0:
+            raise InvalidParamsError(
+                f'TF_ref = {tf_ref} is not usable: the tf_power law needs a '
+                'positive reference thermal forcing.')
+        self.tf_ref = float(tf_ref)
         self.k0 = k0
-        self.gamma = ocean_param('calving_tf_exponent') if gamma is None else gamma
+        self.gamma = (cfg.PARAMS['calving_tf_exponent'] if gamma is None
+                      else gamma)
 
     def frontal_speed_components(self, h, d, w, yr):
         k = self._k(self.k0)
@@ -261,75 +315,93 @@ class TFPower(_OceanCalvingLaw):
 class MeltPlusCalving(_OceanCalvingLaw):
     """Frontal ablation as a sum of front-normal speeds.
 
-    ``Q_f = w * d * (k_c * h + lam * mdot)``, with ``mdot`` from Rignot et al. (2016)
-    Eq. (1): ``mdot = (A * h_w * q_sg**alpha + B) * TF**beta`` in m d-1.
+    ``Q_f = w * d * (k_c * h + lam * mdot)``, with ``mdot`` from Rignot et
+    al. (2016) Eq. (1): ``mdot = (A * h_w * q_sg**alpha + B) * TF**beta`` in
+    m d-1, ``h_w`` being the water depth at the front.
 
-    ``lam`` is there because Rignot's ``mdot`` is the horizontally averaged *maximum*
-    melt rate, not the area-averaged one. Multiplying it by the whole submerged area
-    overstates the melt mass flux, so the product is defensible as a calving driver
-    rather than as a melt flux. ``lam = 1`` is the naive additive case.
+    ``mdot`` is the horizontally averaged maximum melt rate, not the
+    area-averaged one, so ``lam`` scales its action on the whole submerged
+    front. Without a subglacial discharge the law is ``B * TF**beta``.
 
-    ``h_w`` follows ISSM in being the water depth at the front, not the ice thickness.
+    Parameters
+    ----------
+    k_c : float, optional
+        the calving constant, yr-1. Default: the model's ``calving_k``, in
+        which case the melt term adds to a constant that may already contain
+        it (see ``partition`` in :func:`ocean_calving_law`).
+    lam : float, optional
+        default: ``cfg.PARAMS['calving_undercut_efficiency']``
+    water_depth : float, optional
+        the water depth of the melt rate, m. Default: the model's own.
+    A, B, alpha, beta : float, optional
+        default: ``cfg.PARAMS['calving_melt_A']`` and so on
     """
 
     name = 'melt_calving'
+    settings_keys = {'A': 'calving_melt_A', 'B': 'calving_melt_B',
+                     'alpha': 'calving_melt_alpha',
+                     'beta': 'calving_melt_beta',
+                     'lam': 'calving_undercut_efficiency'}
 
-    def __init__(self, *args, k_c=None, lam=None, water_depth=None, alpha=None,
-                 beta=None, **kwargs):
+    def __init__(self, *args, k_c=None, lam=None, water_depth=None, A=None,
+                 B=None, alpha=None, beta=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.A = ocean_param('calving_melt_A')
-        self.B = ocean_param('calving_melt_B')
-        # per law, so a sweep need not mutate cfg.PARAMS
-        self.alpha = ocean_param('calving_melt_alpha') if alpha is None else alpha
-        self.beta = ocean_param('calving_melt_beta') if beta is None else beta
-        self.lam = ocean_param('calving_undercut_efficiency') if lam is None else lam
-        self.k_c = k_c  # a-1
-        self.water_depth = water_depth  # m, from bathymetry when known
+        for kwarg, value in (('A', A), ('B', B), ('alpha', alpha),
+                             ('beta', beta), ('lam', lam)):
+            if value is None:
+                value = cfg.PARAMS[self.settings_keys[kwarg]]
+            setattr(self, kwarg, value)
+        self.k_c = k_c
+        self.water_depth = water_depth
 
     def melt_rate(self, d, w, yr):
         """Rignot et al. (2016) Eq. (1), in m s-1."""
         tf = self._tf_at(yr)
         hw = d if self.water_depth is None else self.water_depth
         if self.q_sg is None:
-            # Rignot's own no-subglacial-discharge limit, and the defensible
-            # default at a cold-based ice cap: the law reduces to B * TF**beta.
             q = 0.
         else:
             area = max(hw * w, 1e-3)
-            q = max(self._at(self.q_sg, yr), 0.) * 86400. / area  # m3 s-1 -> m d-1
-        mdot = (self.A * max(hw, 0.) * q ** self.alpha + self.B) * tf ** self.beta
-        return mdot / 86400.
+            # m3 s-1 -> m d-1
+            q = max(self._at(self.q_sg, yr), 0.) * cfg.SEC_IN_DAY / area
+        mdot = ((self.A * max(hw, 0.) * q ** self.alpha + self.B)
+                * tf ** self.beta)
+        return mdot / cfg.SEC_IN_DAY
 
     def frontal_speed_components(self, h, d, w, yr):
         return self._k(self.k_c) * h, self.lam * self.melt_rate(d, w, yr)
 
 
 class SeaIceModulated(MeltPlusCalving):
-    """Frontal ablation gated by open water rather than by ocean heat alone.
+    """:class:`MeltPlusCalving` with the melt term gated by open water.
 
     ``Q_f = w * d * (k_ice * h + f_ow(t)**delta * lam * mdot(TF))``
 
-    Motivated by the only near-terminus hydrography at Flade Isblink: water within
-    0.005 degC of the freezing point at 44-75 m, and roughly 10 m of melt per month
-    in the August open-water period against 1.2 m per year subsurface. If that holds,
-    open-water duration is the operative predictor and ocean heat is not. It is also
-    the term Malles et al. (2023) wrote into their Eq. (5) and then declined.
+    The open-water fraction ``f_ow`` acts on the melt term only; the calving
+    term is left as it is. ``delta = 0`` is :class:`MeltPlusCalving`.
 
-    ``delta = 0`` collapses this to :class:`MeltPlusCalving`, which is what makes
-    ``delta`` testable rather than assumed.
+    Parameters
+    ----------
+    k_ice : float, optional
+        the calving constant, yr-1 (``k_c`` of :class:`MeltPlusCalving`)
+    delta : float, optional
+        default: ``cfg.PARAMS['calving_openwater_exponent']``
     """
 
     name = 'sea_ice'
+    settings_keys = dict(MeltPlusCalving.settings_keys,
+                         delta='calving_openwater_exponent')
 
     def __init__(self, *args, k_ice=None, delta=None, **kwargs):
-        super().__init__(*args, k_c=k_ice, **kwargs)
-        self.delta = (ocean_param('calving_openwater_exponent') if delta is None
-                      else delta)
+        kwargs.setdefault('k_c', k_ice)
+        super().__init__(*args, **kwargs)
+        self.delta = (cfg.PARAMS['calving_openwater_exponent']
+                      if delta is None else delta)
 
     def frontal_speed_components(self, h, d, w, yr):
         if self.open_water is None:
-            raise InvalidWorkflowError('SeaIceModulated needs open_water_frac in '
-                                       'ocean_data.nc')
+            raise InvalidWorkflowError('SeaIceModulated needs '
+                                       'open_water_frac in ocean_data.nc')
         f = max(self._at(self.open_water, yr), 0.)
         melt = self.lam * self.melt_rate(d, w, yr)
         return self._k(self.k_c) * h, (f ** self.delta) * melt
@@ -342,16 +414,28 @@ LAWS = {'constant': ConstantK, 'tf_power': TFPower,
 def partition_law_k(gdir, law, period=None):
     """Give a melt-bearing law the residual calving constant, keeping the total.
 
-    ``k`` was fitted against an *observed* frontal ablation, so it already contains
-    the calving that submarine melt drives. A melt term added on top of it counts
-    that melt twice: measured on the twelve FIIC divides with `melt_calving` on the
-    200-500 m band, the total came out at 13.7 Gt yr-1 against a calibrated 0.12.
+    A calving constant fitted to an observed frontal ablation already contains
+    the calving that submarine melt drives, so a melt term added on top of it
+    counts that melt twice.
+    :func:`oggm.core.ocean_inversion.partition_calving_constant` solves
+    ``k_c h + lam mdot = k h`` for ``k_c`` at the front the inversion
+    prescribed, with the law's own melt rate averaged over ``period``. The
+    total is then unchanged over that period and only its split moves.
 
-    :func:`partition_calving_constant` solves ``k_c h + lam mdot = k h`` for ``k_c``,
-    so the total is unchanged and only its split moves. The reference melt rate is
-    the law's own, averaged over the reference period, at the prescribed front.
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory, inverted with
+        :func:`oggm.core.ocean_inversion.find_inversion_calving_from_bathymetry`
+    law : :class:`MeltPlusCalving`
+        the law, whose ``k_c`` is set in place
+    period : tuple of two years, optional
+        default: ``gdir.settings['ocean_tf_ref_period']``
 
-    Sets ``law.k_c`` in place and returns ``(k_c, melt_fraction)``.
+    Returns
+    -------
+    (k_c, melt_fraction) : the residual constant in yr-1 and the melt share of
+        the total, or ``(None, 0.)`` for a law without a melt term
     """
     from oggm.core.ocean_inversion import _setting, partition_calving_constant
 
@@ -363,19 +447,21 @@ def partition_law_k(gdir, law, period=None):
     width = _setting(gdir, 'calving_front_width')
     if None in (k_total, thick, depth, width):
         raise InvalidWorkflowError(
-            f'({gdir.rgi_id}) partitioning needs calving_k, calving_front_thick, '
-            'terminus_water_depth and calving_front_width in the settings; run the '
-            'calving inversion first.')
+            f'({gdir.rgi_id}) partitioning needs calving_k, '
+            'calving_front_thick, terminus_water_depth and calving_front_width '
+            'in the settings; run find_inversion_calving_from_bathymetry '
+            'first.')
 
-    period = period or ocean_param('ocean_tf_ref_period')
+    period = period or gdir.settings['ocean_tf_ref_period']
     y0, y1 = (float(y) for y in period)
     yrs = np.asarray(law.years, dtype=float)
     sel = (yrs >= y0) & (yrs < y1 + 1)
     if not sel.any():
         raise InvalidWorkflowError(
-            f'({gdir.rgi_id}) the ocean record does not cover {y0:.0f}-{y1:.0f}, so '
-            'the reference melt rate cannot be formed. Give the law an explicit '
-            'k_c, or pick a period the product covers.')
+            f'({gdir.rgi_id}) the ocean record does not cover '
+            f'{y0:.0f}-{y1:.0f}, so the reference melt rate cannot be formed. '
+            'Give the law an explicit k_c, or pick a period the record '
+            'covers.')
     mdot = float(np.mean([law.melt_rate(depth, width, y) for y in yrs[sel]]))
 
     k_c, frac = partition_calving_constant(k_total, mdot, thick, lam=law.lam)
@@ -387,20 +473,37 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
                       tf_ref=None, partition=False, **law_kwargs):
     """Build a calving law for one glacier from its ocean_data file.
 
-    Separate from the run task so a law can be built, inspected and tested without
-    running the model.
-
     Parameters
     ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory to process
+    calving_law : str, optional
+        'constant', 'tf_power', 'melt_calving' or 'sea_ice'. Default:
+        ``gdir.settings['calving_law']``.
+    band : str, optional
+        the depth band of the ocean file the law reads. Default:
+        ``gdir.settings['ocean_tf_band']``.
+    ocean_filesuffix : str
+        the filesuffix of the ``ocean_data`` file
+    tf_ref : float, optional
+        the reference thermal forcing of 'tf_power', ignored by the other
+        laws. Default: ``gdir.settings['ocean_tf_ref']``, and when that is not
+        set either, :func:`tf_power_mean` of the glacier's own record over
+        ``gdir.settings['ocean_tf_ref_period']``, so that the law returns the
+        calving constant on average over that period.
     partition : bool
-        for a melt-bearing law, set ``k_c`` from :func:`partition_law_k` so the melt
-        term is carved out of the calibrated total rather than added to it. Off by
-        default, because it changes what a law means and every run table should say
-        so explicitly.
-    """
-    import xarray as xr
+        for a melt-bearing law, set ``k_c`` from :func:`partition_law_k` so
+        that the melt term is carved out of the calibrated total instead of
+        being added to it.
+    **law_kwargs
+        passed to the law (``k0``, ``gamma``, ``lam``, ``delta`` ...). The
+        ones not given are read from the glacier's settings.
 
-    calving_law = calving_law or ocean_param('calving_law')
+    Returns
+    -------
+    the law, to be passed as ``calving_law`` to a flowline model
+    """
+    calving_law = calving_law or gdir.settings['calving_law']
     if calving_law not in LAWS:
         raise InvalidParamsError(f'unknown calving law {calving_law!r}; '
                                  f'available: {sorted(LAWS)}')
@@ -411,69 +514,82 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
         raise InvalidWorkflowError(f'({gdir.rgi_id}) no ocean_data file; run '
                                    'process_ocean_data first.')
 
-    band = band or ocean_param('ocean_tf_band')
+    band = band or gdir.settings['ocean_tf_band']
     fp = gdir.get_filepath('ocean_data', filesuffix=ocean_filesuffix)
     with xr.open_dataset(fp) as ds:
         ds = ds.load()
     if 'band' not in ds.dims:
         raise InvalidWorkflowError('ocean_data has no band dimension')
-    names = [str(n) for n in _band_names(ds)]
+    names = band_names(ds)
     if band not in names:
         raise InvalidParamsError(f'band {band!r} not in {names}')
-    i = names.index(band)
+    tf = ds['thermal_forcing'].values[:, names.index(band)]
+    yrs = ds['time.year'].values + (ds['time.month'].values - 0.5) / 12
 
-    yrs = (ds['time.year'].values + (ds['time.month'].values - 0.5) / 12)
-    tf_ref = ocean_param('ocean_tf_ref') if tf_ref is None else tf_ref
-    law = LAWS[calving_law](
-        yrs, ds['thermal_forcing'].values[:, i],
-        open_water=(ds['open_water_frac'].values if 'open_water_frac' in ds
-                    else None),
-        q_sg=(ds['subglacial_discharge'].values if 'subglacial_discharge' in ds
-              else None),
-        tf_ref=tf_ref, **law_kwargs)
+    cls = LAWS[calving_law]
+    for kwarg, key in cls.settings_keys.items():
+        if law_kwargs.get(kwarg) is None:
+            law_kwargs[kwarg] = gdir.settings[key]
+
+    if cls is TFPower:
+        if tf_ref is None:
+            tf_ref = gdir.settings['ocean_tf_ref']
+        if tf_ref is None:
+            y0, y1 = (int(y) for y in gdir.settings['ocean_tf_ref_period'])
+            sel = (ds['time.year'].values >= y0) & (ds['time.year'].values <= y1)
+            if not sel.any():
+                raise InvalidWorkflowError(
+                    f'({gdir.rgi_id}) the ocean record does not cover '
+                    f'{y0}-{y1}, so there is no reference thermal forcing. '
+                    'Pass tf_ref or set ocean_tf_ref.')
+            tf_ref = tf_power_mean(tf[sel], law_kwargs['gamma'])
+        law_kwargs['tf_ref'] = tf_ref
+
+    law = cls(yrs, tf,
+              open_water=(ds['open_water_frac'].values
+                          if 'open_water_frac' in ds else None),
+              q_sg=(ds['subglacial_discharge'].values
+                    if 'subglacial_discharge' in ds else None),
+              **law_kwargs)
     if partition:
         k_c, frac = partition_law_k(gdir, law)
         if k_c is not None:
             gdir.add_to_diagnostics('calving_k_residual', float(k_c))
-            gdir.add_to_diagnostics('calving_melt_fraction_reference', float(frac))
+            gdir.add_to_diagnostics('calving_melt_fraction_reference',
+                                    float(frac))
     return law
 
 
-def _band_names(ds):
-    """Band names, whether they are a coordinate or the char variable we write."""
-    if 'band_name' not in ds:
-        return [str(b) for b in ds['band'].values]
-    raw = np.asarray(ds['band_name'].values)
-    if raw.ndim == 2:  # netCDF char array, if xarray did not join it for us
-        raw = [b''.join(r) for r in raw]
-    return [(r.decode() if isinstance(r, bytes) else str(r)).strip('\x00')
-            for r in raw]
-
-
 def frontal_ablation_components(model):
-    """``(calving, submarine melt)`` of a finished run, m3, from its model object.
-
-    The counterpart of reading the two variables back out of the diagnostics file,
-    for when the model is still in hand.
-    """
+    """``(calving, submarine melt)`` of a finished run, m3, from its model."""
     law = getattr(model, 'calving_law', None)
     if not hasattr(law, 'components_m3'):
-        # the stock law, or any callable that is not one of ours: all of it is
-        # frontal ablation and none of it is attributable to melt
+        # the stock law, or any other callable: nothing attributable to melt
         return float(getattr(model, 'calving_m3_since_y0', 0.)), 0.
     return law.components_m3(model)
 
 
 def write_frontal_components(gdir, law, model=None, output_filesuffix=''):
-    """Write the melt/calving split of a finished run to its own file on disk.
+    """Write the melt/calving split of a finished run to its own file.
 
-    Goes to ``frontal_ablation_diagnostics{output_filesuffix}.nc`` on the time axis of
-    the run's ``model_diagnostics`` file, which is left untouched: ``calving_m3`` there
-    stays the authority, and the two series here are a share of it, so they sum to
-    it at every step rather than to a second, slightly different total.
+    The two series are a share of the ``calving_m3`` of the run's
+    ``model_diagnostics`` file, which is left untouched, so they sum to it at
+    every step.
+
+    Parameters
+    ----------
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory to process
+    law : the calving law the run used
+    model : the flowline model of the run, optional
+        closes the last open step of the split
+    output_filesuffix : str
+        the filesuffix of the run
+
+    Returns
+    -------
+    (calving, submarine melt) : the totals of the run, m3
     """
-    import xarray as xr
-
     calving, melt = law.components_m3(model)
     total = calving + melt
     frac = float(melt / total) if total > 0 else 0.
@@ -496,8 +612,8 @@ def write_frontal_components(gdir, law, model=None, output_filesuffix=''):
     if len(yrs) == 0:
         f_t = np.full(cum.shape, frac)
     else:
-        f = np.where(cum_total > 0, cum_melt / np.where(cum_total > 0, cum_total, 1.),
-                     0.)
+        f = np.where(cum_total > 0,
+                     cum_melt / np.where(cum_total > 0, cum_total, 1.), 0.)
         f_t = np.interp(ds['time'].values.astype(float), yrs, f,
                         left=f[0], right=f[-1])
 
@@ -505,14 +621,17 @@ def write_frontal_components(gdir, law, model=None, output_filesuffix=''):
     out['calving_m3'] = ds['calving_m3']
     out['submarine_melt_m3'] = ('time', cum * f_t)
     out['submarine_melt_m3'].attrs = {
-        'description': 'Accumulated submarine melt part of the frontal ablation',
+        'description': 'Accumulated submarine melt part of the frontal '
+                       'ablation',
         'unit': 'm 3'}
     out['calving_only_m3'] = ('time', cum * (1 - f_t))
     out['calving_only_m3'].attrs = {
-        'description': 'Accumulated iceberg calving part of the frontal ablation',
+        'description': 'Accumulated iceberg calving part of the frontal '
+                       'ablation',
         'unit': 'm 3'}
     out.attrs.update({'rgi_id': gdir.rgi_id,
-                      'cenlon': float(gdir.cenlon), 'cenlat': float(gdir.cenlat),
+                      'cenlon': float(gdir.cenlon),
+                      'cenlat': float(gdir.cenlat),
                       'calving_law': law.name,
                       'submarine_melt_fraction': frac,
                       'partition': 'modelled, not observed'})
@@ -521,15 +640,28 @@ def write_frontal_components(gdir, law, model=None, output_filesuffix=''):
     return calving, melt
 
 
+@global_task(log)
 def compile_frontal_components(gdirs, input_filesuffix='', path=True):
-    """Stack the per-glacier split into one ``(time, rgi_id)`` file, map-ready.
+    """Compile the frontal ablation split of several glaciers into one file.
 
-    The counterpart of :func:`oggm.utils.compile_run_output` for the two variables
-    that function refuses. Carries each glacier's lon/lat so the result can be
-    mapped without the glacier directories.
+    The counterpart of :func:`oggm.utils.compile_run_output` for the
+    ``frontal_ablation_diagnostics`` files.
+
+    Parameters
+    ----------
+    gdirs : list of :py:class:`oggm.GlacierDirectory` objects
+        the glacier directories to process
+    input_filesuffix : str
+        the filesuffix of the runs
+    path : str or bool
+        where to store the file (default is on the working dir). Set to
+        `False` to disable disk storage.
+
+    Returns
+    -------
+    ds : :py:class:`xarray.Dataset`
+        with dimensions (time, rgi_id), or None when no glacier has the file
     """
-    import xarray as xr
-
     dss = []
     for gdir in gdirs:
         fp = gdir.get_filepath('frontal_ablation_diagnostics',
@@ -551,33 +683,61 @@ def compile_frontal_components(gdirs, input_filesuffix='', path=True):
     out.attrs['partition'] = 'modelled, not observed'
     if path:
         if path is True:
-            path = os.path.join(cfg.PATHS['working_dir'],
-                                f'frontal_ablation_compiled{input_filesuffix}.nc')
+            path = os.path.join(
+                cfg.PATHS['working_dir'],
+                f'frontal_ablation_compiled{input_filesuffix}.nc')
         out.to_netcdf(path)
     return out
 
 
-@entity_task(log)
-def run_with_ocean_forcing(gdir, calving_law=None, band=None, ocean_filesuffix='',
-                           tf_ref=None, law_kwargs=None,
+@entity_task(log, writes=['frontal_ablation_diagnostics'])
+def run_with_ocean_forcing(gdir, calving_law=None, band=None,
+                           ocean_filesuffix='', tf_ref=None, law_kwargs=None,
                            climate_filename='gcm_data',
                            climate_input_filesuffix='',
                            output_filesuffix='', **kwargs):
-    """Run the dynamical model with an ocean-forced calving law.
+    """Run the flowline model with an ocean-forced calving law.
 
-    The law is built inside the worker, so no forcing array crosses the
-    multiprocessing pickle boundary.
+    A wrapper around :func:`oggm.core.flowline.run_from_climate_data`, which
+    also writes the calving and submarine melt parts of the frontal ablation
+    (see :func:`write_frontal_components`).
 
     Parameters
     ----------
-    calving_law : str
-        one of 'constant', 'tf_power', 'melt_calving', 'sea_ice'.
-    band : str
-        which depth band of the ocean file the law reads.
-    law_kwargs : dict
-        passed to the law's constructor (k0, gamma, lam, delta, ...).
+    gdir : :py:class:`oggm.GlacierDirectory`
+        the glacier directory to process
+    calving_law : str, optional
+        'constant', 'tf_power', 'melt_calving' or 'sea_ice'. Default:
+        ``gdir.settings['calving_law']``.
+    band : str, optional
+        the depth band of the ocean file the law reads. Default:
+        ``gdir.settings['ocean_tf_band']``.
+    ocean_filesuffix : str
+        the filesuffix of the ``ocean_data`` file
+    tf_ref : float, optional
+        the reference thermal forcing of 'tf_power' (see
+        :func:`ocean_calving_law`)
+    law_kwargs : dict, optional
+        passed to :func:`ocean_calving_law` (``partition``, ``k0``, ``gamma``,
+        ``lam``, ``delta`` ...)
+    climate_filename : str
+        name of the climate file, e.g. 'climate_historical' or 'gcm_data'
+    climate_input_filesuffix : str
+        filesuffix of the climate file
+    output_filesuffix : str
+        filesuffix of the output files
+    **kwargs
+        passed to :func:`oggm.core.flowline.run_from_climate_data`
+
+    Returns
+    -------
+    the flowline model, as returned by ``run_from_climate_data``
     """
     from oggm.core.flowline import run_from_climate_data
+
+    # A law that cannot be built must not leave an earlier run's files behind
+    for name in ('model_diagnostics', 'frontal_ablation_diagnostics'):
+        gdir.get_filepath(name, filesuffix=output_filesuffix, delete=True)
 
     law = ocean_calving_law(gdir, calving_law=calving_law, band=band,
                             ocean_filesuffix=ocean_filesuffix, tf_ref=tf_ref,
@@ -586,10 +746,10 @@ def run_with_ocean_forcing(gdir, calving_law=None, band=None, ocean_filesuffix='
     if band:
         gdir.add_to_diagnostics('ocean_calving_band', band)
 
-    model = run_from_climate_data(gdir, calving_law=law,
-                                  climate_filename=climate_filename,
-                                  climate_input_filesuffix=climate_input_filesuffix,
-                                  output_filesuffix=output_filesuffix, **kwargs)
+    model = run_from_climate_data(
+        gdir, calving_law=law, climate_filename=climate_filename,
+        climate_input_filesuffix=climate_input_filesuffix,
+        output_filesuffix=output_filesuffix, **kwargs)
     write_frontal_components(gdir, law, model=model,
                              output_filesuffix=output_filesuffix)
     return model

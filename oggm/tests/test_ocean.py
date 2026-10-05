@@ -1,9 +1,7 @@
-"""Tests for the ocean-forced frontal ablation extension.
+"""Tests for the ocean-forced frontal ablation.
 
-The two that matter most are the ones that make the four laws a nested family with
-the stock model at its root: `test_tf_power_reduces_to_stock_law` and
-`test_delta_zero_recovers_melt_calving`. Every comparison the paper makes is then a
-comparison inside one model rather than between four.
+`test_tf_power_reduces_to_stock_law` and `test_delta_zero_recovers_melt_calving` are
+the ones that make the four laws a nested family with the stock law at its root.
 """
 import os
 import pickle
@@ -23,17 +21,19 @@ from oggm.core.bedmachine_flowline import (_purge_lazy, bed_extension_statistics
                                            sample_gridded_on_line)
 from oggm.core.flowline import init_present_time_glacier, k_calving_law
 from oggm.core.ocean_calving import (ConstantK, MeltPlusCalving, SeaIceModulated,
-                                     TFPower, frontal_ablation_components,
+                                     TFPower, band_names,
+                                     frontal_ablation_components,
+                                     ocean_calving_law, tf_power_mean,
                                      write_frontal_components)
 from oggm.core.ocean_inversion import (partition_calving_constant,
                                        terminus_water_depth_from_bed)
-from oggm.core.ocean_params import DEFAULTS, init_ocean_params, ocean_param
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 from oggm.shop.bedmachine_bed import (BEDMACHINE_URLS, BEDMACHINE_VARS,
                                       DEFAULT_VERSION, bedmachine_bed_to_gdir,
                                       bedmachine_file)
 from oggm.shop.ocean import (LAMBDA1, LAMBDA2, LAMBDA3, freezing_point,
-                             open_water_fraction, thermal_forcing_bands)
+                             open_water_fraction, parse_depth_bands,
+                             thermal_forcing_bands)
 
 pytestmark = pytest.mark.test_env("models_dynamics")
 
@@ -57,7 +57,6 @@ class FakeModel:
 @pytest.fixture(autouse=True)
 def ocean_params():
     cfg.initialize_minimal()
-    init_ocean_params(reset=True)
     yield
 
 
@@ -95,7 +94,7 @@ def test_terminus_band_follows_bathymetry():
     t = np.full((12, len(z)), 1.5)
     s = np.full_like(t, 34.8)
     names, tops, bots, _, tf, _, _ = thermal_forcing_bands(
-        t, s, z, DEFAULTS['ocean_depth_bands'], DEFAULTS['ocean_band_weighting'],
+        t, s, z, *parse_depth_bands(cfg.PARAMS['ocean_depth_bands']),
         terminus_depth=60.)
     assert names[0] == 'terminus'
     assert bots[0] == 60.
@@ -108,8 +107,7 @@ def test_empty_band_raises():
     t = np.full((12, len(z)), 1.5)
     with pytest.raises(InvalidWorkflowError, match='no ocean levels'):
         thermal_forcing_bands(t, np.full_like(t, 34.8), z,
-                              DEFAULTS['ocean_depth_bands'],
-                              DEFAULTS['ocean_band_weighting'])
+                              *parse_depth_bands(cfg.PARAMS['ocean_depth_bands']))
 
 
 def test_band_weighting_differs():
@@ -201,8 +199,8 @@ def test_melt_calving_reduces_to_rignot_b_limit(state, years):
     """With no subglacial discharge the melt term is exactly B * TF**beta."""
     model, fl, i = state
     tf = 1.8
-    law = MeltPlusCalving(years, np.full_like(years, tf), tf_ref=1.5, k_c=0.6)
-    expected = (ocean_param('calving_melt_B') * tf ** ocean_param('calving_melt_beta')
+    law = MeltPlusCalving(years, np.full_like(years, tf), k_c=0.6)
+    expected = (cfg.PARAMS['calving_melt_B'] * tf ** cfg.PARAMS['calving_melt_beta']
                 / 86400.)
     assert law.melt_rate(100., 1000., 2005.) == pytest.approx(expected)
 
@@ -210,7 +208,7 @@ def test_melt_calving_reduces_to_rignot_b_limit(state, years):
 def test_melt_calving_adds_to_the_control(state, years):
     """Law (iii) with k_c = k is the control plus a strictly positive melt term."""
     model, fl, i = state
-    law = MeltPlusCalving(years, np.full_like(years, 1.5), tf_ref=1.5, k_c=0.6)
+    law = MeltPlusCalving(years, np.full_like(years, 1.5), k_c=0.6)
     assert law(model, fl, i) > k_calving_law(model, fl, i)
 
 
@@ -219,14 +217,14 @@ def test_delta_zero_recovers_melt_calving(state, years):
     model, fl, i = state
     tf = np.full_like(years, 1.8)
     ow = np.linspace(0.1, 0.9, len(years))
-    a = MeltPlusCalving(years, tf, open_water=ow, tf_ref=1.5, k_c=0.6)
-    b = SeaIceModulated(years, tf, open_water=ow, tf_ref=1.5, k_ice=0.6, delta=0.)
+    a = MeltPlusCalving(years, tf, open_water=ow, k_c=0.6)
+    b = SeaIceModulated(years, tf, open_water=ow, k_ice=0.6, delta=0.)
     assert b(model, fl, i) == pytest.approx(a(model, fl, i), rel=1e-12)
 
 
 def test_sea_ice_needs_open_water(state, years):
     model, fl, i = state
-    law = SeaIceModulated(years, np.full_like(years, 1.8), tf_ref=1.5, k_ice=0.6)
+    law = SeaIceModulated(years, np.full_like(years, 1.8), k_ice=0.6)
     with pytest.raises(InvalidWorkflowError, match='open_water'):
         law(model, fl, i)
 
@@ -237,7 +235,7 @@ def test_sea_ice_can_fall_while_tf_rises(state, years):
     model, fl, i = state
     tf = np.linspace(1.0, 2.0, len(years))
     ow = np.linspace(0.9, 0.1, len(years))
-    law = SeaIceModulated(years, tf, open_water=ow, tf_ref=1.5, k_ice=0., delta=2.)
+    law = SeaIceModulated(years, tf, open_water=ow, k_ice=0., delta=2.)
     early = law(FakeModel(yr=2001.), fl, i)
     late = law(FakeModel(yr=2020.), fl, i)
     assert late < early
@@ -258,19 +256,23 @@ def test_laws_are_picklable(state, years):
     model, fl, i = state
     for law in (ConstantK(k=0.6),
                 TFPower(years, np.full_like(years, 1.5), tf_ref=1.5),
-                MeltPlusCalving(years, np.full_like(years, 1.5), tf_ref=1.5, k_c=0.6),
+                MeltPlusCalving(years, np.full_like(years, 1.5), k_c=0.6),
                 SeaIceModulated(years, np.full_like(years, 1.5),
                                 open_water=np.full_like(years, 0.5),
-                                tf_ref=1.5, k_ice=0.6)):
+                                k_ice=0.6)):
         again = pickle.loads(pickle.dumps(law))
         assert again(model, fl, i) == law(model, fl, i)
 
 
-def test_ocean_param_falls_back_to_defaults():
-    del cfg.PARAMS['calving_tf_exponent']
-    assert ocean_param('calving_tf_exponent') == DEFAULTS['calving_tf_exponent']
+def test_depth_bands_are_parsed_from_the_parameter_file():
+    bands, weighting = parse_depth_bands(cfg.PARAMS['ocean_depth_bands'])
+    assert bands == [('terminus', 0., 100.), ('ismip6', 200., 500.),
+                     ('moller', 0., 700.)]
+    assert weighting == {'terminus': 'uniform', 'ismip6': 'uniform',
+                         'moller': 'depth_weighted'}
+    assert parse_depth_bands(['a:0:50']) == ([('a', 0., 50.)], {'a': 'uniform'})
     with pytest.raises(InvalidParamsError):
-        ocean_param('not_an_ocean_param')
+        parse_depth_bands(['a:0'])
 
 
 # --- the file round trip -------------------------------------------------------
@@ -284,7 +286,7 @@ class FakeGdir:
 
     def __init__(self, path):
         self.dir = path
-        self.settings = {'task_timeout': 0}
+        self.settings = dict(cfg.PARAMS, task_timeout=0)
 
     def get_filepath(self, name, filesuffix='', delete=False):
         fp = self.dir / (cfg.BASENAMES[name][0].replace('.nc', f'{filesuffix}.nc'))
@@ -343,9 +345,8 @@ def test_ocean_file_round_trip(ocean_file):
         assert ds.attrs['tf_method'] == 'linear_lambda_jenkins2011'
         assert str(ds['time'].values[0])[:7] == '2000-01'
 
-    from oggm.core.ocean_calving import _band_names
     with xr.open_dataset(ocean_file.get_filepath('ocean_data')) as ds:
-        assert _band_names(ds) == ['terminus', 'ismip6', 'moller']
+        assert band_names(ds) == ['terminus', 'ismip6', 'moller']
 
 
 def test_law_from_file_reads_the_named_band(ocean_file, state):
@@ -449,7 +450,7 @@ def test_warming_ocean_calves_more():
 
 def _destine_file(path, y0=1990, y1=1994, lon=343.0, months=None, bands=None,
                   nan_below=None, siconc_len=None):
-    """A DestinE per-site extraction as extract_ocean_footprint.py writes it."""
+    """One monthly water column, as `process_destine_ocean_data` reads it."""
     import pandas as pd
 
     time = months if months is not None else pd.date_range(
@@ -583,7 +584,7 @@ def test_destine_reader_needs_a_path(tmp_path):
 
 # --- the bed under and beyond the calving front --------------------------------
 
-def _columbia(flowlines):
+def _columbia(flowlines, workdir):
     """A real tidewater gdir, inverted, with a synthetic BedMachine beside it.
 
     Columbia rather than a dummy flowline because the two numbers this part of the
@@ -593,25 +594,25 @@ def _columbia(flowlines):
     tidewater glacier to a 10 pixel border while extending its flowline by
     `calving_line_extension * dx` pixels, so the extension leaves the grid at once.
 
-    `flowlines` picks the geometry, and the two kinds live in separate working
-    directories because they write the same files. `elev_bands` is what production
-    runs on. `centerlines` is the only kind that carries a real `fl.line`, which is
-    what `bedmachine_calving_extension` samples the gridded bed along.
+    `flowlines` picks the geometry: `centerlines` is the only kind that carries a
+    real `fl.line`, which `bedmachine_calving_extension` samples the bed along.
+    The directory is built once per kind and each test gets a copy in `workdir`,
+    because the tasks under test edit the directory.
     """
+    import shutil
+
     import geopandas as gpd
 
     import oggm
     from oggm import tasks
     from oggm.core import gis, centerlines
-    from oggm.core.ocean_params import init_ocean_params
     from oggm.tests.funcs import get_test_dir
     from oggm.utils import get_demo_file, mkdir
 
-    testdir = os.path.join(get_test_dir(), f'tmp_bedmachine_flowline_{flowlines}')
+    testdir = os.path.join(get_test_dir(), f'tmp_ocean_columbia_{flowlines}')
     mkdir(testdir)
 
     cfg.initialize()
-    init_ocean_params(reset=True)
     cfg.PATHS['working_dir'] = testdir
     cfg.PATHS['dem_file'] = get_demo_file('dem_Columbia.tif')
     cfg.PARAMS['use_intersects'] = False
@@ -650,24 +651,23 @@ def _columbia(flowlines):
     path = os.path.join(testdir, 'synthetic_bedmachine.nc')
     if not os.path.exists(path):
         write_synthetic_bedmachine(gdir, path)
-    return gdir, path
+
+    shutil.copytree(os.path.join(testdir, 'per_glacier'),
+                    os.path.join(workdir, 'per_glacier'))
+    cfg.PATHS['working_dir'] = str(workdir)
+    return oggm.GlacierDirectory(entity), path
 
 
 @pytest.fixture
-def columbia():
-    """Production geometry: elevation-band flowlines, which carry no `line`."""
-    return _columbia('elev_bands')
+def columbia(tmp_path):
+    """Elevation-band flowlines, which carry no `line`."""
+    return _columbia('elev_bands', tmp_path)
 
 
 @pytest.fixture
-def columbia_lines():
-    """Geometrical flowlines, the only kind `bedmachine_calving_extension` accepts.
-
-    Production does not hit that restriction: it runs on elevation bands and uses
-    `bedmachine_terminus_bed`, which reads the mask instead of a line. The guard
-    itself is pinned by `test_calving_extension_refuses_elevation_band_flowlines`.
-    """
-    return _columbia('centerlines')
+def columbia_lines(tmp_path):
+    """Geometrical flowlines, the only kind `bedmachine_calving_extension` accepts."""
+    return _columbia('centerlines', tmp_path)
 
 
 def synthetic_bed(x, y):
@@ -707,7 +707,7 @@ def write_synthetic_bedmachine(gdir, path, dx=150.):
 
 
 def test_greenland_v6_is_the_default():
-    """The stock shop module predates v6 (released 2025-12-11); this one does not."""
+    """BedMachine Greenland v6 was released on 2025-12-11."""
     assert DEFAULT_VERSION['05'] == '6'
     assert 'BedMachineGreenland-v6.nc' in BEDMACHINE_URLS[('05', '6')]
     assert 'BedMachineGreenland-v5.nc' in BEDMACHINE_URLS[('05', '5')]
@@ -869,12 +869,10 @@ def test_calving_extension_raises_outside_the_grid(columbia):
 
 
 def test_calving_extension_refuses_elevation_band_flowlines(columbia):
-    """The guard that sends production to `bedmachine_terminus_bed` instead.
+    """Elevation-band flowlines have no line to sample the bed along.
 
-    Elevation-band flowlines carry `line=None`, and `Flowline` then invents a
-    straight line along the first grid row. Sampling a gridded bed along that line
-    would return values from somewhere else on the grid, silently. The `columbia`
-    fixture builds exactly those flowlines, because that is what production runs on.
+    `Flowline` gives them a placeholder along the first grid row, and a bed sampled
+    along it would come from somewhere else on the grid.
     """
     gdir, path = columbia
     bedmachine_bed_to_gdir(gdir, local_file=path)
@@ -1029,11 +1027,9 @@ def test_a_deepening_extension_calves_more_than_a_measured_one():
 def test_calving_vs_bed_extension_compares_two_runs_of_one_glacier(columbia):
     """Two runs differing only in the bed at and beyond the front.
 
-    On the production geometry, elevation bands, and through the production task:
-    `bedmachine_terminus_bed` reads the mask rather than a line, so it is the one
-    the FIIC runs use. Columbia on centerlines blows the CFL limit on a tributary
-    (max_u of order 1e7 m yr-1 at fl_id 21), which is a property of the demo glacier
-    rather than of the bed code, so the comparison is made here where it is stable.
+    On elevation bands and through `bedmachine_terminus_bed`: Columbia on
+    centerlines exceeds the CFL limit on a tributary, a property of the demo
+    glacier and not of the bed code.
     """
     gdir, path = columbia
     bedmachine_bed_to_gdir(gdir, local_file=path)
@@ -1082,6 +1078,335 @@ def test_terminus_bed_moves_a_front_the_inversion_left_on_land(columbia):
     assert fl.thick[i0] == pytest.approx(surf[i0] + 200.)
 
 
+def test_terminus_bed_reports_what_it_changed(columbia):
+    gdir, path = columbia
+    bedmachine_bed_to_gdir(gdir, local_file=path)
+    init_present_time_glacier(gdir)
+    out = bedmachine_terminus_bed(gdir, water_depth=150.)
+    d = out[list(out)[-1]]
+    fl = gdir.read_pickle('model_flowlines')[-1]
+    np.testing.assert_allclose(d['volume_after_m3'],
+                               np.sum(fl.section) * fl.dx_meter)
+    np.testing.assert_allclose(
+        d['area_after_m2'], np.sum(fl.widths_m[fl.thick > 0]) * fl.dx_meter)
+    assert d['n_emptied'] == int(np.sum(fl.thick[:d['terminus_index'] + 1] == 0))
+    assert d['volume_before_m3'] > 0 and d['area_before_m2'] > 0
+
+
+# --- the inversion side ----------------------------------------------------------
+
+def _write_ocean(gdir, filesuffix=''):
+    """An ocean file on a real directory, 1990-2012, warming in every band."""
+    import pandas as pd
+    from oggm.shop.ocean import _write_ocean_file
+
+    time = pd.date_range('1990-01-01', '2012-12-01', freq='MS')
+    n = len(time)
+    tf = np.stack([np.linspace(0.2, 0.6, n), np.linspace(1.0, 2.0, n),
+                   np.linspace(0.5, 1.2, n)], axis=1)
+    _write_ocean_file(gdir, time.values, ['terminus', 'ismip6', 'moller'],
+                      [0., 200., 0.], [60., 500., 700.],
+                      ['uniform', 'uniform', 'depth_weighted'],
+                      tf, tf + 1.0, np.full_like(tf, 34.8),
+                      siconc=np.linspace(0.9, 0.2, n),
+                      open_water=open_water_fraction(np.linspace(0.9, 0.2, n)),
+                      lon=gdir.cenlon, lat=gdir.cenlat, filesuffix=filesuffix)
+    return tf
+
+
+def test_tf_power_mean_is_where_the_law_averages_to_one():
+    tf = np.array([-0.5, 0.5, 1., 2., 4., np.nan])
+    for gamma in (0.5, 1., 1.18, 2.):
+        ref = tf_power_mean(tf, gamma)
+        ok = np.isfinite(tf)
+        scaling = (np.clip(tf[ok], 0, None) / ref) ** gamma
+        np.testing.assert_allclose(scaling.mean(), 1.)
+    np.testing.assert_allclose(tf_power_mean(tf, 1.), 7.5 / 5)
+    assert np.isnan(tf_power_mean([np.nan], 1.18))
+
+
+def test_tf_power_takes_its_own_reference_by_default(ocean_file, state):
+    """Without a tf_ref the law returns k on average over the reference period."""
+    gdir = ocean_file
+    gdir.settings['ocean_tf_ref_period'] = [2000, 2010]
+    law = ocean_calving_law(gdir, 'tf_power', band='ismip6')
+    sel = (law.years >= 2000) & (law.years < 2011)
+    np.testing.assert_allclose(law.tf_ref, tf_power_mean(law.tf[sel], law.gamma))
+    np.testing.assert_allclose(
+        np.mean((law.tf[sel] / law.tf_ref) ** law.gamma), 1.)
+
+    # the parameter, then the argument, take precedence
+    gdir.settings['ocean_tf_ref'] = 1.2
+    assert ocean_calving_law(gdir, 'tf_power', band='ismip6').tf_ref == 1.2
+    assert ocean_calving_law(gdir, 'tf_power', band='ismip6',
+                             tf_ref=1.5).tf_ref == 1.5
+
+    # a record outside the reference period has no reference
+    gdir.settings['ocean_tf_ref'] = None
+    gdir.settings['ocean_tf_ref_period'] = [1950, 1960]
+    with pytest.raises(InvalidWorkflowError, match='does not cover'):
+        ocean_calving_law(gdir, 'tf_power', band='ismip6')
+    with pytest.raises(InvalidParamsError):
+        TFPower(law.years, law.tf)
+
+
+def test_law_parameters_come_from_the_glacier_settings(ocean_file):
+    gdir = ocean_file
+    gdir.settings['calving_tf_exponent'] = 2.
+    gdir.settings['calving_melt_beta'] = 1.61
+    gdir.settings['calving_openwater_exponent'] = 0.5
+    assert ocean_calving_law(gdir, 'tf_power', band='ismip6',
+                             tf_ref=1.).gamma == 2.
+    law = ocean_calving_law(gdir, 'sea_ice', band='ismip6', tf_ref=1.)
+    assert (law.beta, law.delta) == (1.61, 0.5)
+    assert law.B == cfg.PARAMS['calving_melt_B']
+    # an explicit argument wins
+    assert ocean_calving_law(gdir, 'tf_power', band='ismip6', tf_ref=1.,
+                             gamma=1.).gamma == 1.
+
+
+def test_a_law_that_cannot_be_built_leaves_no_earlier_output(columbia):
+    from oggm.core.ocean_calving import run_with_ocean_forcing
+
+    gdir, _ = columbia
+    for name in ('model_diagnostics', 'frontal_ablation_diagnostics'):
+        with open(gdir.get_filepath(name, filesuffix='_x'), 'w') as f:
+            f.write('stale')
+    with pytest.raises(InvalidWorkflowError, match='no ocean_data'):
+        run_with_ocean_forcing(gdir, calving_law='tf_power',
+                               output_filesuffix='_x')
+    assert not gdir.has_file('model_diagnostics', filesuffix='_x')
+    assert not gdir.has_file('frontal_ablation_diagnostics', filesuffix='_x')
+
+
+def test_inversion_k_scales_with_the_period_mean_forcing(columbia):
+    from oggm.core.ocean_inversion import (ocean_tf_mean,
+                                           set_inversion_k_from_ocean)
+
+    gdir, _ = columbia
+    tf = _write_ocean(gdir)
+    mean = ocean_tf_mean(gdir, band='ismip6', period=(2000, 2010))
+    np.testing.assert_allclose(mean, tf[120:252, 1].mean(), rtol=1e-6)
+    np.testing.assert_allclose(
+        ocean_tf_mean(gdir, band='ismip6', period=(2000, 2010), gamma=1.18),
+        tf_power_mean(tf[120:252, 1], 1.18), rtol=1e-6)
+
+    k = set_inversion_k_from_ocean(gdir, k_ref=0.6, band='ismip6',
+                                   period=(2000, 2010), tf_ref=1.)
+    np.testing.assert_allclose(k, 0.6 * mean ** 1.18)
+    assert gdir.settings['inversion_calving_k'] == k
+    # the period mean is its own reference: k is left as it is
+    k = set_inversion_k_from_ocean(gdir, k_ref=0.6, band='ismip6',
+                                   period=(2000, 2010))
+    np.testing.assert_allclose(k, 0.6)
+    with pytest.raises(InvalidParamsError):
+        set_inversion_k_from_ocean(gdir, band='ismip6', tf_ref=0.)
+
+
+def test_bathymetry_inversion_prescribes_the_depth(columbia):
+    from oggm import workflow
+    from oggm.core.ocean_inversion import (calving_law_flux, fit_calving_k,
+                                           find_inversion_calving_from_bathymetry,
+                                           flotation_thickness,
+                                           front_thickness)
+
+    gdir, _ = columbia
+    with pytest.raises(InvalidWorkflowError, match='no terminus_water_depth'):
+        find_inversion_calving_from_bathymetry(gdir)
+
+    gdir.settings['terminus_water_depth'] = 150.
+    fl = gdir.read_pickle('inversion_flowlines')[-1]
+    free_board = max(float(fl.surface_h[-1]), 0.)
+    assert front_thickness(gdir, 150.) == free_board + 150.
+    np.testing.assert_allclose(flotation_thickness(150.), 150. * 1028 / 900)
+
+    # the constant that reproduces an observation, and the flux it gives
+    k, per = fit_calving_k([gdir], {gdir.rgi_id: 1.5})
+    assert per == {gdir.rgi_id: k}
+    gdir.settings['inversion_calving_k'] = k
+    law = calving_law_flux(gdir)
+    np.testing.assert_allclose(law['flux'], 1.5)
+    np.testing.assert_allclose(
+        law['flux'], k * (free_board + 150.) * 150. * law['width'] / 1e9)
+
+    out = find_inversion_calving_from_bathymetry(gdir)
+    assert out['calving_front_water_depth'] == 150.
+    assert out['calving_front_thick'] == free_board + 150.
+    np.testing.assert_allclose(out['calving_law_flux'], 1.5)
+    # the inverted flowline carries that flux through its last cell
+    np.testing.assert_allclose(out['calving_flux'], 1.5, rtol=1e-3)
+    assert out['volume_before_calving'] > 0
+    # settings and diagnostics say the same, unlike after the stock task alone
+    diag = gdir.get_diagnostics()
+    for key in ('calving_flux', 'calving_front_water_depth',
+                'calving_front_thick', 'calving_inversion_k'):
+        assert diag[key] == gdir.settings[key] == out[key]
+    assert diag['calving_depth_source'] == 'bathymetry'
+
+    # the workflow switch runs the same task
+    gdir.settings['calving_depth_source'] = 'unset'
+    cfg.PARAMS['inversion_calving_from_bathymetry'] = True
+    workflow.inversion_tasks([gdir])
+    assert gdir.settings['calving_depth_source'] == 'bathymetry'
+    np.testing.assert_allclose(gdir.settings['calving_law_flux'], 1.5)
+
+
+def test_glen_a_calibration_keeps_the_prescribed_depth(columbia):
+    """The stock Glen A fit inverts the marine glacier at the measured depth."""
+    from oggm import tasks, workflow
+
+    gdir, _ = columbia
+    gdir.settings['terminus_water_depth'] = 150.
+    cfg.PARAMS['inversion_calving_from_bathymetry'] = True
+    v0 = tasks.get_inversion_volume(gdir)
+    df = workflow.calibrate_inversion_from_ref_table(
+        [gdir], ref_volume_m3=0.8 * v0, filter_inversion_output=False)
+    assert df.attrs['glen_a_factor'] > 1
+    np.testing.assert_allclose(tasks.get_inversion_volume(gdir), 0.8 * v0,
+                               rtol=1e-2)
+    assert gdir.settings['calving_depth_source'] == 'bathymetry'
+    np.testing.assert_allclose(gdir.settings['calving_flux'],
+                               gdir.settings['calving_law_flux'], rtol=1e-3)
+
+
+def test_calving_k_model_is_the_geometric_mean_without_terms():
+    from oggm.core.ocean_inversion import (calving_k_from_model,
+                                           fit_calving_k_model)
+
+    rows = [dict(rgi_id=i, k=k, width=w)
+            for i, (k, w) in enumerate([(0.5, 100.), (2., 400.), (1., 200.),
+                                        (4., 800.)])]
+    model = fit_calving_k_model([], {}, covariates=rows)
+    np.testing.assert_allclose(calving_k_from_model(model, {}),
+                               np.exp(np.mean(np.log([0.5, 2., 1., 4.]))))
+    # k = width / 200 here, which one log term recovers exactly
+    model = fit_calving_k_model([], {}, terms=('width',), covariates=rows)
+    np.testing.assert_allclose(calving_k_from_model(model, {'width': 1000.}), 5.)
+    np.testing.assert_allclose(model['residual'], 0., atol=1e-10)
+    with pytest.raises(InvalidWorkflowError):
+        fit_calving_k_model([], {}, terms=('width',), covariates=rows[:2])
+
+
+def test_partition_keeps_the_calibrated_total(columbia):
+    from oggm.core.ocean_inversion import find_inversion_calving_from_bathymetry
+
+    gdir, _ = columbia
+    _write_ocean(gdir)
+    gdir.settings['terminus_water_depth'] = 150.
+    find_inversion_calving_from_bathymetry(gdir)
+    gdir.settings['ocean_tf_ref_period'] = [2000, 2010]
+    with pytest.raises(InvalidWorkflowError):
+        ocean_calving_law(gdir, 'melt_calving', band='terminus', partition=True,
+                          lam=1e-4, ocean_filesuffix='_none')
+
+    law = ocean_calving_law(gdir, 'melt_calving', band='terminus',
+                            partition=True)
+    k, h = gdir.settings['calving_k'], gdir.settings['calving_front_thick']
+    w = gdir.settings['calving_front_width']
+    sel = (law.years >= 2000) & (law.years < 2011)
+    mdot = np.mean([law.melt_rate(150., w, y) for y in law.years[sel]])
+    assert 0 < law.k_c < k
+    np.testing.assert_allclose(
+        law.k_c / cfg.SEC_IN_YEAR * h + law.lam * mdot,
+        k / cfg.SEC_IN_YEAR * h)
+    np.testing.assert_allclose(
+        gdir.get_diagnostics()['calving_k_residual'], law.k_c)
+
+
+def test_subglacial_discharge_follows_the_melt_season(columbia):
+    from oggm.core.ocean_inversion import (subglacial_discharge_from_mb,
+                                           write_subglacial_discharge)
+
+    gdir, _ = columbia
+    yrs, q = subglacial_discharge_from_mb(gdir, period=(1995, 2004))
+    assert len(yrs) == len(q) == 120
+    assert np.all(q >= 0)
+    q = q.reshape(10, 12).mean(axis=0)
+    assert q[5:8].mean() > 10 * q[[0, 1, 11]].mean()
+    assert subglacial_discharge_from_mb(gdir, period=(2100, 2110)) == (None, None)
+
+    _write_ocean(gdir)
+    mean = write_subglacial_discharge(gdir, period=(1990, 2012))
+    with xr.open_dataset(gdir.get_filepath('ocean_data')) as ds:
+        np.testing.assert_allclose(np.nanmean(ds['subglacial_discharge']), mean,
+                                   rtol=1e-5)
+        assert ds['subglacial_discharge'].attrs['units'] == 'm3 s-1'
+
+
+# --- calving in the calibration, the spinup and the hydro output -------------------
+
+def test_geodetic_calibration_adds_the_frontal_flux(columbia):
+    """The surface balance is fitted to the observation plus the frontal ablation."""
+    from oggm import tasks
+    from oggm.core.massbalance import MultipleFlowlineMassBalance, calving_mb
+
+    gdir, _ = columbia
+    ref_mb, melt_f = gdir.settings['reference_mb'], gdir.settings['melt_f']
+    assert gdir.settings['calving_mb'] == 0
+
+    gdir.inversion_calving_rate = 0.1  # km3 yr-1
+    cmb = calving_mb(gdir)
+    assert cmb > 0
+    tasks.mb_calibration_from_geodetic_mb(gdir, overwrite_gdir=True)
+    # the observation is what is stored, the frontal term beside it
+    np.testing.assert_allclose(gdir.settings['reference_mb'], ref_mb)
+    np.testing.assert_allclose(gdir.settings['calving_mb'], cmb)
+    assert gdir.settings['melt_f'] < melt_f
+
+    y0, y1 = (int(d[:4]) for d in gdir.settings['reference_period'].split('_'))
+    mbmod = MultipleFlowlineMassBalance(gdir, use_inversion_flowlines=True)
+    smb = mbmod.get_specific_mb(
+        fls=gdir.read_pickle('inversion_flowlines'),
+        year=np.arange(y0, y1)).mean()
+    np.testing.assert_allclose(smb, ref_mb + cmb, rtol=1e-3)
+
+
+def test_dynamic_spinup_hands_the_terminus_type_to_the_model(columbia):
+    """Without it the evolution model runs the spinup with calving off."""
+    from oggm.core.dynamic_spinup import run_dynamic_spinup
+    from oggm.core.flowline import SemiImplicitModel
+
+    gdir, _ = columbia
+    init_present_time_glacier(gdir)
+    seen = {}
+
+    class Spy(SemiImplicitModel):
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError('seen')
+
+    with pytest.raises(RuntimeError, match='seen'):
+        run_dynamic_spinup(gdir, evolution_model=Spy, allow_calving=True,
+                           spinup_start_yr=1979, ye=2010)
+    assert seen['is_tidewater'] is True
+    assert seen['is_lake_terminating'] is False
+    assert seen['water_level'] == gdir.settings['calving_water_level']
+
+
+@pytest.mark.slow
+def test_hydro_output_keeps_the_frontal_ablation_out_of_the_surface(columbia):
+    from oggm import tasks
+
+    gdir, _ = columbia
+    cfg.PARAMS['store_model_geometry'] = True
+    cfg.PARAMS['store_diagnostic_variables'] = (
+        list(cfg.PARAMS['store_diagnostic_variables']) + ['model_mb'])
+    init_present_time_glacier(gdir)
+    tasks.run_with_hydro(gdir, run_task=tasks.run_from_climate_data,
+                         ys=1980, ye=2010, output_filesuffix='_hydro')
+    with xr.open_dataset(gdir.get_filepath('model_diagnostics',
+                                           filesuffix='_hydro')) as ds:
+        ds = ds.load()
+    rho = gdir.settings['ice_density']
+    calving_kg = (ds.calving_m3[-1] - ds.calving_m3[0]).item() * rho
+    assert calving_kg > 0
+    dmass = (ds.volume_m3[-1] - ds.volume_m3[0]).item() * rho
+    # what the surface terms are closed against is the mass change plus what
+    # left through the front
+    np.testing.assert_allclose(ds.model_mb[:-1].sum().item(), dmass + calving_kg,
+                               rtol=1e-6)
+
+
 # --- the melt/calving split ----------------------------------------------------
 #
 # The model adds the two summands and keeps one number, so the laws keep their own
@@ -1094,8 +1419,8 @@ def _laws(years):
     ow = np.full_like(years, 0.5)
     return [ConstantK(k=0.6),
             TFPower(years, tf, tf_ref=1.5, k0=0.6),
-            MeltPlusCalving(years, tf, tf_ref=1.5, k_c=0.6),
-            SeaIceModulated(years, tf, open_water=ow, tf_ref=1.5, k_ice=0.6)]
+            MeltPlusCalving(years, tf, k_c=0.6),
+            SeaIceModulated(years, tf, open_water=ow, k_ice=0.6)]
 
 
 def test_components_sum_to_the_flux(state, years):
@@ -1127,8 +1452,8 @@ def test_delta_zero_recovers_the_split_not_only_the_total(state, years):
     model, fl, i = state
     tf = np.full_like(years, 1.8)
     ow = np.linspace(0.1, 0.9, len(years))
-    a = MeltPlusCalving(years, tf, open_water=ow, tf_ref=1.5, k_c=0.6)
-    b = SeaIceModulated(years, tf, open_water=ow, tf_ref=1.5, k_ice=0.6, delta=0.)
+    a = MeltPlusCalving(years, tf, open_water=ow, k_c=0.6)
+    b = SeaIceModulated(years, tf, open_water=ow, k_ice=0.6, delta=0.)
     h, w = fl.thick[i], fl.widths_m[i]
     d = h - (fl.surface_h[i] - model.water_level)
     assert (b.frontal_speed_components(h, d, w, 2005.) ==
@@ -1143,9 +1468,9 @@ def test_the_sea_ice_gate_moves_the_split(state, years):
     h, w = fl.thick[i], fl.widths_m[i]
     d = h - (fl.surface_h[i] - model.water_level)
     open_sea = SeaIceModulated(years, tf, open_water=np.full_like(years, 0.9),
-                               tf_ref=1.5, k_ice=0.6, delta=2.)
+                               k_ice=0.6, delta=2.)
     icy = SeaIceModulated(years, tf, open_water=np.full_like(years, 0.1),
-                          tf_ref=1.5, k_ice=0.6, delta=2.)
+                          k_ice=0.6, delta=2.)
     c_open, m_open = open_sea.frontal_speed_components(h, d, w, 2005.)
     c_icy, m_icy = icy.frontal_speed_components(h, d, w, 2005.)
     assert m_icy < m_open
@@ -1155,14 +1480,14 @@ def test_the_sea_ice_gate_moves_the_split(state, years):
 def test_a_bare_call_does_not_accumulate(state, years):
     """A law called without a model clock is an inspection, not a run."""
     model, fl, i = state
-    law = MeltPlusCalving(years, np.full_like(years, 1.8), tf_ref=1.5, k_c=0.6)
+    law = MeltPlusCalving(years, np.full_like(years, 1.8), k_c=0.6)
     law(model, fl, i)
     assert law.frontal_ablation_m3 == 0.
     assert law.components_m3() == (0., 0.)
 
 
 def test_accounting_survives_pickle(state, years):
-    law = MeltPlusCalving(years, np.full_like(years, 1.8), tf_ref=1.5, k_c=0.6)
+    law = MeltPlusCalving(years, np.full_like(years, 1.8), k_c=0.6)
     law.frontal_ablation_m3, law.submarine_melt_m3 = 10., 3.
     again = pickle.loads(pickle.dumps(law))
     assert again.components_m3() == (7., 3.)
@@ -1192,7 +1517,7 @@ def test_the_split_sums_to_calving_m3_in_a_run():
     """The two components must close against the model's own counter, including the
     step that was still open when the run stopped."""
     yrs = np.arange(0, 2501, 1.)
-    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), tf_ref=1.5, k_c=0.2)
+    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), k_c=0.2)
     model, ds = _marine_model(calving_law=law)
     calving, melt = frontal_ablation_components(model)
     assert melt > 0
@@ -1212,7 +1537,7 @@ def test_the_control_reports_no_melt_in_a_run():
 @pytest.mark.slow
 def test_the_split_series_is_monotone_and_closes_at_every_step():
     yrs = np.arange(0, 2501, 1.)
-    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), tf_ref=1.5, k_c=0.2)
+    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), k_c=0.2)
     model, ds = _marine_model(calving_law=law)
     t, cum_total, cum_melt = law.component_series(model)
     assert len(t) > 100
@@ -1228,7 +1553,7 @@ def test_write_frontal_components_writes_a_mappable_sidecar(tmp_path):
     from oggm.core.ocean_calving import compile_frontal_components
 
     yrs = np.arange(0, 2501, 1.)
-    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), tf_ref=1.5, k_c=0.2)
+    law = MeltPlusCalving(yrs, np.full_like(yrs, 1.8), k_c=0.2)
     model, ds = _marine_model(calving_law=law)
 
     gdir = FakeGdir(tmp_path)
@@ -1255,7 +1580,7 @@ def test_write_frontal_components_writes_a_mappable_sidecar(tmp_path):
 def test_write_frontal_components_without_a_file(tmp_path, state, years):
     """No diagnostics file is a missing output, not an error: the totals still go to
     the glacier's own diagnostics."""
-    law = MeltPlusCalving(years, np.full_like(years, 1.8), tf_ref=1.5, k_c=0.6)
+    law = MeltPlusCalving(years, np.full_like(years, 1.8), k_c=0.6)
     assert write_frontal_components(FakeGdir(tmp_path), law) == (0., 0.)
 
 
@@ -1263,14 +1588,14 @@ def test_beta_is_a_law_parameter(state, years):
     """The low-discharge branch (beta = 1.61) has to be reachable per run, without
     touching the global parameters another glacier in the same worker reads."""
     tf = 1.8
-    law = MeltPlusCalving(years, np.full_like(years, tf), tf_ref=1.5, k_c=0.6,
+    law = MeltPlusCalving(years, np.full_like(years, tf), k_c=0.6,
                           beta=1.61)
     assert law.beta == 1.61
-    assert ocean_param('calving_melt_beta') == 1.18
+    assert cfg.PARAMS['calving_melt_beta'] == 1.18
     assert law.melt_rate(100., 1000., 2005.) == pytest.approx(
-        ocean_param('calving_melt_B') * tf ** 1.61 / 86400.)
+        cfg.PARAMS['calving_melt_B'] * tf ** 1.61 / 86400.)
     ice = SeaIceModulated(years, np.full_like(years, tf), open_water=np.ones_like(years),
-                          tf_ref=1.5, k_ice=0.6, beta=1.61)
+                          k_ice=0.6, beta=1.61)
     assert ice.beta == 1.61
 
 

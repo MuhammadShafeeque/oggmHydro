@@ -297,6 +297,16 @@ _doc = ('A group netcdf file containing the model diagnostics (volume, '
         'Netcdf groups = fl_{i}, with i between 0 and n_flowlines - 1')
 BASENAMES['fl_diagnostics'] = ('fl_diagnostics.nc', _doc)
 
+_doc = ('The monthly ocean boundary conditions at the glacier terminus: '
+        'thermal forcing in one or more depth bands, sea-ice concentration '
+        'and, optionally, subglacial discharge.')
+BASENAMES['ocean_data'] = ('ocean_data.nc', _doc)
+
+_doc = ('The submarine melt and calving parts of the frontal ablation of a '
+        'run, on the time axis of its model_diagnostics file.')
+BASENAMES['frontal_ablation_diagnostics'] = ('frontal_ablation_diagnostics.nc',
+                                             _doc)
+
 _doc = "A table containing the Huss&Farinotti 2012 squeezed flowlines."
 BASENAMES['elevation_band_flowline'] = ('elevation_band_flowline.csv', _doc)
 
@@ -526,6 +536,8 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
     PARAMS['clip_tidewater_border'] = cp.as_bool('clip_tidewater_border')
     PARAMS['use_kcalving_for_inversion'] = cp.as_bool('use_kcalving_for_inversion')
     PARAMS['use_kcalving_for_run'] = cp.as_bool('use_kcalving_for_run')
+    k = 'inversion_calving_from_bathymetry'
+    PARAMS[k] = cp.as_bool(k)
     PARAMS['calving_use_limiter'] = cp.as_bool('calving_use_limiter')
     PARAMS['use_inversion_params_for_run'] = cp.as_bool('use_inversion_params_for_run')
     k = 'error_when_glacier_reaches_boundaries'
@@ -574,6 +586,23 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
     except ValueError:
         PARAMS['calving_line_extension'] = None
 
+    # Ocean forcing and frontal ablation
+    k = 'ocean_depth_bands'
+    PARAMS[k] = [str(vk) for vk in cp.as_list(k)]
+    k = 'ocean_tf_ref_period'
+    PARAMS[k] = [int(vk) for vk in cp.as_list(k)]
+    for k in ['ocean_tf_band', 'calving_law', 'bed_extension_width_method']:
+        PARAMS[k] = cp[k]
+    for k in ['ocean_use_teos10', 'ocean_bias_correct',
+              'bed_extension_match_terminus']:
+        PARAMS[k] = cp.as_bool(k)
+    # These can be none
+    try:
+        PARAMS['ocean_tf_ref'] = cp.as_float('ocean_tf_ref')
+    except ValueError:
+        PARAMS['ocean_tf_ref'] = None
+    PARAMS['bedmachine_version'] = cp['bedmachine_version'] or None
+
     # Delete non-floats
     ltr = ['working_dir', 'dem_file', 'climate_file', 'use_tar_shapefiles',
            'grid_dx_method', 'compress_climate_netcdf', 'by_bin_dx',
@@ -593,7 +622,12 @@ def initialize_minimal(file=None, logging_level='INFO', params=None):
            'tidewater_type', 'store_model_geometry', 'store_output_on_error',
            'store_diagnostic_variables', 'store_fl_diagnostic_variables',
            'geodetic_mb_period', 'store_fl_diagnostics',
-           'prcp_fac', 'downstream_line_shape', 'keep_multipolygon_outlines']
+           'prcp_fac', 'downstream_line_shape', 'keep_multipolygon_outlines',
+           'ocean_depth_bands', 'ocean_tf_ref_period', 'ocean_tf_band',
+           'calving_law', 'bed_extension_width_method', 'ocean_use_teos10',
+           'ocean_bias_correct', 'bed_extension_match_terminus',
+           'ocean_tf_ref', 'bedmachine_version',
+           'inversion_calving_from_bathymetry']
     for k in ltr:
         cp.pop(k, None)
 

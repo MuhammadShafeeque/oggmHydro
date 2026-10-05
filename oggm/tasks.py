@@ -48,6 +48,8 @@ from oggm.shop.gcm_climate import process_monthly_isimip_data
 from oggm.shop.gcm_climate import process_cmip_data
 from oggm.shop.gcm_climate import process_lmr_data
 from oggm.shop.gcm_climate import process_modera_data
+from oggm.shop.ocean import process_ocean_data
+from oggm.shop.ocean import process_destine_ocean_data
 from oggm.core.inversion import prepare_for_inversion
 from oggm.core.inversion import mass_conservation_inversion
 from oggm.core.inversion import filter_inversion_output
@@ -56,6 +58,12 @@ from oggm.core.inversion import compute_inversion_velocities
 from oggm.core.inversion import distribute_thickness_per_altitude
 from oggm.core.inversion import distribute_thickness_interp
 from oggm.core.inversion import find_inversion_calving_from_any_mb
+from oggm.core.ocean_inversion import terminus_water_depth_from_bed
+from oggm.core.ocean_inversion import find_inversion_calving_from_bathymetry
+from oggm.core.ocean_inversion import set_inversion_k_from_ocean
+from oggm.core.ocean_inversion import set_inversion_k_from_model
+from oggm.core.ocean_inversion import calving_vs_geodetic_residual
+from oggm.core.ocean_inversion import write_subglacial_discharge
 from oggm.core.flowline import init_present_time_glacier
 from oggm.core.flowline import flowline_model_run
 from oggm.core.flowline import run_random_climate
@@ -63,6 +71,10 @@ from oggm.core.flowline import run_from_climate_data
 from oggm.core.flowline import run_constant_climate
 from oggm.core.flowline import run_with_hydro
 from oggm.core.flowline import compute_fl_diagnostics_quantiles
+from oggm.core.ocean_calving import run_with_ocean_forcing
+from oggm.core.bedmachine_flowline import bedmachine_calving_extension
+from oggm.core.bedmachine_flowline import bedmachine_terminus_bed
+from oggm.core.bedmachine_flowline import calving_front_width_check
 from oggm.core.dynamic_spinup import run_dynamic_spinup
 from oggm.core.dynamic_spinup import run_dynamic_melt_f_calibration
 from oggm.utils import copy_to_basedir

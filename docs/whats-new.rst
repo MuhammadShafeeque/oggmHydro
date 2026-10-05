@@ -277,10 +277,55 @@ Enhancements
   to the glacier state of a given simulation year, instead of the default
   largest area during the simulation period (:pull:`1965`).
   By `Patrick Schmitt <https://github.com/pat-schmitt>`_
+- New ocean-forced frontal ablation. ``tasks.process_ocean_data`` and
+  ``tasks.process_destine_ocean_data`` (new module ``shop.ocean``) write an
+  ``ocean_data`` file to the glacier directory, with the ocean thermal forcing
+  in one or more depth bands, the sea-ice concentration and optionally the
+  subglacial discharge. ``tasks.run_with_ocean_forcing`` (new module
+  ``core.ocean_calving``) runs the flowline model with one of four calving
+  laws which form a nested family: the default law (``constant``), a calving
+  constant scaled by the thermal forcing (``tf_power``), an added submarine
+  melt term after Rignot et al. (2016) (``melt_calving``) and the same term
+  gated by the open-water fraction (``sea_ice``). The calving and submarine
+  melt parts of the frontal ablation are written to a new
+  ``frontal_ablation_diagnostics`` file. On the inversion side (new module
+  ``core.ocean_inversion``), the water depth at the calving front can be
+  taken from a measured bed (``tasks.terminus_water_depth_from_bed``,
+  ``tasks.find_inversion_calving_from_bathymetry``, selected in
+  ``inversion_tasks`` with the new
+  ``PARAMS['inversion_calving_from_bathymetry']``), and the calving constant
+  can be fitted to observed frontal ablation or scaled by the thermal
+  forcing. ``shop.bedmachine_bed.bedmachine_bed_to_gdir`` adds the BedMachine
+  bed, its error, source flag, surface and mask to ``gridded_data``, and
+  ``tasks.bedmachine_terminus_bed`` and ``tasks.bedmachine_calving_extension``
+  replace the synthetic bed at and beyond a calving front with the measured
+  one. All new parameters are in ``params.cfg``. See
+  :doc:`the documentation <frontal-ablation>` for an overview.
+  By `Muhammad Shafeeque <https://github.com/MuhammadShafeeque>`_
+- ``mb_calibration_from_scalar_mb``, ``mb_calibration_from_geodetic_mb`` and
+  ``mb_calibration_to_rmsd`` now accept calving glaciers: when
+  ``gdir.inversion_calving_rate`` is not zero, the surface mass balance is
+  calibrated against the reference mass balance plus the frontal ablation.
+  ``reference_mb`` stays the observation and the frontal term is stored as
+  ``calving_mb`` in the settings.
+  By `Muhammad Shafeeque <https://github.com/MuhammadShafeeque>`_
 
 Bug fixes
 ~~~~~~~~~
 
+- ``run_with_hydro`` no longer counts the mass lost through the calving
+  front as melt: at a calving glacier the melt correction now closes the
+  surface budget against the mass change plus the calving flux.
+  By `Muhammad Shafeeque <https://github.com/MuhammadShafeeque>`_
+- ``run_dynamic_spinup`` with ``allow_calving=True`` now passes the terminus
+  type and the water level of the inversion to the evolution model. Before,
+  the spinup of a tidewater glacier ran without calving.
+  By `Muhammad Shafeeque <https://github.com/MuhammadShafeeque>`_
+- ``cfg.unpack_config`` no longer clears the shared multiprocessing
+  dictionaries (``cfg.DATA``, ``cfg.DL_VERIFIED``, ``cfg.DEM_SOURCE_TABLE``)
+  when a pool worker starts, which raced the lookups of the workers already
+  running.
+  By `Muhammad Shafeeque <https://github.com/MuhammadShafeeque>`_
 - ``init_present_time_glacier`` no longer fails with "Trapezoid beds need to
   have origin widths > 0" when the inversion returns a trapezoid sitting
   exactly on its physical boundary (thickness = width / lambda, i.e. a zero

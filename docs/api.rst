@@ -132,6 +132,8 @@ OGGM Shop
     shop.millan22.compile_millan_statistics
     shop.bedmachine.bedmachine_to_gdir
     shop.bedmachine.compile_bedmachine_statistics
+    shop.bedmachine_bed.bedmachine_bed_to_gdir
+    shop.bedmachine_bed.compile_bedmachine_bed_statistics
     shop.rgitopo.init_glacier_directories_from_rgitopo
     shop.rgitopo.select_dem_from_dir
     shop.rgitopo.dem_quality_check
@@ -141,6 +143,8 @@ OGGM Shop
     shop.gcm_climate.process_cmip_data
     shop.gcm_climate.process_lmr_data
     shop.gcm_climate.process_modera_data
+    shop.ocean.process_ocean_data
+    shop.ocean.process_destine_ocean_data
 
 .. _apientitytasks:
 
@@ -200,6 +204,8 @@ the majority of OGGM's tasks). They are parallelizable.
     tasks.process_cmip_data
     tasks.process_lmr_data
     tasks.process_modera_data
+    tasks.process_ocean_data
+    tasks.process_destine_ocean_data
     tasks.prepare_for_inversion
     tasks.mass_conservation_inversion
     tasks.filter_inversion_output
@@ -208,12 +214,22 @@ the majority of OGGM's tasks). They are parallelizable.
     tasks.distribute_thickness_per_altitude
     tasks.distribute_thickness_interp
     tasks.find_inversion_calving_from_any_mb
+    tasks.terminus_water_depth_from_bed
+    tasks.find_inversion_calving_from_bathymetry
+    tasks.set_inversion_k_from_ocean
+    tasks.set_inversion_k_from_model
+    tasks.calving_vs_geodetic_residual
+    tasks.write_subglacial_discharge
     tasks.init_present_time_glacier
+    tasks.bedmachine_calving_extension
+    tasks.bedmachine_terminus_bed
+    tasks.calving_front_width_check
     tasks.flowline_model_run
     tasks.run_random_climate
     tasks.run_from_climate_data
     tasks.run_constant_climate
     tasks.run_with_hydro
+    tasks.run_with_ocean_forcing
     tasks.run_dynamic_spinup
     tasks.run_dynamic_melt_f_calibration
     tasks.copy_to_basedir
@@ -247,6 +263,7 @@ but might use multiprocessing internally.
     global_tasks.compile_fixed_geometry_mass_balance
     global_tasks.compile_climate_statistics
     global_tasks.compile_ela
+    global_tasks.compile_frontal_components
 
 
 Command line interface (CLI)
