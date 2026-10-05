@@ -4285,14 +4285,12 @@ def mb_calibration_to_rmsd(gdir, *,
     ref_mb_years = ref_df.index.values
     years = ref_mb_years
 
-    # Do we have a calving glacier? The geodetic observation is the total mass
-    # change, which frontal ablation contributes to but the surface mass balance
-    # does not include, so the surface target is the observation plus the frontal
-    # flux: dV/dt = SMB - cmb.
+    # Do we have a calving glacier? The observation is the total mass change,
+    # so the surface mass balance has to match it plus the frontal ablation
     cmb = calving_mb(gdir)
     if cmb != 0:
         if ref_mb_unit == 'kg m-2':
-            # cmb is a rate, the target a total over the period.
+            # cmb is a rate, the target a total over the period
             steps_per_year = {'annual': 1, 'monthly': 12}.get(time_resolution)
             if steps_per_year is None:
                 raise NotImplementedError(
@@ -4832,6 +4830,9 @@ def mb_calibration_from_scalar_mb(gdir, *,
         To use available observations, see
         :py:func:`oggm.core.massbalance.mb_calibration_from_geodetic_mb` or
         :py:func:`oggm.core.massbalance.mb_calibration_from_wgms_mb`.
+        For a calving glacier (``gdir.inversion_calving_rate`` not zero), the
+        surface mass balance is calibrated against ref_mb plus the frontal
+        ablation.
     ref_mb_unit : str, optional
         The unit of ref_mb`. Options are:
         - 'kg m-2 yr-1': annual average MB over a full-year ref_mb_period.
@@ -5021,14 +5022,12 @@ def mb_calibration_from_scalar_mb(gdir, *,
             "'kg m-2 yr-1'. Please set the correct unit using the `ref_mb_unit` "
             "parameter and make sure `ref_mb` is provided correctly.")
 
-    # Do we have a calving glacier? The geodetic observation is the total mass
-    # change, which frontal ablation contributes to but the surface mass balance
-    # does not include, so the surface target is the observation plus the frontal
-    # flux: dV/dt = SMB - cmb.
+    # Do we have a calving glacier? The observation is the total mass change,
+    # so the surface mass balance has to match it plus the frontal ablation
     cmb = calving_mb(gdir)
     if cmb != 0:
         if ref_mb_unit == 'kg m-2':
-            # cmb is a rate, the target a total over the period.
+            # cmb is a rate, the target a total over the period
             steps_per_year = {'annual': 1, 'monthly': 12}.get(time_resolution)
             if steps_per_year is None:
                 raise NotImplementedError(
@@ -5037,8 +5036,7 @@ def mb_calibration_from_scalar_mb(gdir, *,
                     'spans is not defined here.')
             cmb = cmb * len(years) / steps_per_year
         ref_mb = ref_mb + cmb
-    # The observation, kept apart from the surface target it was turned into: the
-    # stored `reference_mb` is what everything downstream compares a model against.
+    # What we store as `reference_mb` is the observation
     ref_mb_geodetic = ref_mb - cmb
 
     # Ok, regardless on how we want to calibrate, we start with defaults
@@ -5216,8 +5214,8 @@ def mb_calibration_from_scalar_mb(gdir, *,
     df['melt_f'] = melt_f
     df['prcp_fac'] = prcp_fac
     df['temp_bias'] = temp_bias
-    # What did we try to match? `reference_mb` stays the observation; for a calving
-    # glacier the surface balance was fitted to it plus `calving_mb`.
+    # What did we try to match? For a calving glacier the surface mass
+    # balance was fitted to `reference_mb` plus `calving_mb`
     df['reference_mb'] = ref_mb_geodetic
     df['calving_mb'] = cmb
     df['reference_mb_err'] = ref_mb_err

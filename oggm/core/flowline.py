@@ -4607,10 +4607,9 @@ def run_with_hydro(gdir, settings_filesuffix='',
     (instead of the ice volume times a fixed ice density) also accounts for
     mass balance models with a snow/firn bucket system (e.g.
     ``SfcTypeTIModel``), where part of the glacier mass has a lower density.
-    At a tidewater glacier the mass lost through the calving front is added
+    At a calving glacier the mass lost through the calving front is added
     back before the correction, since the hydro variables describe surface
-    terms only: without that step the frontal ablation would be absorbed by
-    ``melt_on_glacier`` and reported as runoff.
+    terms only.
 
     If the mass balance model of the run tracks surface types (e.g.
     ``SfcTypeTIModel``), the on-glacier melt is additionally split into
@@ -4784,14 +4783,11 @@ def run_with_hydro(gdir, settings_filesuffix='',
                 "PARAMS['store_diagnostic_variables'].")
         model_mass_kg = dict(zip(ds_diag['time'].values,
                                  ds_diag['mass_kg'].values))
-        # Mass lost through the calving front, which the hydro variables do not
-        # describe: without it the melt correction below would close the surface
-        # budget against a mass change that is net of calving, and the frontal
-        # ablation would end up inside `melt_on_glacier`.
+        # Mass lost through the calving front, which is not a surface term
         if 'calving_m3' in ds_diag:
             model_calving_kg = dict(zip(
                 ds_diag['time'].values,
-                ds_diag['calving_m3'].values * cfg.PARAMS['ice_density']))
+                ds_diag['calving_m3'].values * gdir.settings['ice_density']))
         else:
             model_calving_kg = {yr: 0. for yr in ds_diag['time'].values}
 
@@ -5112,8 +5108,7 @@ def run_with_hydro(gdir, settings_filesuffix='',
             # We use the total glacier mass change of the run, which also
             # includes the snow and firn buckets for mb models with surface
             # type tracking (e.g. SfcTypeTIModel), plus what left through the
-            # calving front, so that what is reconstructed here stays the
-            # surface balance alone.
+            # calving front
             model_mb = (model_mass_kg[yr + 1] - model_mass_kg[yr]
                         + model_calving_kg[yr + 1] - model_calving_kg[yr])
 
