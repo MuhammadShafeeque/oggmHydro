@@ -282,11 +282,13 @@ Enhancements
   ``ocean_data`` file to the glacier directory, with the ocean thermal forcing
   in one or more depth bands, the sea-ice concentration and optionally the
   subglacial discharge. ``tasks.run_with_ocean_forcing`` (new module
-  ``core.ocean_calving``) runs the flowline model with one of four calving
+  ``core.ocean_calving``) runs the flowline model with one of five calving
   laws which form a nested family: the default law (``constant``), a calving
-  constant scaled by the thermal forcing (``tf_power``), an added submarine
-  melt term after Rignot et al. (2016) (``melt_calving``) and the same term
-  gated by the open-water fraction (``sea_ice``). The calving and submarine
+  constant scaled by the thermal forcing, with an optional background term
+  (``tf_power``), an added submarine melt term after Rignot et al. (2016)
+  (``melt_calving``), the same term gated by the open-water fraction
+  (``sea_ice``) and the larger of the calving and melt speeds
+  (``larger_of``). The calving and submarine
   melt parts of the frontal ablation are written to a new
   ``frontal_ablation_diagnostics`` file. On the inversion side (new module
   ``core.ocean_inversion``), the water depth at the calving front can be

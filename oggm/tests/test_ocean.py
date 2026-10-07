@@ -20,7 +20,8 @@ from oggm.core.bedmachine_flowline import (_purge_lazy, bed_extension_statistics
                                            extension_slice,
                                            sample_gridded_on_line)
 from oggm.core.flowline import init_present_time_glacier, k_calving_law
-from oggm.core.ocean_calving import (ConstantK, MeltPlusCalving, SeaIceModulated,
+from oggm.core.ocean_calving import (ConstantK, LargerOf, MeltPlusCalving,
+                                     SeaIceModulated,
                                      TFPower, band_names,
                                      frontal_ablation_components,
                                      ocean_calving_law, tf_power_mean,
@@ -187,6 +188,50 @@ def test_gamma_zero_is_the_control(state, years):
     assert law(model, fl, i) == pytest.approx(k_calving_law(model, fl, i))
 
 
+def test_tf_fraction_nests_the_control_and_the_power_law(state, years):
+    """a = 0 is constant k, a = 1 is the law without a background term."""
+    model, fl, i = state
+    tf = np.full_like(years, 4.2)
+    stock = k_calving_law(model, fl, i)
+    assert TFPower(years, tf, tf_ref=1.5, tf_fraction=0.)(model, fl, i) == \
+        pytest.approx(stock)
+    full = TFPower(years, tf, tf_ref=1.5)(model, fl, i)
+    assert TFPower(years, tf, tf_ref=1.5, tf_fraction=1.)(model, fl, i) == full
+    half = TFPower(years, tf, tf_ref=1.5, tf_fraction=0.5)(model, fl, i)
+    assert half == pytest.approx(0.5 * (stock + full))
+    with pytest.raises(InvalidParamsError, match='tf_fraction'):
+        TFPower(years, tf, tf_ref=1.5, tf_fraction=1.2)
+
+
+def test_tf_fraction_keeps_the_mean_scaling_of_one(years):
+    """At the power-mean reference the law averages to k0 for any a."""
+    tf = 1.5 + np.sin(2 * np.pi * years)
+    for gamma in (0.5, 1.18, 2.):
+        ref = tf_power_mean(tf, gamma)
+        for a in (0., 0.5, 1.):
+            law = TFPower(years, tf, tf_ref=ref, gamma=gamma, tf_fraction=a)
+            np.testing.assert_allclose(
+                np.mean([law.scaling(y) for y in years]), 1., rtol=2e-3)
+
+
+def test_larger_of_reduces_to_the_control(state, years):
+    """lam = 0 is constant k; a large melt speed takes over the whole flux."""
+    model, fl, i = state
+    tf = np.full_like(years, 1.8)
+    assert LargerOf(years, tf, lam=0.)(model, fl, i) == \
+        pytest.approx(k_calving_law(model, fl, i))
+    h, w = fl.thick[i], fl.widths_m[i]
+    d = h - (fl.surface_h[i] - model.water_level)
+    small = LargerOf(years, tf, k_c=0.6, lam=1e-3)
+    u_c, u_m = small.frontal_speed_components(h, d, w, model.yr)
+    assert u_m == 0. and u_c == pytest.approx(0.6 / cfg.SEC_IN_YEAR * h)
+    big = LargerOf(years, tf, k_c=0.6, lam=1e3)
+    u_c, u_m = big.frontal_speed_components(h, d, w, model.yr)
+    assert u_c == 0. and u_m == pytest.approx(big.melt_speed(d, w, model.yr))
+    assert (u_c + u_m) * d * w == pytest.approx(big(model, fl, i))
+    assert big(model, fl, i) > small(model, fl, i)
+
+
 def test_no_extrapolation_past_the_forcing(state):
     """Running past the end of the forcing freezes it instead of trending off."""
     yrs = np.array([2000., 2001., 2002.])
@@ -259,7 +304,8 @@ def test_laws_are_picklable(state, years):
                 MeltPlusCalving(years, np.full_like(years, 1.5), k_c=0.6),
                 SeaIceModulated(years, np.full_like(years, 1.5),
                                 open_water=np.full_like(years, 0.5),
-                                k_ice=0.6)):
+                                k_ice=0.6),
+                LargerOf(years, np.full_like(years, 1.5), k_c=0.6)):
         again = pickle.loads(pickle.dumps(law))
         assert again(model, fl, i) == law(model, fl, i)
 
@@ -1313,6 +1359,42 @@ def test_partition_keeps_the_calibrated_total(columbia):
         gdir.get_diagnostics()['calving_k_residual'], law.k_c)
 
 
+def test_partition_averages_the_gated_melt(columbia):
+    """The open-water law's residual constant keeps the total with its gate on."""
+    from oggm.core.ocean_inversion import find_inversion_calving_from_bathymetry
+
+    gdir, _ = columbia
+    _write_ocean(gdir)
+    gdir.settings['terminus_water_depth'] = 150.
+    find_inversion_calving_from_bathymetry(gdir)
+    gdir.settings['ocean_tf_ref_period'] = [2000, 2010]
+    law = ocean_calving_law(gdir, 'sea_ice', band='terminus', partition=True)
+    free = ocean_calving_law(gdir, 'melt_calving', band='terminus',
+                             partition=True)
+    k, h = gdir.settings['calving_k'], gdir.settings['calving_front_thick']
+    w = gdir.settings['calving_front_width']
+    sel = (law.years >= 2000) & (law.years < 2011)
+    u_melt = np.mean([law.melt_speed(150., w, y) for y in law.years[sel]])
+    np.testing.assert_allclose(law.k_c / cfg.SEC_IN_YEAR * h + u_melt,
+                               k / cfg.SEC_IN_YEAR * h)
+    assert law.k_c > free.k_c  # the gate leaves less melt to carve out
+
+
+def test_inversion_scaling_takes_the_background_term(columbia):
+    from oggm.core.ocean_inversion import set_inversion_k_from_ocean
+
+    gdir, _ = columbia
+    _write_ocean(gdir)
+    gdir.settings['inversion_calving_k'] = 0.6
+    kw = dict(k_ref=0.6, band='terminus', period=(2000, 2010), tf_ref=1.)
+    full = set_inversion_k_from_ocean(gdir, **kw)
+    assert set_inversion_k_from_ocean(gdir, tf_fraction=0., **kw) == \
+        pytest.approx(0.6)
+    assert set_inversion_k_from_ocean(gdir, tf_fraction=1., **kw) == full
+    assert set_inversion_k_from_ocean(gdir, tf_fraction=0.5, **kw) == \
+        pytest.approx(0.5 * (0.6 + full))
+
+
 def test_subglacial_discharge_follows_the_melt_season(columbia):
     from oggm.core.ocean_inversion import (subglacial_discharge_from_mb,
                                            write_subglacial_discharge)
@@ -1420,7 +1502,8 @@ def _laws(years):
     return [ConstantK(k=0.6),
             TFPower(years, tf, tf_ref=1.5, k0=0.6),
             MeltPlusCalving(years, tf, k_c=0.6),
-            SeaIceModulated(years, tf, open_water=ow, k_ice=0.6)]
+            SeaIceModulated(years, tf, open_water=ow, k_ice=0.6),
+            LargerOf(years, tf, k_c=0.6, lam=1e3)]
 
 
 def test_components_sum_to_the_flux(state, years):
