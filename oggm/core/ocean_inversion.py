@@ -84,11 +84,12 @@ def ocean_tf_mean(gdir, band=None, period=None, ocean_filesuffix='',
 
 @entity_task(log)
 def set_inversion_k_from_ocean(gdir, k_ref=None, gamma=None, band=None,
-                               period=None, tf_ref=None, ocean_filesuffix=''):
+                               period=None, tf_ref=None, ocean_filesuffix='',
+                               tf_fraction=None):
     """Scale the inversion's calving constant by the period-mean thermal forcing.
 
-    ``k_inv = k_ref * (mean(TF, period) / TF_ref) ** gamma`` is written to the
-    glacier's settings as ``inversion_calving_k``.
+    ``k_inv = k_ref * ((1 - a) + a * (mean(TF, period) / TF_ref) ** gamma)``
+    is written to the glacier's settings as ``inversion_calving_k``.
 
     Parameters
     ----------
@@ -110,6 +111,9 @@ def set_inversion_k_from_ocean(gdir, k_ref=None, gamma=None, band=None,
         leaves ``k_ref`` unchanged.
     ocean_filesuffix : str
         the filesuffix of the ``ocean_data`` file
+    tf_fraction : float, optional
+        ``a``, the share of the constant that follows the ocean. Default:
+        ``gdir.settings['calving_tf_fraction']``.
 
     Returns
     -------
@@ -136,7 +140,12 @@ def set_inversion_k_from_ocean(gdir, k_ref=None, gamma=None, band=None,
             f'({gdir.rgi_id}) TF_ref = {tf_ref} is not usable; set '
             'ocean_tf_ref or pick a different band.')
 
-    k_inv = float(k_ref * (max(tf_mean, 0.) / tf_ref) ** gamma)
+    if tf_fraction is None:
+        tf_fraction = gdir.settings['calving_tf_fraction']
+    scale = (max(tf_mean, 0.) / tf_ref) ** gamma
+    if tf_fraction != 1:
+        scale = (1 - tf_fraction) + tf_fraction * scale
+    k_inv = float(k_ref * scale)
     gdir.settings['inversion_calving_k'] = k_inv
     gdir.add_to_diagnostics('ocean_inversion_k', k_inv)
     gdir.add_to_diagnostics('ocean_inversion_tf_mean', tf_mean)
