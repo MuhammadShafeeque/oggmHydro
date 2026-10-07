@@ -312,7 +312,7 @@ def test_laws_are_picklable(state, years):
 
 def test_depth_bands_are_parsed_from_the_parameter_file():
     bands, weighting = parse_depth_bands(cfg.PARAMS['ocean_depth_bands'])
-    assert bands == [('terminus', 0., 100.), ('ismip6', 200., 500.),
+    assert bands == [('terminus', 0., 60.), ('ismip6', 200., 500.),
                      ('moller', 0., 700.)]
     assert weighting == {'terminus': 'uniform', 'ismip6': 'uniform',
                          'moller': 'depth_weighted'}
