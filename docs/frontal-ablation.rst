@@ -23,19 +23,24 @@ ocean. :py:func:`tasks.process_ocean_data` writes an ``ocean_data`` file to
 the glacier directory (the thermal forcing in one or more depth bands, the
 sea-ice concentration and, optionally, the subglacial discharge), and
 :py:func:`tasks.run_with_ocean_forcing` runs the flowline model with one of
-four calving laws, chosen with ``PARAMS['calving_law']``:
+five calving laws, chosen with ``PARAMS['calving_law']``:
 
 - ``constant``: the default law, :math:`q = k \, d \, h \, w`
-- ``tf_power``: :math:`k(t) = k_0 \, (TF(t) / TF_{ref})^{\gamma}`, with
-  :math:`TF` the thermal forcing
+- ``tf_power``: :math:`k(t) = k_0 \, ((1 - a) + a \, (TF(t) / TF_{ref})^{\gamma})`,
+  with :math:`TF` the thermal forcing and :math:`a` the share of the constant
+  that follows it (``PARAMS['calving_tf_fraction']``, 1 by default)
 - ``melt_calving``: a submarine melt rate after Rignot et al. (2016) added to
   the calving term, :math:`q = w \, d \, (k_c \, h + \lambda \, \dot{m})`
 - ``sea_ice``: ``melt_calving`` with the melt term multiplied by
   :math:`f_{ow}^{\delta}`, :math:`f_{ow}` being the open-water fraction
+- ``larger_of``: the larger of the two speeds,
+  :math:`q = w \, d \, \max(k_c \, h, \lambda \, \dot{m})`, after Malles
+  et al. (2025)
 
 The laws are nested: each reduces to the one before it for a value of its
-parameters (:math:`TF = TF_{ref}` or :math:`\gamma = 0`, :math:`\lambda = 0`,
-:math:`\delta = 0`). A calving constant calibrated against an observed frontal
+parameters (:math:`TF = TF_{ref}`, :math:`\gamma = 0` or :math:`a = 0`;
+:math:`\lambda = 0`; :math:`\delta = 0`), and ``larger_of`` reduces to the
+default law at :math:`\lambda = 0`. A calving constant calibrated against an observed frontal
 ablation already contains the melt-driven part, so the melt term of the last
 two laws adds to it unless the law is built with ``partition=True``
 (:py:func:`core.ocean_calving.ocean_calving_law`).

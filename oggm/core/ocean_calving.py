@@ -1,17 +1,21 @@
 """Ocean-forced frontal ablation laws for the flowline models.
 
-Four laws, as a nested family rooted at the stock model:
+Five laws, as a nested family rooted at the stock model:
 
 ===================  =========================================================
 ``constant``         :class:`ConstantK`, identical to
                      :func:`oggm.core.flowline.k_calving_law`. The control.
-``tf_power``         :class:`TFPower`, ``k(t) = k0 (TF/TF_ref)**gamma``.
-                     Reduces to the control when ``TF == TF_ref``.
+``tf_power``         :class:`TFPower`,
+                     ``k(t) = k0 ((1 - a) + a (TF/TF_ref)**gamma)``.
+                     Reduces to the control when ``TF == TF_ref`` or ``a = 0``.
 ``melt_calving``     :class:`MeltPlusCalving`, an explicit submarine-melt term
                      after Rignot et al. (2016) plus a calving term.
 ``sea_ice``          :class:`SeaIceModulated`, the melt term gated by the
                      open-water fraction. Reduces to ``melt_calving`` at
                      ``delta = 0``.
+``larger_of``        :class:`LargerOf`, the larger of the calving and the
+                     submarine-melt speed. Reduces to the control at
+                     ``lam = 0``.
 ===================  =========================================================
 
 Each is passed as the ``calving_law`` of ``FluxBasedModel`` or
@@ -274,11 +278,13 @@ class ConstantK(_OceanCalvingLaw):
 class TFPower(_OceanCalvingLaw):
     """The stock law with a calving constant scaled by the thermal forcing.
 
-    ``k(t) = k0 * (max(TF(t), 0) / TF_ref) ** gamma``
+    ``k(t) = k0 * ((1 - a) + a * (max(TF(t), 0) / TF_ref) ** gamma)``
 
     The default ``gamma`` is the thermal-forcing exponent of the submarine
     melt rate of Rignot et al. (2016), which assumes that frontal ablation
-    inherits the thermal dependence of the melt.
+    inherits the thermal dependence of the melt. ``a`` is the share of the
+    calving constant that follows the ocean; the rest is a background term
+    that calves at the freezing point too.
 
     Parameters
     ----------
@@ -291,12 +297,16 @@ class TFPower(_OceanCalvingLaw):
         ``calving_k``.
     gamma : float, optional
         default: ``cfg.PARAMS['calving_tf_exponent']``
+    tf_fraction : float, optional
+        ``a``, in [0, 1]. Default: ``cfg.PARAMS['calving_tf_fraction']``
     """
 
     name = 'tf_power'
-    settings_keys = {'gamma': 'calving_tf_exponent'}
+    settings_keys = {'gamma': 'calving_tf_exponent',
+                     'tf_fraction': 'calving_tf_fraction'}
 
-    def __init__(self, *args, tf_ref=None, k0=None, gamma=None, **kwargs):
+    def __init__(self, *args, tf_ref=None, k0=None, gamma=None,
+                 tf_fraction=None, **kwargs):
         super().__init__(*args, **kwargs)
         if tf_ref is None or not np.isfinite(tf_ref) or tf_ref <= 0:
             raise InvalidParamsError(
@@ -306,10 +316,22 @@ class TFPower(_OceanCalvingLaw):
         self.k0 = k0
         self.gamma = (cfg.PARAMS['calving_tf_exponent'] if gamma is None
                       else gamma)
+        self.tf_fraction = (cfg.PARAMS['calving_tf_fraction']
+                            if tf_fraction is None else tf_fraction)
+        if not 0 <= self.tf_fraction <= 1:
+            raise InvalidParamsError(
+                f'tf_fraction = {self.tf_fraction} is not in [0, 1]')
+
+    def scaling(self, yr):
+        """``k(t) / k0`` at ``yr``."""
+        s = (self._tf_at(yr) / self.tf_ref) ** self.gamma
+        if self.tf_fraction == 1:
+            return s
+        return (1 - self.tf_fraction) + self.tf_fraction * s
 
     def frontal_speed_components(self, h, d, w, yr):
         k = self._k(self.k0)
-        return k * (self._tf_at(yr) / self.tf_ref) ** self.gamma * h, 0.
+        return k * self.scaling(yr) * h, 0.
 
 
 class MeltPlusCalving(_OceanCalvingLaw):
@@ -368,8 +390,12 @@ class MeltPlusCalving(_OceanCalvingLaw):
                 * tf ** self.beta)
         return mdot / cfg.SEC_IN_DAY
 
+    def melt_speed(self, d, w, yr):
+        """The front-normal melt speed the law applies, m s-1."""
+        return self.lam * self.melt_rate(d, w, yr)
+
     def frontal_speed_components(self, h, d, w, yr):
-        return self._k(self.k_c) * h, self.lam * self.melt_rate(d, w, yr)
+        return self._k(self.k_c) * h, self.melt_speed(d, w, yr)
 
 
 class SeaIceModulated(MeltPlusCalving):
@@ -398,17 +424,32 @@ class SeaIceModulated(MeltPlusCalving):
         self.delta = (cfg.PARAMS['calving_openwater_exponent']
                       if delta is None else delta)
 
-    def frontal_speed_components(self, h, d, w, yr):
+    def melt_speed(self, d, w, yr):
         if self.open_water is None:
             raise InvalidWorkflowError('SeaIceModulated needs '
                                        'open_water_frac in ocean_data.nc')
         f = max(self._at(self.open_water, yr), 0.)
         melt = self.lam * self.melt_rate(d, w, yr)
-        return self._k(self.k_c) * h, (f ** self.delta) * melt
+        return (f ** self.delta) * melt
+
+
+class LargerOf(MeltPlusCalving):
+    """The larger of the calving and the submarine-melt speed.
+
+    ``Q_f = w * d * max(k_c * h, lam * mdot)``, after Malles et al. (2025).
+    The whole flux is reported as the larger term. ``lam = 0`` is the control.
+    """
+
+    name = 'larger_of'
+
+    def frontal_speed_components(self, h, d, w, yr):
+        u_c, u_m = self._k(self.k_c) * h, self.melt_speed(d, w, yr)
+        return (u_c, 0.) if u_c >= u_m else (0., u_m)
 
 
 LAWS = {'constant': ConstantK, 'tf_power': TFPower,
-        'melt_calving': MeltPlusCalving, 'sea_ice': SeaIceModulated}
+        'melt_calving': MeltPlusCalving, 'sea_ice': SeaIceModulated,
+        'larger_of': LargerOf}
 
 
 def partition_law_k(gdir, law, period=None):
@@ -418,9 +459,10 @@ def partition_law_k(gdir, law, period=None):
     the calving that submarine melt drives, so a melt term added on top of it
     counts that melt twice.
     :func:`oggm.core.ocean_inversion.partition_calving_constant` solves
-    ``k_c h + lam mdot = k h`` for ``k_c`` at the front the inversion
-    prescribed, with the law's own melt rate averaged over ``period``. The
-    total is then unchanged over that period and only its split moves.
+    ``k_c h + u_melt = k h`` for ``k_c`` at the front the inversion
+    prescribed, with the melt speed the law applies (its open-water gate
+    included) averaged over ``period``. The total is then unchanged over that
+    period and only its split moves.
 
     Parameters
     ----------
@@ -462,9 +504,10 @@ def partition_law_k(gdir, law, period=None):
             f'{y0:.0f}-{y1:.0f}, so the reference melt rate cannot be formed. '
             'Give the law an explicit k_c, or pick a period the record '
             'covers.')
-    mdot = float(np.mean([law.melt_rate(depth, width, y) for y in yrs[sel]]))
+    u_melt = float(np.mean([law.melt_speed(depth, width, y)
+                            for y in yrs[sel]]))
 
-    k_c, frac = partition_calving_constant(k_total, mdot, thick, lam=law.lam)
+    k_c, frac = partition_calving_constant(k_total, u_melt, thick, lam=1.)
     law.k_c = k_c
     return k_c, frac
 
@@ -478,8 +521,8 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
     gdir : :py:class:`oggm.GlacierDirectory`
         the glacier directory to process
     calving_law : str, optional
-        'constant', 'tf_power', 'melt_calving' or 'sea_ice'. Default:
-        ``gdir.settings['calving_law']``.
+        'constant', 'tf_power', 'melt_calving', 'sea_ice' or 'larger_of'.
+        Default: ``gdir.settings['calving_law']``.
     band : str, optional
         the depth band of the ocean file the law reads. Default:
         ``gdir.settings['ocean_tf_band']``.
@@ -707,8 +750,8 @@ def run_with_ocean_forcing(gdir, calving_law=None, band=None,
     gdir : :py:class:`oggm.GlacierDirectory`
         the glacier directory to process
     calving_law : str, optional
-        'constant', 'tf_power', 'melt_calving' or 'sea_ice'. Default:
-        ``gdir.settings['calving_law']``.
+        'constant', 'tf_power', 'melt_calving', 'sea_ice' or 'larger_of'.
+        Default: ``gdir.settings['calving_law']``.
     band : str, optional
         the depth band of the ocean file the law reads. Default:
         ``gdir.settings['ocean_tf_band']``.
