@@ -513,7 +513,8 @@ def partition_law_k(gdir, law, period=None):
 
 
 def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
-                      tf_ref=None, partition=False, **law_kwargs):
+                      tf_ref=None, partition=False, partition_period=None,
+                      **law_kwargs):
     """Build a calving law for one glacier from its ocean_data file.
 
     Parameters
@@ -538,6 +539,9 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
         for a melt-bearing law, set ``k_c`` from :func:`partition_law_k` so
         that the melt term is carved out of the calibrated total instead of
         being added to it.
+    partition_period : tuple of two years, optional
+        the period over which the partition keeps the total. Default:
+        ``gdir.settings['ocean_tf_ref_period']``.
     **law_kwargs
         passed to the law (``k0``, ``gamma``, ``lam``, ``delta`` ...). The
         ones not given are read from the glacier's settings.
@@ -595,7 +599,7 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
                     if 'subglacial_discharge' in ds else None),
               **law_kwargs)
     if partition:
-        k_c, frac = partition_law_k(gdir, law)
+        k_c, frac = partition_law_k(gdir, law, period=partition_period)
         if k_c is not None:
             gdir.add_to_diagnostics('calving_k_residual', float(k_c))
             gdir.add_to_diagnostics('calving_melt_fraction_reference',

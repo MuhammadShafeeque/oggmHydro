@@ -1367,10 +1367,10 @@ def test_partition_averages_the_gated_melt(columbia):
     _write_ocean(gdir)
     gdir.settings['terminus_water_depth'] = 150.
     find_inversion_calving_from_bathymetry(gdir)
-    gdir.settings['ocean_tf_ref_period'] = [2000, 2010]
-    law = ocean_calving_law(gdir, 'sea_ice', band='terminus', partition=True)
+    law = ocean_calving_law(gdir, 'sea_ice', band='terminus', partition=True,
+                            partition_period=(2000, 2010))
     free = ocean_calving_law(gdir, 'melt_calving', band='terminus',
-                             partition=True)
+                             partition=True, partition_period=(2000, 2010))
     k, h = gdir.settings['calving_k'], gdir.settings['calving_front_thick']
     w = gdir.settings['calving_front_width']
     sel = (law.years >= 2000) & (law.years < 2011)
