@@ -1,0 +1,52 @@
+{
+  "title": "OGGM-Ocean: the Open Global Glacier Model with ocean-dependent frontal ablation",
+  "upload_type": "software",
+  "description": "OGGM-Ocean is the Open Global Glacier Model (OGGM) with the ocean modules: the ocean_calving frontal ablation parameterization, its inversion and the dynamic calibration of the calving constant. The version number gives the OGGM base and, after +ocean, the version of the ocean modules. OGGM is developed by OGGM e.V. and the OGGM Contributors (https://github.com/OGGM/oggm; Maussion et al., 2019, https://doi.org/10.5194/gmd-12-909-2019), who hold its copyright; the archive keeps their code under its BSD-3-Clause license. The ocean modules and this combined release are developed and maintained by the creators of this record, not by the OGGM team, and are not endorsed by them. Questions about this release go to the creators.",
+  "creators": [
+    {
+      "name": "Shafeeque, Muhammad",
+      "orcid": "0000-0002-2152-6672",
+      "affiliation": "University of Bremen; MARUM, University of Bremen; Alfred Wegener Institute"
+    },
+    {
+      "name": "Marzeion, Ben",
+      "orcid": "0000-0002-6185-3539",
+      "affiliation": "University of Bremen; MARUM, University of Bremen"
+    }
+  ],
+  "contributors": [
+    {
+      "name": "OGGM e.V. and OGGM Contributors",
+      "type": "RightsHolder"
+    }
+  ],
+  "license": "BSD-3-Clause",
+  "keywords": [
+    "glacier model",
+    "frontal ablation",
+    "calving",
+    "ocean thermal forcing",
+    "OGGM"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "10.5281/zenodo.597193",
+      "relation": "isDerivedFrom",
+      "scheme": "doi"
+    },
+    {
+      "identifier": "https://github.com/OGGM/oggm",
+      "relation": "isDerivedFrom",
+      "scheme": "url"
+    },
+    {
+      "identifier": "10.5194/gmd-12-909-2019",
+      "relation": "references",
+      "scheme": "doi"
+    }
+  ],
+  "references": [
+    "Maussion, F., Butenko, A., Champollion, N., Dusch, M., Eis, J., Fourteau, K., Gregor, P., Jarosch, A. H., Landmann, J., Oesterle, F., Recinos, B., Rothenpieler, T., Vlug, A., Wild, C. T., and Marzeion, B.: The Open Global Glacier Model (OGGM) v1.1, Geosci. Model Dev., 12, 909-931, https://doi.org/10.5194/gmd-12-909-2019, 2019.",
+    "OGGM e.V. and OGGM Contributors: OGGM, the Open Global Glacier Model, Zenodo, https://doi.org/10.5281/zenodo.597193, source code at https://github.com/OGGM/oggm."
+  ]
+}

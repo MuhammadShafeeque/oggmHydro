@@ -125,6 +125,10 @@ env-vars-file = ".env"
 path = "oggm/__init__.py"
 source = "vcs"
 
+# OGGM-Ocean tags carry a dev number, which the default scheme cannot bump
+[tool.hatch.version.raw-options]
+version_scheme = "only-version"
+
 # This section is for uv, but may also used by hatchling when building the package
 
 # local dependency groups for uv

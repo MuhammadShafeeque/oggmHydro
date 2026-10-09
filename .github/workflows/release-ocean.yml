@@ -1,0 +1,64 @@
+name: Release OGGM-Ocean
+
+# Tags look like oggm-ocean-1.6.4.dev87+ocean1.1: the OGGM base, then the ocean version.
+# They do not start with "v", so the upstream PyPI release workflow never runs on them.
+on:
+  push:
+    tags:
+      - 'oggm-ocean-*'
+
+jobs:
+  test:
+    name: Test models_dynamics
+    runs-on: ubuntu-latest
+    container: ghcr.io/oggm/untested_base:20260223
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Fix Git-Permissions
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Test
+        timeout-minutes: 60
+        run: ./ci/run_tests.sh models_dynamics untested_base
+
+  release:
+    name: Build and publish the GitHub release
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - name: Build sdist and wheel
+        run: |
+          python3 -m pip install build
+          python3 -m build
+      - name: Check the built version against the tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#oggm-ocean-}"
+          ls "dist/oggm-${version}.tar.gz"
+          echo "base=${version%%+*}" >> "$GITHUB_OUTPUT"
+          echo "ocean=${version##*+ocean}" >> "$GITHUB_OUTPUT"
+      - name: Create the release
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --verify-tag
+          --title "OGGM-Ocean ${{ steps.version.outputs.ocean }}"
+          --notes "OGGM ${{ steps.version.outputs.base }} with the ocean modules, version ${{ steps.version.outputs.ocean }}.
+          Not on PyPI: install the wheel below with pip.
+          OGGM is developed by OGGM e.V. and the OGGM Contributors (https://github.com/OGGM/oggm);
+          please also cite Maussion et al. (2019), https://doi.org/10.5194/gmd-12-909-2019."
+          --repo "$GITHUB_REPOSITORY"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
