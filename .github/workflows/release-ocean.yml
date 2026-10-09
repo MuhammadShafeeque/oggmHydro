@@ -1,6 +1,6 @@
 name: Release OGGM-Ocean
 
-# Tags look like oggm-ocean-1.6.4.dev87+ocean1.1: the OGGM base, then the ocean version.
+# Tags look like oggm-ocean-1.7.dev87+ocean1.0: the OGGM base, then the ocean version.
 # They do not start with "v", so the upstream PyPI release workflow never runs on them.
 on:
   push:
