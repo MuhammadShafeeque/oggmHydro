@@ -268,6 +268,12 @@ def dynamic_calving_k_run_with_dynamic_spinup(
     as ``calving_k_dyn_start`` (``'spinup'`` or ``'cold'``), the spinup's
     last error as ``calving_k_dyn_spinup_error``.
 
+    The flowline is rebuilt with the ``calving_line_extension`` of the
+    settings. A glacier whose spinup starts larger than today can advance
+    past a short extension, the spinup then fails and the control starts
+    cold: reset the extension for advancing glaciers, or set it large at
+    first (OGGM's preprocessing uses half the ``border``).
+
     Parameters
     ----------
     gdir : :py:class:`oggm.GlacierDirectory`
@@ -327,6 +333,8 @@ def dynamic_calving_k_run_with_dynamic_spinup(
     else:
         find_inversion_calving_from_any_mb(gdir, glen_a=glen_a, fs=fs,
                                            continue_on_error=False, **sfx)
+    # The flowline ends ``calving_line_extension`` points beyond the front, so
+    # a glacier the spinup must advance needs it reset, or set large at first.
     init_present_time_glacier(gdir, continue_on_error=False, **sfx)
     if bathymetry:
         gdir.settings_filesuffix = settings_filesuffix
