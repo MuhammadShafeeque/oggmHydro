@@ -231,6 +231,7 @@ the majority of OGGM's tasks). They are parallelizable.
     tasks.run_with_ocean_forcing
     tasks.run_dynamic_spinup
     tasks.run_dynamic_melt_f_calibration
+    tasks.run_dynamic_calving_k_calibration
     tasks.copy_to_basedir
     tasks.gdir_to_tar
     tasks.merge_consecutive_run_outputs
