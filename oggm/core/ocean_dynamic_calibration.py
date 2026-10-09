@@ -264,7 +264,9 @@ def dynamic_calving_k_run_with_dynamic_spinup(
     spinup that still fails, or starts after ``init_yr``, leaves the control
     to start cold from the calibrated glacier in ``init_yr``. A control
     stopped by the CFL criterion is run again at each ``run_cfl_min_dt``, and
-    if a spun-up one still stops, cold.
+    if a spun-up one still stops, cold. The start is written to the settings
+    as ``calving_k_dyn_start`` (``'spinup'`` or ``'cold'``), the spinup's
+    last error as ``calving_k_dyn_spinup_error``.
 
     Parameters
     ----------
