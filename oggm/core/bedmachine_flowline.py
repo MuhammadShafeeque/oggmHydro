@@ -276,10 +276,10 @@ def bedmachine_calving_extension(gdir, bed_var='bedmachine_bed',
         match_terminus = gdir.settings['bed_extension_match_terminus']
 
     keep = gdir.has_file('model_flowlines', filesuffix=synthetic_filesuffix)
-    fls = gdir.read_pickle('model_flowlines',
+    fls = gdir.read_store('model_flowlines',
                            filesuffix=synthetic_filesuffix if keep else filesuffix)
     if not keep:
-        gdir.write_pickle(fls, 'model_flowlines',
+        gdir.write_store(fls, 'model_flowlines',
                           filesuffix=synthetic_filesuffix)
 
     w_inv = _inversion_calving_front_width(gdir)
@@ -360,7 +360,7 @@ def bedmachine_calving_extension(gdir, bed_var='bedmachine_bed',
             f'({gdir.rgi_id}) no synthetic calving extension found in '
             'model_flowlines. Run init_present_time_glacier first.')
 
-    gdir.write_pickle(fls, 'model_flowlines', filesuffix=filesuffix)
+    gdir.write_store(fls, 'model_flowlines', filesuffix=filesuffix)
     for k, v in out.items():
         gdir.add_to_diagnostics(f'bed_extension_{k}', v)
     return out
@@ -445,10 +445,10 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
                                  'is not a depth below sea level.')
 
     keep = gdir.has_file('model_flowlines', filesuffix=synthetic_filesuffix)
-    fls = gdir.read_pickle('model_flowlines',
+    fls = gdir.read_store('model_flowlines',
                            filesuffix=synthetic_filesuffix if keep else filesuffix)
     if not keep:
-        gdir.write_pickle(fls, 'model_flowlines', filesuffix=synthetic_filesuffix)
+        gdir.write_store(fls, 'model_flowlines', filesuffix=synthetic_filesuffix)
 
     out = {}
     for i, fl in enumerate(fls):
@@ -554,7 +554,7 @@ def bedmachine_terminus_bed(gdir, water_depth=None, n_blend=None,
     if not out:
         raise InvalidWorkflowError(f'({gdir.rgi_id}) no flowline holds ice.')
 
-    gdir.write_pickle(fls, 'model_flowlines', filesuffix=filesuffix)
+    gdir.write_store(fls, 'model_flowlines', filesuffix=filesuffix)
     for k, v in out.items():
         gdir.add_to_diagnostics(f'terminus_bed_{k}', v)
     return out
@@ -592,7 +592,7 @@ def calving_front_width_check(gdir, rtol=None, raise_on_fail=False,
 
     if rtol is None:
         rtol = gdir.settings['calving_front_width_rtol']
-    fls = gdir.read_pickle('model_flowlines', filesuffix=filesuffix)
+    fls = gdir.read_store('model_flowlines', filesuffix=filesuffix)
     w_inv = _inversion_calving_front_width(gdir)
 
     d = {'rgi_id': gdir.rgi_id,
@@ -660,8 +660,8 @@ def bed_extension_statistics(gdir, filesuffix='',
          'rgi_area_km2': gdir.rgi_area_km2,
          'is_tidewater': gdir.is_tidewater}
     try:
-        meas = gdir.read_pickle('model_flowlines', filesuffix=filesuffix)
-        syn = gdir.read_pickle('model_flowlines', filesuffix=synthetic_filesuffix)
+        meas = gdir.read_store('model_flowlines', filesuffix=filesuffix)
+        syn = gdir.read_store('model_flowlines', filesuffix=synthetic_filesuffix)
     except FileNotFoundError:
         return d
 

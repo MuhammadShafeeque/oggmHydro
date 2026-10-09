@@ -796,7 +796,7 @@ def test_bedmachine_bed_to_gdir_rejects_unknown_variables(columbia):
 def test_extension_slice_finds_what_init_present_time_glacier_built(columbia):
     gdir, _ = columbia
     init_present_time_glacier(gdir)
-    fl = gdir.read_pickle('model_flowlines')[-1]
+    fl = gdir.read_store('model_flowlines')[-1]
 
     sl = extension_slice(gdir, fl)
     assert sl is not None
@@ -816,7 +816,7 @@ def test_extension_slice_refuses_a_bed_it_did_not_build(columbia):
     """The guard against overwriting real ice, or an extension already replaced."""
     gdir, _ = columbia
     init_present_time_glacier(gdir)
-    fl = gdir.read_pickle('model_flowlines')[-1]
+    fl = gdir.read_store('model_flowlines')[-1]
 
     fl.bed_h[-5] += 10.
     assert extension_slice(gdir, fl) is None
@@ -827,11 +827,11 @@ def test_calving_extension_replaces_the_bed_and_keeps_the_synthetic(columbia_lin
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
 
-    syn_before = gdir.read_pickle('model_flowlines')[-1].bed_h.copy()
+    syn_before = gdir.read_store('model_flowlines')[-1].bed_h.copy()
     out = bedmachine_calving_extension(gdir)
 
-    meas = gdir.read_pickle('model_flowlines')[-1]
-    syn = gdir.read_pickle('model_flowlines', filesuffix='_synthetic')[-1]
+    meas = gdir.read_store('model_flowlines')[-1]
+    syn = gdir.read_store('model_flowlines', filesuffix='_synthetic')[-1]
     n = gdir.settings['calving_line_extension']
 
     # the synthetic copy is untouched, and everything upstream of the front is
@@ -863,9 +863,9 @@ def test_match_terminus_removes_the_step_at_the_junction(columbia_lines):
     init_present_time_glacier(gdir)
 
     raw = bedmachine_calving_extension(gdir, match_terminus=False)
-    bed_raw = gdir.read_pickle('model_flowlines')[-1].bed_h
+    bed_raw = gdir.read_store('model_flowlines')[-1].bed_h
     matched = bedmachine_calving_extension(gdir, match_terminus=True)
-    bed_matched = gdir.read_pickle('model_flowlines')[-1].bed_h
+    bed_matched = gdir.read_store('model_flowlines')[-1].bed_h
 
     n = gdir.settings['calving_line_extension']
     # the edited flowline is the last key: on centerlines a tributary has no
@@ -887,13 +887,13 @@ def test_calving_extension_reruns_from_the_synthetic_bed(columbia_lines):
     init_present_time_glacier(gdir)
 
     bedmachine_calving_extension(gdir, width_method='terminus')
-    first = gdir.read_pickle('model_flowlines')[-1].bed_h.copy()
+    first = gdir.read_store('model_flowlines')[-1].bed_h.copy()
     bedmachine_calving_extension(gdir, width_method='mean5')
-    second = gdir.read_pickle('model_flowlines')[-1]
+    second = gdir.read_store('model_flowlines')[-1]
 
     np.testing.assert_allclose(second.bed_h, first)
     n = gdir.settings['calving_line_extension']
-    syn = gdir.read_pickle('model_flowlines', filesuffix='_synthetic')[-1]
+    syn = gdir.read_store('model_flowlines', filesuffix='_synthetic')[-1]
     np.testing.assert_allclose(second._w0_m[-n:], syn._w0_m[-n:])
 
 
@@ -903,7 +903,7 @@ def test_calving_extension_raises_outside_the_grid(columbia):
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
 
-    fl = gdir.read_pickle('model_flowlines')[-1]
+    fl = gdir.read_store('model_flowlines')[-1]
     with xr.open_dataset(gdir.get_filepath('gridded_data')) as ds:
         nx = ds.sizes['x']
     assert np.max(fl.line.coords.xy[0]) < nx  # this fixture has room
@@ -949,7 +949,7 @@ def test_width_methods_pick_the_width_the_law_will_use(columbia_lines):
     widths = {}
     for method in ('mean5', 'terminus', 'inversion'):
         out = bedmachine_calving_extension(gdir, width_method=method)
-        widths[method] = gdir.read_pickle('model_flowlines')[-1]._w0_m[-n:]
+        widths[method] = gdir.read_store('model_flowlines')[-1]._w0_m[-n:]
         assert out[list(out)[-1]]['width_method'] == method
 
     np.testing.assert_allclose(widths['inversion'], w_inv)
@@ -1097,10 +1097,11 @@ def test_terminus_bed_moves_a_front_the_inversion_left_on_land(columbia):
     gdir, path = columbia
     bedmachine_bed_to_gdir(gdir, local_file=path)
     init_present_time_glacier(gdir)
-    syn = gdir.get_filepath('model_flowlines', filesuffix='_synthetic')
-    if os.path.exists(syn):
-        os.remove(syn)
-    fls = gdir.read_pickle('model_flowlines')
+    for path in (gdir.get_filepath, gdir.get_store_filepath):
+        syn = path('model_flowlines', filesuffix='_synthetic')
+        if os.path.exists(syn):
+            os.remove(syn)
+    fls = gdir.read_store('model_flowlines')
     fl = fls[-1]
     i0 = int(np.nonzero(fl.thick > 0)[0][-1])
     surf = fl.surface_h.copy()
@@ -1110,7 +1111,7 @@ def test_terminus_bed_moves_a_front_the_inversion_left_on_land(columbia):
     fl.bed_h = bed
     fl.thick = surf - bed
     _purge_lazy(fl)
-    gdir.write_pickle(fls, 'model_flowlines')
+    gdir.write_store(fls, 'model_flowlines')
 
     out = bedmachine_terminus_bed(gdir, water_depth=200.)
     d = out[list(out)[-1]]
@@ -1118,7 +1119,7 @@ def test_terminus_bed_moves_a_front_the_inversion_left_on_land(columbia):
     assert d['n_corrected'] >= 1
     assert d['method'] == 'flat'
     assert d['water_depth_after'] == pytest.approx(200.)
-    fl = gdir.read_pickle('model_flowlines')[-1]
+    fl = gdir.read_store('model_flowlines')[-1]
     assert int(np.nonzero(fl.thick > 0)[0][-1]) == i0
     assert fl.bed_h[i0] == pytest.approx(-200.)
     assert fl.thick[i0] == pytest.approx(surf[i0] + 200.)
@@ -1130,7 +1131,7 @@ def test_terminus_bed_reports_what_it_changed(columbia):
     init_present_time_glacier(gdir)
     out = bedmachine_terminus_bed(gdir, water_depth=150.)
     d = out[list(out)[-1]]
-    fl = gdir.read_pickle('model_flowlines')[-1]
+    fl = gdir.read_store('model_flowlines')[-1]
     np.testing.assert_allclose(d['volume_after_m3'],
                                np.sum(fl.section) * fl.dx_meter)
     np.testing.assert_allclose(
@@ -1261,7 +1262,7 @@ def test_bathymetry_inversion_prescribes_the_depth(columbia):
         find_inversion_calving_from_bathymetry(gdir)
 
     gdir.settings['terminus_water_depth'] = 150.
-    fl = gdir.read_pickle('inversion_flowlines')[-1]
+    fl = gdir.read_store('inversion_flowlines')[-1]
     free_board = max(float(fl.surface_h[-1]), 0.)
     assert front_thickness(gdir, 150.) == free_board + 150.
     np.testing.assert_allclose(flotation_thickness(150.), 150. * 1028 / 900)
@@ -1438,7 +1439,7 @@ def test_geodetic_calibration_adds_the_frontal_flux(columbia):
     y0, y1 = (int(d[:4]) for d in gdir.settings['reference_period'].split('_'))
     mbmod = MultipleFlowlineMassBalance(gdir, use_inversion_flowlines=True)
     smb = mbmod.get_specific_mb(
-        fls=gdir.read_pickle('inversion_flowlines'),
+        fls=gdir.read_store('inversion_flowlines'),
         year=np.arange(y0, y1)).mean()
     np.testing.assert_allclose(smb, ref_mb + cmb, rtol=1e-3)
 

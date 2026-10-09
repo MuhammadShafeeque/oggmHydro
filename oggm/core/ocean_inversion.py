@@ -346,7 +346,7 @@ def front_thickness(gdir, water_depth, input_filesuffix=''):
     :func:`oggm.core.bedmachine_flowline.bedmachine_terminus_bed` gives the
     front of the run.
     """
-    fl = gdir.read_pickle('inversion_flowlines',
+    fl = gdir.read_store('inversion_flowlines',
                           filesuffix=input_filesuffix)[-1]
     return max(float(fl.surface_h[-1]), 0.) + float(water_depth)
 
@@ -384,7 +384,7 @@ def calving_law_flux(gdir, water_depth=None, k=None, thick=None,
     if thick is None:
         thick = front_thickness(gdir, water_depth,
                                 input_filesuffix=input_filesuffix)
-    fl = gdir.read_pickle('inversion_flowlines',
+    fl = gdir.read_store('inversion_flowlines',
                           filesuffix=input_filesuffix)[-1]
     width = fl.widths[-1] * gdir.grid.dx
     return dict(flux=max(k * thick * water_depth * width / 1e9, 0.),
@@ -490,7 +490,7 @@ def find_inversion_calving_from_bathymetry(gdir, settings_filesuffix='',
             output_filesuffix=output_filesuffix,
             water_level=0., glen_a=glen_a, fs=fs)
 
-    fl = gdir.read_pickle('inversion_flowlines',
+    fl = gdir.read_store('inversion_flowlines',
                           filesuffix=output_filesuffix)[-1]
     f_calving = (fl.flux[-1] * (gdir.grid.dx ** 2) * 1e-9
                  / gdir.settings['ice_density'])
@@ -585,7 +585,7 @@ def subglacial_discharge_from_mb(gdir, period=None, mb_model=None,
                                        MonthlyTIModel)
     from oggm.utils import date_to_floatyear
 
-    fls = gdir.read_pickle('inversion_flowlines', filesuffix=input_filesuffix)
+    fls = gdir.read_store('inversion_flowlines', filesuffix=input_filesuffix)
     if mb_model is None:
         mb_model = MultipleFlowlineMassBalance(gdir, fls=fls,
                                                mb_model_class=MonthlyTIModel)
@@ -740,8 +740,8 @@ def calving_covariates(gdir, observed_flux=None, ocean_filesuffix='',
         return out
 
     shape = calving_law_flux(gdir, k=1., input_filesuffix=input_filesuffix)
-    cls = gdir.read_pickle('inversion_input', filesuffix=input_filesuffix)[-1]
-    fl = gdir.read_pickle('inversion_flowlines',
+    cls = gdir.read_store('inversion_input', filesuffix=input_filesuffix)[-1]
+    fl = gdir.read_store('inversion_flowlines',
                           filesuffix=input_filesuffix)[-1]
     out.update(shape_km3=shape['flux'],
                water_depth=shape['water_depth'],

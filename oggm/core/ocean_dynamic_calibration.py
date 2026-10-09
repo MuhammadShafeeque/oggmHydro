@@ -333,8 +333,10 @@ def dynamic_calving_k_run_with_dynamic_spinup(
         depth = gdir.settings['terminus_water_depth']
         # The terminus bed edits its kept copy when there is one, which is
         # the flowline of an earlier pass
-        gdir.get_filepath('model_flowlines', filesuffix='_synthetic',
-                          delete=True)
+        for path in (gdir.get_filepath, gdir.get_store_filepath):
+            fp = path('model_flowlines', filesuffix='_synthetic')
+            if os.path.exists(fp):
+                os.remove(fp)
         d = list(bedmachine_terminus_bed(gdir, water_depth=depth,
                                          continue_on_error=False).values())[-1]
         if not d['water_depth_after'] > 0:
