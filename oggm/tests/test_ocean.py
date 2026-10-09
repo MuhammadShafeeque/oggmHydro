@@ -1705,3 +1705,261 @@ def test_depth_fallback_trim_defaults_to_the_setting(tmp_path):
     gdir = _depth_grid(tmp_path)
     gdir.settings['terminus_depth_fallback_trim'] = 5
     assert terminus_water_depth_from_bed(gdir) == 50.
+
+
+# --- the calving constant through the dynamic model ----------------------------
+
+def _step_all(prev, q_dyn, targets, **kwargs):
+    """calving_k_step over a few fronts: {rgi_id: k}, {rgi_id: q}, {rgi_id: (t, e)}."""
+    from oggm.core.ocean_dynamic_calibration import calving_k_step
+    return {rid: calving_k_step(k, q_dyn.get(rid), *targets.get(rid, (None, None)),
+                                **kwargs)
+            for rid, k in prev.items()}
+
+
+@pytest.fixture
+def k_case():
+    prev = dict.fromkeys('abcdefg', 1.)
+    q_dyn = {'a': 0.2, 'b': 0.103, 'c': 1.0, 'd': 0., 'f': 0.3, 'g': 0.12}
+    targets = dict.fromkeys('abcde', (0.1, 0.001))
+    return prev, q_dyn, targets
+
+
+def test_a_k_step_is_the_ratio_bounded_and_listed(k_case):
+    out = _step_all(*k_case)
+    assert out['a']['calving_k'] == pytest.approx(0.5)  # target over control
+    assert out['a']['rule'] == 'ratio' and out['a']['reason'] == ''
+    assert out['b']['converged'] and out['b']['calving_k'] == 1.  # within 5 %
+    assert out['c']['calving_k'] == pytest.approx(0.25)
+    assert out['c']['reason'] == 'step_bounded'
+    assert out['d']['reason'] == 'control_flux_zero' and out['d']['calving_k'] == 1.
+    assert out['e']['reason'] == 'no_control_run' and out['e']['calving_k'] == 1.
+    assert out['f']['reason'] == out['g']['reason'] == 'no_target'
+    assert {r for r, o in out.items() if o['moved']} == {'a', 'c'}
+
+
+def test_a_front_within_its_error_bar_is_still_corrected(k_case):
+    prev, q_dyn, targets = k_case
+    targets['a'] = (0.1, 0.11)
+    out = _step_all(prev, q_dyn, targets)['a']
+    assert out['within_error'] and not out['converged']
+    assert out['calving_k'] == pytest.approx(0.5)
+
+
+def test_a_target_that_is_not_positive_is_listed():
+    from oggm.core.ocean_dynamic_calibration import calving_k_step
+    out = calving_k_step(1., 0.2, 0.)
+    assert out['reason'] == 'target_not_positive' and not out['moved']
+
+
+def _k_loop(q_of_k, k0=3., target=0.1, passes=6):
+    """The rule alone, pass after pass, as the entity task runs it."""
+    from oggm.core.ocean_dynamic_calibration import calving_k_step
+    hist, k = [], k0
+    for n in range(passes):
+        q = q_of_k(k)
+        out = calving_k_step(k, q, target, 0., hist)
+        hist.append((k, q))
+        if not out['moved']:
+            break
+        k = out['calving_k']
+    return out, hist, n
+
+
+def test_the_k_loop_converges_on_a_front_that_thickens():
+    """Q_dyn = 0.2 k**0.7: the ratio step closes on it within the pass limit."""
+    out, hist, n = _k_loop(lambda k: 0.2 * k ** 0.7, passes=5)
+    assert out['converged'] and n < 5
+
+
+@pytest.mark.parametrize('power', [0.4, 1.8, 2.5])
+def test_a_bracket_closes_a_front_that_over_or_under_reacts(power):
+    """Q_dyn = k**power: the plain ratio step overshoots above 1; the bracket closes."""
+    from oggm.core.ocean_dynamic_calibration import calving_k_step
+    out, hist, n = _k_loop(lambda k: 0.2 * k ** power)
+    assert out['converged'] and n <= 4
+    out = calving_k_step(3., 0.05, 0.1, 0., [(9., 0.4)])
+    assert out['rule'] == 'bracket' and 3. < out['calving_k'] < 9.
+
+
+def test_the_best_pass_is_the_closest_in_log_space():
+    """A front that jumps between two states never closes; it ends on its closest pass."""
+    from oggm.core.ocean_dynamic_calibration import best_calving_k
+    out, hist, _ = _k_loop(lambda k: 0.03 if k < 2.5 else 0.3, passes=5)
+    assert not out['converged'] and out['moved']
+    k, q = best_calving_k(hist, 0.1)
+    assert (k, q) in hist
+    assert abs(np.log(q / 0.1)) == min(abs(np.log(qq / 0.1)) for _, qq in hist)
+    assert best_calving_k(hist, None) is None
+    assert best_calving_k([(1., 0.)], 0.1) is None
+
+
+def test_a_bracket_holds_when_the_response_is_not_monotonic():
+    """Two constants below the target, the lower one with the larger flux: the step stays
+    inside the narrowest pair that straddles the target."""
+    from oggm.core.ocean_dynamic_calibration import propose_calving_k
+    seen = [(1.077000, 0.0072322), (1.208033, 0.0065828), (1.262477, 0.0128236)]
+    k, rule = propose_calving_k(1.208033, 0.0065828, 0.0109396, seen, 4.)
+    assert rule == 'bracket' and 1.208033 < k < 1.262477
+
+
+def test_a_bracket_that_repeats_a_constant_takes_the_midpoint():
+    from oggm.core.ocean_dynamic_calibration import propose_calving_k
+    k, rule = propose_calving_k(2., 0.2, 0.1, [(1., 0.05), (1.0005, 0.2)], 4.)
+    assert rule == 'bracket' and k == pytest.approx(np.sqrt(1.0005))
+
+
+def test_the_response_exponent_is_used_only_where_it_is_sane():
+    from oggm.core.ocean_dynamic_calibration import propose_calving_k
+    # Q = 0.2 k**2 measured twice above the target: e = 2, so the step is a square root
+    k, rule = propose_calving_k(2., 0.8, 0.1, [(4., 3.2), (2., 0.8)], 100.)
+    assert rule == 'response' and k == pytest.approx(2. * (0.1 / 0.8) ** 0.5)
+    # a response of 10 is not believed: the plain ratio
+    k, rule = propose_calving_k(2., 0.8, 0.1, [(2.2, 0.8 * 1.1 ** 10), (2., 0.8)], 100.)
+    assert rule == 'ratio' and k == pytest.approx(2. * 0.1 / 0.8)
+
+
+def test_passes_at_the_same_constant_keep_their_order():
+    """A front measured twice at one constant: the earlier pass is the neighbour."""
+    from oggm.core.ocean_dynamic_calibration import propose_calving_k
+    seen = [(19.87, 0.00285), (19.87, 0.00345), (16.92, 0.00341), (19.33, 0.00337)]
+    k, rule = propose_calving_k(19.33, 0.00337, 0.00294, seen)
+    assert rule == 'bracket' and 19.33 < k < 19.87
+    k, rule = propose_calving_k(19.33, 0.00337, 0.00294, [seen[i] for i in (1, 0, 2, 3)])
+    assert rule == 'ratio' and k == pytest.approx(19.33 * 0.00294 / 0.00337)
+
+
+def test_mean_frontal_ablation_reads_the_window(tmp_path):
+    from oggm.core.ocean_dynamic_calibration import mean_frontal_ablation
+    gdir = FakeGdir(tmp_path)
+    t = np.arange(1990, 2021)
+    xr.Dataset({'calving_m3': ('time', (t - 1990) * 1e9)}, coords={'time': t}).to_netcdf(
+        gdir.get_filepath('model_diagnostics', filesuffix='_ctl'))
+    q = mean_frontal_ablation(gdir, (2000, 2010), filesuffix='_ctl')
+    assert q == pytest.approx(cfg.PARAMS['ice_density'] / 1000.)
+    assert np.isnan(mean_frontal_ablation(gdir, (2000, 2030), filesuffix='_ctl'))
+    (tmp_path / 'empty').mkdir()
+    assert np.isnan(mean_frontal_ablation(FakeGdir(tmp_path / 'empty'), (2000, 2010)))
+
+
+class StubRun:
+    """A run_function whose control flux is `q_of_k`, recording each call."""
+
+    def __init__(self, q_of_k, fail_at=None):
+        self.q_of_k, self.fail_at, self.calls = q_of_k, fail_at, []
+
+    def __call__(self, gdir, calving_k=None, **kwargs):
+        # the task has written the constant to both keys before the pass
+        assert gdir.settings['calving_k'] == gdir.settings['inversion_calving_k'] == calving_k
+        self.calls.append(calving_k)
+        if self.fail_at == len(self.calls):
+            raise RuntimeError('CFL error: the stub stops')
+        return self.q_of_k(calving_k)
+
+
+def _calibrate(tmp_path, q_of_k, k0=3., **kwargs):
+    from oggm.core.ocean_dynamic_calibration import run_dynamic_calving_k_calibration
+    gdir = FakeGdir(tmp_path)
+    gdir.settings['calving_k'] = gdir.settings['inversion_calving_k'] = k0
+    run = q_of_k if isinstance(q_of_k, StubRun) else StubRun(q_of_k)
+    kwargs = {'ref_fa': 0.1, 'ref_fa_err': 0.02, 'run_function': run, **kwargs}
+    out = run_dynamic_calving_k_calibration(gdir, **kwargs)
+    return gdir, out, run
+
+
+def test_the_k_calibration_converges_and_records(tmp_path):
+    gdir, out, run = _calibrate(tmp_path, lambda k: 0.2 * k ** 0.7)
+    s = gdir.settings
+    assert s['calving_k_dyn_converged'] and s['calving_k_dyn_within_error']
+    assert s['calving_k'] == s['inversion_calving_k'] == run.calls[-1] == out['calving_k']
+    assert abs(s['calving_k_dyn_q_dyn'] / 0.1 - 1) <= 0.05
+    assert s['calving_k_static'] == 3. and s['calving_k_dyn_reason'] == ''
+    assert s['calving_k_dyn_rule'] == ''  # converged: nothing left to move
+    assert s['calving_k_dyn_history'] == [[k, 0.2 * k ** 0.7] for k in run.calls]
+    assert s['calving_k_dyn_passes'] == len(run.calls) - 1 == len(s['calving_k_dyn_rules'])
+    # the passes are the rule's own
+    out_rule, hist, _ = _k_loop(lambda k: 0.2 * k ** 0.7)
+    assert [k for k, _ in hist] == run.calls
+
+
+def test_the_k_calibration_brackets_a_front_that_over_reacts(tmp_path):
+    gdir, out, run = _calibrate(tmp_path, lambda k: 0.2 * k ** 2.5, k0=1.5)
+    assert gdir.settings['calving_k_dyn_converged']
+    assert 'bracket' in gdir.settings['calving_k_dyn_rules']
+
+
+def test_the_k_calibration_ends_on_the_best_pass(tmp_path):
+    """A front that never closes is run once more at its closest pass."""
+    def q_of_k(k):
+        return 0.03 if k < 2.5 else 0.3
+    gdir, out, run = _calibrate(tmp_path, q_of_k, maxiter=5)
+    s = gdir.settings
+    assert s['calving_k_dyn_rule'] == 'best_pass' and not s['calving_k_dyn_converged']
+    assert s['calving_k_dyn_passes'] == 5
+    hist = s['calving_k_dyn_history']
+    assert len(hist) == 6 and run.calls[-1] == s['calving_k'] == hist[-1][0]
+    assert abs(np.log(hist[-1][1] / 0.1)) == min(abs(np.log(q / 0.1)) for _, q in hist)
+    assert s['calving_k_dyn_q_dyn'] == hist[-1][1]
+
+
+def test_the_k_calibration_bounds_its_step(tmp_path):
+    """One pass allowed, 40 times the target: a quarter step, then back to that pass."""
+    gdir, out, run = _calibrate(tmp_path, lambda k: 4. * k, k0=1., maxiter=1)
+    s = gdir.settings
+    assert run.calls == [1.]  # the closest pass is the one run: no rerun
+    assert s['calving_k_dyn_reason'] == 'step_bounded'
+    assert s['calving_k_dyn_rules'] == ['ratio'] and s['calving_k_dyn_passes'] == 1
+    assert s['calving_k_dyn_rule'] == 'best_pass' and s['calving_k'] == 1.
+
+
+@pytest.mark.parametrize('ref_fa, reason', [(None, 'no_target'),
+                                            (np.nan, 'no_target'),
+                                            (0., 'target_not_positive')])
+def test_a_front_without_a_target_is_not_run(tmp_path, ref_fa, reason):
+    gdir, out, run = _calibrate(tmp_path, lambda k: 0.1, ref_fa=ref_fa)
+    assert run.calls == []
+    assert gdir.settings['calving_k_dyn_reason'] == reason
+    assert gdir.settings['calving_k'] == 3. and out['calving_k_static'] == 3.
+
+
+def test_a_land_glacier_is_not_run(tmp_path):
+    from oggm.core.ocean_dynamic_calibration import run_dynamic_calving_k_calibration
+    gdir = FakeGdir(tmp_path)
+    gdir.is_tidewater = False
+    run = StubRun(lambda k: 0.1)
+    assert run_dynamic_calving_k_calibration(gdir, ref_fa=0.1, run_function=run) is None
+    assert run.calls == [] and gdir.settings['calving_k_dyn_reason'] == 'not_tidewater'
+
+
+def test_a_failed_pass_ends_the_k_calibration(tmp_path):
+    run = StubRun(lambda k: 0.2 * k, fail_at=2)
+    with pytest.raises(RuntimeError, match='CFL error'):
+        _calibrate(tmp_path, run, continue_on_error=False)
+    run = StubRun(lambda k: 0.2 * k, fail_at=2)
+    gdir, out, _ = _calibrate(tmp_path, run, ignore_errors=True)
+    s = gdir.settings
+    assert s['calving_k_dyn_reason'] == 'no_control_run'
+    assert 'CFL error' in s['calving_k_dyn_error']
+    # as a pass table lists it: the constant that failed, its flux unknown
+    assert s['calving_k'] == run.calls[-1] and np.isnan(s['calving_k_dyn_history'][-1][1])
+
+
+def test_glaciers_without_a_target_take_the_geometric_mean(tmp_path):
+    from oggm.core.ocean_dynamic_calibration import calving_k_for_glaciers_without_target
+    gdirs = []
+    for i, (k, tgt) in enumerate([(0.5, 0.1), (1., 0.1), (0.25, 0.1), (4., 0.1),
+                                  (1., None), (1., np.nan)]):
+        gdir = FakeGdir(tmp_path)
+        gdir.rgi_id, gdir.settings = f'G{i}', {'calving_k': k}
+        if tgt is not None:
+            gdir.settings['calving_k_dyn_q_target'] = tgt
+        gdirs.append(gdir)
+    land = FakeGdir(tmp_path)
+    land.is_tidewater, land.settings = False, {'calving_k': 9.}
+    mean = calving_k_for_glaciers_without_target(gdirs + [land], exclude=['G3'])
+    assert mean == pytest.approx(np.exp(np.log([0.5, 1., 0.25]).mean()))
+    for gdir in gdirs[4:]:
+        assert gdir.settings['calving_k'] == gdir.settings['inversion_calving_k'] == mean
+        assert gdir.settings['calving_k_dyn_rule'] == 'geometric_mean'
+    assert gdirs[3].settings['calving_k'] == 4. and land.settings['calving_k'] == 9.
+    assert calving_k_for_glaciers_without_target(gdirs[4:]) is None

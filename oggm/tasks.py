@@ -77,6 +77,8 @@ from oggm.core.bedmachine_flowline import bedmachine_terminus_bed
 from oggm.core.bedmachine_flowline import calving_front_width_check
 from oggm.core.dynamic_spinup import run_dynamic_spinup
 from oggm.core.dynamic_spinup import run_dynamic_melt_f_calibration
+from oggm.core.ocean_dynamic_calibration import (
+    run_dynamic_calving_k_calibration)
 from oggm.utils import copy_to_basedir
 from oggm.utils import gdir_to_tar
 from oggm.utils import merge_consecutive_run_outputs
