@@ -1963,3 +1963,26 @@ def test_glaciers_without_a_target_take_the_geometric_mean(tmp_path):
         assert gdir.settings['calving_k_dyn_rule'] == 'geometric_mean'
     assert gdirs[3].settings['calving_k'] == 4. and land.settings['calving_k'] == 9.
     assert calving_k_for_glaciers_without_target(gdirs[4:]) is None
+
+
+@pytest.mark.slow
+def test_the_k_calibration_runs_a_real_tidewater_glacier(columbia):
+    """Two passes of the default run function on Columbia, whose spinup the CFL criterion
+    stops at every floor here: the control starts cold, at 10 s where 60 s stops it."""
+    from oggm.core.ocean_dynamic_calibration import (mean_frontal_ablation,
+                                                     run_dynamic_calving_k_calibration)
+    gdir, _ = columbia
+    cfg.PARAMS['store_model_geometry'] = True
+    gdir.settings['calving_k'] = gdir.settings['inversion_calving_k'] = 0.6
+    out = run_dynamic_calving_k_calibration(
+        gdir, ref_fa=0.5, ref_period=(2000, 2010), maxiter=2,
+        kwargs_run_function={'ye': 2010}, continue_on_error=False)
+    s = gdir.settings
+    hist = s['calving_k_dyn_history']
+    assert len(hist) >= 2 and all(q > 0 for _, q in hist)
+    assert hist[0][0] == 0.6 and hist[1][0] < 0.6  # too much calving: k goes down
+    assert s['calving_k'] == s['inversion_calving_k'] == out['calving_k']
+    assert s['calving_inversion_k'] == out['calving_k']  # the last inversion ran at it
+    assert s['calving_k_dyn_start'] == 'cold'
+    # the directory holds the control of the final constant
+    assert mean_frontal_ablation(gdir, (2000, 2010), '_dyn_k') == s['calving_k_dyn_q_dyn']
