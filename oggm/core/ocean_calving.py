@@ -438,6 +438,8 @@ class LargerOf(MeltPlusCalving):
 
     ``Q_f = w * d * max(k_c * h, lam * mdot)``, after Malles et al. (2025).
     The whole flux is reported as the larger term. ``lam = 0`` is the control.
+    With ``partition``, ``k_c`` is lowered until the period mean of the larger
+    term equals the calibrated total.
     """
 
     name = 'larger_of'
@@ -462,7 +464,9 @@ def partition_law_k(gdir, law, period=None):
     ``k_c h + u_melt = k h`` for ``k_c`` at the front the inversion
     prescribed, with the melt speed the law applies (its open-water gate
     included) averaged over ``period``. The total is then unchanged over that
-    period and only its split moves.
+    period and only its split moves. For :class:`LargerOf`,
+    :func:`oggm.core.ocean_inversion.larger_of_calving_constant` solves
+    ``mean(max(k_c h, u_melt)) = k h`` instead.
 
     Parameters
     ----------
@@ -479,7 +483,8 @@ def partition_law_k(gdir, law, period=None):
     (k_c, melt_fraction) : the residual constant in yr-1 and the melt share of
         the total, or ``(None, 0.)`` for a law without a melt term
     """
-    from oggm.core.ocean_inversion import _setting, partition_calving_constant
+    from oggm.core.ocean_inversion import (_setting, larger_of_calving_constant,
+                                          partition_calving_constant)
 
     if not hasattr(law, 'melt_rate'):
         return None, 0.
@@ -504,10 +509,12 @@ def partition_law_k(gdir, law, period=None):
             f'{y0:.0f}-{y1:.0f}, so the reference melt rate cannot be formed. '
             'Give the law an explicit k_c, or pick a period the record '
             'covers.')
-    u_melt = float(np.mean([law.melt_speed(depth, width, y)
-                            for y in yrs[sel]]))
-
-    k_c, frac = partition_calving_constant(k_total, u_melt, thick, lam=1.)
+    u_melt = [law.melt_speed(depth, width, y) for y in yrs[sel]]
+    if isinstance(law, LargerOf):
+        k_c, frac = larger_of_calving_constant(k_total, u_melt, thick)
+    else:
+        k_c, frac = partition_calving_constant(k_total, float(np.mean(u_melt)),
+                                               thick, lam=1.)
     law.k_c = k_c
     return k_c, frac
 
@@ -537,8 +544,8 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
         calving constant on average over that period.
     partition : bool
         for a melt-bearing law, set ``k_c`` from :func:`partition_law_k` so
-        that the melt term is carved out of the calibrated total instead of
-        being added to it.
+        that the law keeps the calibrated total over ``partition_period``
+        instead of adding melt to it.
     partition_period : tuple of two years, optional
         the period over which the partition keeps the total. Default:
         ``gdir.settings['ocean_tf_ref_period']``.

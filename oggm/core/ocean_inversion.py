@@ -229,6 +229,49 @@ def partition_calving_constant(k_total, melt_rate, thick, lam=None):
     return float(k_c), float(u_melt / u_total)
 
 
+def larger_of_calving_constant(k_total, melt_speeds, thick):
+    """The calving constant at which the larger-of law keeps the total.
+
+    Solves ``mean(max(k_c*h, u_melt(t))) == k_total*h`` for ``k_c`` over the
+    melt speeds of a reference period.
+
+    Parameters
+    ----------
+    k_total : float
+        the calibrated calving constant, yr-1
+    melt_speeds : array
+        the front-normal melt speeds of the period, m s-1
+    thick : float
+        the terminus ice thickness the constant acts on, m
+
+    Returns
+    -------
+    (k_c, melt_fraction) : the constant in yr-1, and the share of the total
+        that the melt term carries
+    """
+    if thick <= 0:
+        raise InvalidParamsError(f'thick = {thick} is not a terminus thickness')
+    u_total = k_total / cfg.SEC_IN_YEAR * thick
+    u = np.sort(np.clip(np.asarray(melt_speeds, dtype=float), 0., None))
+    if u_total <= 0 or u.size == 0:
+        return float(max(k_total, 0.)), 0.
+    if u.mean() >= u_total:
+        log.warning('submarine melt alone (%.3e m s-1) matches or exceeds the '
+                    'calibrated frontal ablation speed (%.3e): the calving '
+                    'constant is zero', u.mean(), u_total)
+        return 0., 1.
+    # mean(max(c, u)) is piecewise linear in c; with j speeds below c it is
+    # (j*c + sum of the others) / n, so take the first segment that holds.
+    n = u.size
+    above = np.concatenate([np.cumsum(u[::-1])[::-1], [0.]])
+    for j in range(1, n + 1):
+        c = (n * u_total - above[j]) / j
+        if c <= (u[j] if j < n else np.inf):
+            break
+    frac = float(np.where(u > c, u, 0.).sum() / n / u_total)
+    return float(c / thick * cfg.SEC_IN_YEAR), frac
+
+
 def ocean_cells(ds, mask, bed_var='bedmachine_bed'):
     """Cells outside the glacier that are ocean.
 
