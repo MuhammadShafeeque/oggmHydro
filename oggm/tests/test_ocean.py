@@ -22,7 +22,7 @@ from oggm.core.bedmachine_flowline import (_purge_lazy, bed_extension_statistics
 from oggm.core.flowline import init_present_time_glacier, k_calving_law
 from oggm.core.ocean_calving import (ConstantK, LargerOf, MeltPlusCalving,
                                      SeaIceModulated,
-                                     TFPower, band_names,
+                                     TFPower, band_index, band_names,
                                      frontal_ablation_components,
                                      ocean_calving_law, tf_power_mean,
                                      write_frontal_components)
@@ -90,17 +90,30 @@ def test_open_water_fraction_is_bounded():
     assert np.all(np.diff(owf) <= 0)
 
 
-def test_terminus_band_follows_bathymetry():
-    """A measured terminus depth replaces the band's default bottom."""
+def test_front_band_follows_bathymetry():
+    """A measured front depth sets the front band's bottom, floored at the first level."""
     z = np.arange(5., 705., 10.)
     t = np.full((12, len(z)), 1.5)
     s = np.full_like(t, 34.8)
+    bands = parse_depth_bands(cfg.PARAMS['ocean_depth_bands'])
     names, tops, bots, _, tf, _, _ = thermal_forcing_bands(
-        t, s, z, *parse_depth_bands(cfg.PARAMS['ocean_depth_bands']),
-        terminus_depth=60.)
-    assert names[0] == 'terminus'
-    assert bots[0] == 60.
+        t, s, z, *bands, terminus_depth=120.)
+    assert names == ['shallow_0_60', 'ismip6', 'front']
+    assert bots == [60., 500., 120.]
     assert tf.shape == (12, 3)
+    *_, bots, _, _, _, _ = thermal_forcing_bands(t, s, z, *bands, terminus_depth=2.)
+    assert bots[2] == 5.
+    # the band of earlier versions still takes the depth
+    *_, bots, _, _, _, _ = thermal_forcing_bands(t, s, z, [('terminus', 0., 60.)],
+                                                 {}, terminus_depth=120.)
+    assert bots == [120.]
+
+
+def test_terminus_is_read_as_the_fixed_shallow_band():
+    names = ['terminus', 'ismip6']
+    assert band_index(names, 'shallow_0_60') == band_index(names, 'terminus') == 0
+    with pytest.raises(InvalidParamsError):
+        band_index(names, 'front')
 
 
 def test_empty_band_raises():
@@ -313,10 +326,10 @@ def test_laws_are_picklable(state, years):
 
 def test_depth_bands_are_parsed_from_the_parameter_file():
     bands, weighting = parse_depth_bands(cfg.PARAMS['ocean_depth_bands'])
-    assert bands == [('terminus', 0., 60.), ('ismip6', 200., 500.),
-                     ('moller', 0., 700.)]
-    assert weighting == {'terminus': 'uniform', 'ismip6': 'uniform',
-                         'moller': 'depth_weighted'}
+    assert bands == [('shallow_0_60', 0., 60.), ('ismip6', 200., 500.),
+                     ('front', 0., 60.)]
+    assert weighting == {'shallow_0_60': 'uniform', 'ismip6': 'uniform',
+                         'front': 'uniform'}
     assert parse_depth_bands(['a:0:50']) == ([('a', 0., 50.)], {'a': 'uniform'})
     with pytest.raises(InvalidParamsError):
         parse_depth_bands(['a:0'])

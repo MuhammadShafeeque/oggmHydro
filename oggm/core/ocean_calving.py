@@ -56,6 +56,18 @@ def band_names(ds):
             for r in raw]
 
 
+# Earlier name of the fixed 0-60 m band, still read from older ocean_data files
+BAND_ALIASES = {'terminus': 'shallow_0_60', 'shallow_0_60': 'terminus'}
+
+
+def band_index(names, band):
+    """Position of ``band`` in ``names``, or of its earlier name."""
+    for b in (band, BAND_ALIASES.get(band)):
+        if b in names:
+            return names.index(b)
+    raise InvalidParamsError(f'band {band!r} not in {names}')
+
+
 def tf_power_mean(tf, gamma):
     """The reference thermal forcing at which ``tf_power`` leaves k unchanged.
 
@@ -574,10 +586,7 @@ def ocean_calving_law(gdir, calving_law=None, band=None, ocean_filesuffix='',
         ds = ds.load()
     if 'band' not in ds.dims:
         raise InvalidWorkflowError('ocean_data has no band dimension')
-    names = band_names(ds)
-    if band not in names:
-        raise InvalidParamsError(f'band {band!r} not in {names}')
-    tf = ds['thermal_forcing'].values[:, names.index(band)]
+    tf = ds['thermal_forcing'].values[:, band_index(band_names(ds), band)]
     yrs = ds['time.year'].values + (ds['time.month'].values - 0.5) / 12
 
     cls = LAWS[calving_law]

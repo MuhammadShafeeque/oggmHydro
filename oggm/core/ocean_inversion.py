@@ -20,7 +20,7 @@ import xarray as xr
 
 from oggm import cfg
 from oggm import entity_task
-from oggm.core.ocean_calving import band_names
+from oggm.core.ocean_calving import band_index, band_names
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 from oggm.utils import DisableLogger
 
@@ -72,10 +72,7 @@ def ocean_tf_mean(gdir, band=None, period=None, ocean_filesuffix='',
     fp = gdir.get_filepath('ocean_data', filesuffix=ocean_filesuffix)
     with xr.open_dataset(fp) as ds:
         ds = ds.load()
-    names = band_names(ds)
-    if band not in names:
-        raise InvalidParamsError(f'band {band!r} not in {names}')
-    tf = ds['thermal_forcing'].isel(band=names.index(band))
+    tf = ds['thermal_forcing'].isel(band=band_index(band_names(ds), band))
     tf = tf.sel(time=slice(str(period[0]), str(period[1])))
     if gamma is not None:
         return tf_power_mean(tf.values, gamma)

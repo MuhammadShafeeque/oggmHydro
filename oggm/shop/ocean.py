@@ -109,7 +109,8 @@ def thermal_forcing_bands(thetao, so, depth, depth_bands, band_weighting,
     band_weighting : dict
         band name -> 'uniform' or 'depth_weighted'
     terminus_depth : float, optional
-        replaces the bottom of the 'terminus' band
+        the bottom of the 'front' band, at least the first level (and of
+        the 'terminus' band of earlier versions)
     teos10 : bool
         see :func:`freezing_point`
     lat : float, optional
@@ -125,7 +126,9 @@ def thermal_forcing_bands(thetao, so, depth, depth_bands, band_weighting,
     tf_b, th_b, so_b = [], [], []
 
     for name, top, bot in depth_bands:
-        if name == 'terminus' and terminus_depth is not None:
+        if name == 'front' and terminus_depth is not None:
+            bot = max(float(terminus_depth), float(z.min()))
+        elif name == 'terminus' and terminus_depth is not None:
             bot = float(terminus_depth)
         sel = (z >= top) & (z <= bot)
         if sel.sum() == 0:
@@ -200,7 +203,7 @@ def process_ocean_data(gdir, thetao=None, so=None, siconc=None,
         band name -> 'uniform' or 'depth_weighted'. Default: as given in
         ``gdir.settings['ocean_depth_bands']``.
     terminus_depth : float, optional
-        water depth at the terminus, m; the bottom of the 'terminus' band
+        water depth at the terminus, m; the bottom of the 'front' band
     year_range : tuple of two years, optional
         reference period of the bias correction. Default:
         ``gdir.settings['ocean_tf_ref_period']``.
