@@ -26,7 +26,8 @@ from oggm.core.ocean_calving import (ConstantK, LargerOf, MeltPlusCalving,
                                      frontal_ablation_components,
                                      ocean_calving_law, tf_power_mean,
                                      write_frontal_components)
-from oggm.core.ocean_inversion import (partition_calving_constant,
+from oggm.core.ocean_inversion import (larger_of_calving_constant,
+                                       partition_calving_constant,
                                        terminus_water_depth_from_bed)
 from oggm.exceptions import InvalidParamsError, InvalidWorkflowError
 from oggm.shop.bedmachine_bed import (BEDMACHINE_URLS, BEDMACHINE_VARS,
@@ -1594,6 +1595,54 @@ def test_partition_calving_constant_refuses_to_go_negative():
     assert (k_c, frac) == (0., 1.)
     with pytest.raises(InvalidParamsError, match='thickness'):
         partition_calving_constant(0.6, 1e-7, 0.)
+
+
+def test_larger_of_calving_constant_keeps_the_total():
+    """The period mean of max(k_c h, u_melt) must equal what the calibrated k gave."""
+    h, k = 200., 0.6
+    u_total = k / cfg.SEC_IN_YEAR * h
+    u = u_total * np.array([0.1, 0.5, 1.5, 0.2, 0.8, 0.3])
+    k_c, frac = larger_of_calving_constant(k, u, h)
+    c = k_c / cfg.SEC_IN_YEAR * h
+    assert 0 < k_c < k
+    assert np.mean(np.maximum(c, u)) == pytest.approx(u_total)
+    assert frac == pytest.approx(np.where(u > c, u, 0.).mean() / u_total)
+
+
+def test_larger_of_calving_constant_limits():
+    """Melt never above calving keeps k; melt above the total on average gives zero."""
+    h, k = 200., 0.6
+    u_total = k / cfg.SEC_IN_YEAR * h
+    assert larger_of_calving_constant(k, [0., 0.5 * u_total], h) == \
+        (pytest.approx(k), 0.)
+    assert larger_of_calving_constant(k, [0.5, 2.0] * np.array(u_total) * 2,
+                                      h) == (0., 1.)
+    with pytest.raises(InvalidParamsError, match='thickness'):
+        larger_of_calving_constant(k, [0.], 0.)
+
+
+def test_partition_calibrates_the_larger_of_law(columbia):
+    """With partition, the larger-of law returns the calibrated total over the period."""
+    from oggm.core.ocean_inversion import find_inversion_calving_from_bathymetry
+
+    gdir, _ = columbia
+    _write_ocean(gdir)
+    gdir.settings['terminus_water_depth'] = 150.
+    find_inversion_calving_from_bathymetry(gdir)
+    k, h = gdir.settings['calving_k'], gdir.settings['calving_front_thick']
+    w = gdir.settings['calving_front_width']
+    unit = ocean_calving_law(gdir, 'larger_of', band='terminus', lam=1.)
+    sel = (unit.years >= 2000) & (unit.years < 2011)
+    u1 = np.array([unit.melt_speed(150., w, y) for y in unit.years[sel]])
+    # mean melt at 95 % of the total, so that the last months exceed it
+    lam = 0.95 * k / cfg.SEC_IN_YEAR * h / u1.mean()
+    law = ocean_calving_law(gdir, 'larger_of', band='terminus', partition=True,
+                            partition_period=(2000, 2010), lam=lam)
+    u = lam * u1
+    assert u.max() > k / cfg.SEC_IN_YEAR * h
+    c = law.k_c / cfg.SEC_IN_YEAR * h
+    assert 0 < law.k_c < k
+    np.testing.assert_allclose(np.mean(np.maximum(c, u)), k / cfg.SEC_IN_YEAR * h)
 
 
 @pytest.mark.slow
